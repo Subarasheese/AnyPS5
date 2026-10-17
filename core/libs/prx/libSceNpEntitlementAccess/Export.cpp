@@ -161,8 +161,10 @@ int APS5_VABI sceNpEntitlementAccessRequestUnifiedEntitlementInfo(void) {
     return SCE_NP_ERROR_SIGNED_OUT;
 }
 
-int APS5_VABI sceNpEntitlementAccessGetPftFlag(void) {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceNpEntitlementAccessGetPftFlag(uint32_t* flag) {
+    constexpr int errorParameter = static_cast<int>(0x817D0002);
+    if (!flag) return errorParameter;
+    *flag = 0;
     return 0;
 }
 

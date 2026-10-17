@@ -3,7 +3,7 @@
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
 #include <relinker/parsing/ElfReader.hpp>
 #include <cstring>
-#include <iostream>
+#include <sstream>
 #include <limits>
 #include <optional>
 
@@ -188,8 +188,11 @@ private:
 };
 
 class StrictNidFilter : public IUnusedNidFilter {
+    Domain::IProgress& progress;
+
 public:
-    std::vector<NidReference> Filter(const std::vector<NidReference>& nidRefs, const std::vector<std::uint8_t>& elfBytes, const std::vector<std::uint8_t>& textSection, VirtualAddress textVAddr) override {
+    explicit StrictNidFilter(Domain::IProgress& progress) : progress(progress) {}
+    std::vector<NidReference> Filter(const std::vector<NidReference>& nidRefs, const std::vector<std::uint8_t>& elfBytes, const std::vector<std::uint8_t>& textSection, VirtualAddress textVAddr, const std::vector<VirtualAddress>&) override {
         const StrictImage image(elfBytes);
         const auto input = image.Build(nidRefs, textSection, textVAddr);
         const auto analysis = UnusedNidFilter::AnalyzeStrictReachability(input);
@@ -197,16 +200,16 @@ public:
         for (const auto& reference : nidRefs) {
             if (analysis.ImportSlots.contains(reference.RelocationAddress)) result.push_back(reference);
         }
-        std::cout << "Strict reachability: " << analysis.Instructions.size() << " instructions; conservative indirect transfers=" << analysis.IndirectTransfers << "\n";
-        std::cout << "Function graph: " << analysis.LiveRegions << "/" << analysis.TotalRegions << " live regions; address-taken roots=" << analysis.AddressTakenRoots << "; unwind functions=" << input.Functions.size() << "\n";
+        { std::ostringstream message; message << "Strict reachability: " << analysis.Instructions.size() << " instructions; conservative indirect transfers=" << analysis.IndirectTransfers << "\n"; progress.Message(message.str()); }
+        { std::ostringstream message; message << "Function graph: " << analysis.LiveRegions << "/" << analysis.TotalRegions << " live regions; address-taken roots=" << analysis.AddressTakenRoots << "; unwind functions=" << input.Functions.size() << "\n"; progress.Message(message.str()); }
         return result;
     }
 };
 
 }
 
-std::shared_ptr<IUnusedNidFilter> MakeStrictUnusedNidFilter() {
-    return std::make_shared<StrictNidFilter>();
+std::shared_ptr<IUnusedNidFilter> MakeStrictUnusedNidFilter(Domain::IProgress& progress) {
+    return std::make_shared<StrictNidFilter>(progress);
 }
 
 }

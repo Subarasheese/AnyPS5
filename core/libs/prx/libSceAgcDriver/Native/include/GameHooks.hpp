@@ -1,7 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_NATIVE_INCLUDE_GAMEHOOKS_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_NATIVE_INCLUDE_GAMEHOOKS_HPP
 
-// Redirects GT7 (PPSA01317) graphics-context methods to native implementations.
+// Redirects GT7 graphics-context methods to native implementations.
 //
 // The relinked executable keeps GT7's code at its original virtual addresses (host address =
 // image base + eboot VA). Every hooked method starts with `push rbp; mov rbp, rsp; push r1x`

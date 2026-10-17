@@ -1211,7 +1211,7 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
         }
     }
     const std::vector<std::shared_ptr<Graphics::StorageTexture>> owners(graphics.colors.size());
-    auto framebuffer = pipeline->AcquireFramebuffer(views, owners, graphics.renderExtent);
+    auto framebuffer = pipeline->AcquireFramebuffer(views, owners, graphics.renderExtent, graphics.renderLayers);
     s.kept.push_back(framebuffer);
     s.kept.push_back(pipeline);
     // Shader data blocks: push constants (pushDataStartDword) or the ring.

@@ -10,6 +10,8 @@
 #include <cstring>
 #include <string>
 
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbEventWrite(CommandBuffer* buf, std::uint8_t eventType, const volatile void* address);
+extern "C" std::uint64_t APS5_VABI sceAgcDcbEventWriteGetSize(std::uint8_t eventType);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbResetQueue(CommandBuffer* buf, std::uint32_t op, std::uint32_t state);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbClearState(CommandBuffer* buf, std::uint32_t command);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetFlip(CommandBuffer* buf, std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument);
@@ -19,6 +21,7 @@ extern "C" int APS5_VABI sceAgcInit(std::uint32_t version);
 extern "C" void* APS5_VABI sceAgcGetRegisterDefaults();
 extern "C" void* APS5_VABI sceAgcGetRegisterDefaultsInternal();
 extern "C" void* APS5_VABI sceAgcGetRegisterDefaults2Internal(std::uint32_t version);
+extern "C" int APS5_VABI sceAgcGetDefaultCxStateFlat(void* out_state, std::uint32_t size);
 extern "C" int APS5_VABI sceAgcInit_0090(std::uint32_t* state, std::uint32_t version);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbDrawIndexAuto(CommandBuffer* buf, std::uint32_t indexCount, std::uint64_t modifier);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbDrawIndexIndirect(CommandBuffer* buf, std::uint32_t dataOffsetInBytes, std::uint64_t modifier);
@@ -620,10 +623,12 @@ void testDefaults() {
     check(sceAgcInit_0090(&state, 8) == 0 && state == 0x12345678, "AGC initialization failed or modified caller state");
     check(sceAgcInit_0090(&state, 13) == 0 && state == 0x12345678, "AGC version 13 initialization changed caller state");
     expectFailure([] { sceAgcInit_0090(nullptr, 8); });
-    expectFailure([&] { sceAgcInit_0090(&state, 14); });
+    check(sceAgcInit_0090(&state, 14) == 0 && state == 0x12345678, "out-of-range AGC initialization version changed caller state");
     check(sceAgcInit(8) == 0, "AGC version initialization failed");
-    expectFailure([] { sceAgcInit(14); });
-    expectFailure([] { sceAgcInit(0xffffffffu); });
+    check(sceAgcInit(13) == 0, "AGC version 13 initialization failed");
+    check(sceAgcInit(14) == 0, "out-of-range AGC version did not return success");
+    check(sceAgcInit(0xffffffffu) == 0, "maximum AGC version did not return success");
+    check(sceAgcInit(0xffffc278u) == 0, "pointer-valued AGC argument did not return success");
     for (std::uint32_t version = 0; version < 14; ++version) {
         for (const bool internal : {false, true}) {
             auto* first = Agc::Command::GetRegisterDefaults(version, internal, __func__);
@@ -633,8 +638,64 @@ void testDefaults() {
     auto* internalDefaults = sceAgcGetRegisterDefaultsInternal();
     check(internalDefaults != nullptr && internalDefaults == Agc::Command::GetRegisterDefaults(0, true, __func__) && internalDefaults == sceAgcGetRegisterDefaults2Internal(0), "internal register defaults are not the baseline internal table");
     check(internalDefaults != sceAgcGetRegisterDefaults(), "internal register defaults returned the public table");
+    constexpr int kInvalidArgument = static_cast<int>(0x80890001u);
+    std::array<std::uint32_t, 512> flatCxBuffer{};
+    check(sceAgcGetDefaultCxStateFlat(nullptr, sizeof(flatCxBuffer)) == kInvalidArgument, "null destination was accepted");
+    check(sceAgcGetDefaultCxStateFlat(flatCxBuffer.data(), 0) == 0, "zero size copy failed");
+    check(sceAgcGetDefaultCxStateFlat(flatCxBuffer.data(), sizeof(flatCxBuffer)) == 0, "flat CX state default retrieval failed");
+    check(flatCxBuffer[0x001] == 0x11000100u, "flat CX state register 0x001 mismatch");
+    check(flatCxBuffer[0x007] == 0x0000ffffu, "flat CX state register 0x007 mismatch");
+    check(flatCxBuffer[0x12d] == 0x3f800000u, "flat CX state register 0x12d mismatch");
+    check(flatCxBuffer[0x1e0] == 0x20010001u, "flat CX state register 0x1e0 mismatch");
+    std::array<std::uint32_t, 513> overBuffer{};
+    overBuffer[512] = 0x12345678u;
+    check(sceAgcGetDefaultCxStateFlat(overBuffer.data(), sizeof(overBuffer)) == 0, "oversized copy failed");
+    check(overBuffer[512] == 0x12345678u, "oversized copy overflowed buffer");
+    check(Agc::Command::GetDefaultCxStateFlat(nullptr, sizeof(flatCxBuffer)) == kInvalidArgument, "null command destination was accepted");
+    check(Agc::Command::GetDefaultCxStateFlat(flatCxBuffer.data(), sizeof(flatCxBuffer)) == 0, "command flat CX state retrieval failed");
     expectFailure([] { Agc::Command::GetRegisterDefaults(14, false, __func__); });
     expectFailure([] { Agc::Command::GetRegisterDefaults(0xffffffffu, true, __func__); });
+}
+
+void testEventWrite() {
+    Storage storage;
+    const auto* samplePacket = sceAgcDcbEventWrite(&storage.buffer, 0x38, reinterpret_cast<const void*>(0x1000));
+    check(samplePacket == storage.words.data(), "incorrect event 0x38 return pointer");
+    check(storage.words[0] == 0xc0024600u, "incorrect event 0x38 packet header");
+    check(storage.words[1] == (0x100u | 0x38u), "incorrect event 0x38 first payload word");
+    check(storage.words[2] == 0x1000u, "incorrect event 0x38 low address word");
+    check(storage.words[3] == 0u, "incorrect event 0x38 high address word");
+    check(sceAgcDcbEventWriteGetSize(0x38) == 16, "incorrect event 0x38 size");
+    check(sceAgcDcbEventWriteGetSize(0x39) == 16, "incorrect event 0x39 size");
+
+    Storage sample39;
+    sceAgcDcbEventWrite(&sample39.buffer, 0x39, reinterpret_cast<const void*>(0x2008));
+    check(sample39.words[0] == 0xc0024600u && sample39.words[1] == (0x100u | 0x39u) && sample39.words[2] == 0x2008u && sample39.words[3] == 0u, "incorrect event 0x39 packet");
+
+    expectFailure([&] { sceAgcDcbEventWrite(&storage.buffer, 0x38, reinterpret_cast<const void*>(0x1001)); });
+    expectFailure([&] { sceAgcDcbEventWrite(&storage.buffer, 0x40, nullptr); });
+
+    Storage partialFlush;
+    sceAgcDcbEventWrite(&partialFlush.buffer, 7, nullptr);
+    check(partialFlush.words[0] == 0xc0004600u && partialFlush.words[1] == 0x407u, "incorrect event 7 partial flush packet");
+    check(sceAgcDcbEventWriteGetSize(7) == 8, "incorrect event 7 size");
+
+    Storage partialFlush15;
+    sceAgcDcbEventWrite(&partialFlush15.buffer, 15, nullptr);
+    check(partialFlush15.words[0] == 0xc0004600u && partialFlush15.words[1] == 0x40fu, "incorrect event 15 partial flush packet");
+
+    Storage partialFlush16;
+    sceAgcDcbEventWrite(&partialFlush16.buffer, 16, nullptr);
+    check(partialFlush16.words[0] == 0xc0004600u && partialFlush16.words[1] == 0x410u, "incorrect event 16 partial flush packet");
+
+    Storage cacheFlushNull;
+    sceAgcDcbEventWrite(&cacheFlushNull.buffer, 0x16, nullptr);
+    check(cacheFlushNull.words[0] == 0xc0004600u && cacheFlushNull.words[1] == 0x16u, "incorrect event 0x16 null address packet");
+    check(sceAgcDcbEventWriteGetSize(0x16) == 8, "incorrect event 0x16 size");
+
+    Storage cacheFlushWithAddress;
+    sceAgcDcbEventWrite(&cacheFlushWithAddress.buffer, 0x16, reinterpret_cast<const void*>(0x2d2a10000ull));
+    check(cacheFlushWithAddress.words[0] == 0xc0004600u && cacheFlushWithAddress.words[1] == 0x16u, "incorrect event 0x16 with address packet");
 }
 
 }
@@ -648,6 +709,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         testPackets();
+        testEventWrite();
         testNop();
         testClearState();
         testIndexedIndirectDraws();

@@ -59,11 +59,8 @@ bool HostPipe(int descriptor) {
 #endif
 
 int TerminalError(int descriptor) {
-    if (descriptor >= GuestSockets::FirstDescriptor) {
-        const int family = GuestSockets::Family(descriptor);
-        if (family < 0) return BadDescriptor;
-        return family == InternetFamily ? AddressNotAvailable : OperationNotSupported;
-    }
+    const int family = GuestSockets::Family(descriptor);
+    if (family >= 0) return family == InternetFamily ? AddressNotAvailable : OperationNotSupported;
     if (descriptor < 0 || !HostOpen(descriptor)) return BadDescriptor;
     return NotTerminal;
 }

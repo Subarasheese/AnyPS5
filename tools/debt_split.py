@@ -17,6 +17,7 @@ def parse(text):
     items = []
     section = None
     current = None
+    blanks = []
     for line in text.splitlines():
         heading = HEADING.match(line)
         if heading:
@@ -26,13 +27,15 @@ def parse(text):
         elif line.startswith("- "):
             current = ["entry", section, [line]]
             items.append(current)
+            blanks = []
         elif current and (line.startswith(" ") or line.startswith("\t")):
-            current[2].append(line)
+            current[2] += blanks + [line]
+            blanks = []
         elif line.strip():
             current = None
             items.append(["text", section, [line]])
         else:
-            current = None
+            blanks.append(line)
     return [(kind, section, "\n".join(lines)) for kind, section, lines in items]
 
 
@@ -43,7 +46,7 @@ def key(kind, text):
 def relink(text, source, destination):
     def replace(match):
         target = match.group(1)
-        if re.match(r"^[a-z][a-z0-9+.-]*:", target):
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:|//", target):
             return match.group(0)
         path, _, anchor = target.partition("#")
         resolved = posixpath.normpath(posixpath.join(posixpath.dirname(source), path)) if path else source
@@ -77,6 +80,11 @@ def read_debt(root, name):
     return sections
 
 
+def write_lf(path, text):
+    with open(path, "w", encoding="utf-8", newline="\n") as file:
+        file.write(text)
+
+
 def write_debt(root, name, sections, order):
     path = root / debt_file(name)
     sections = {section: entries for section, entries in sections.items() if entries}
@@ -85,7 +93,7 @@ def write_debt(root, name, sections, order):
             path.unlink()
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render(f"# {name} technical debt", sections, order), encoding="utf-8")
+    write_lf(path, render(f"# {name} technical debt", sections, order))
 
 
 def sections_of(text):
@@ -132,7 +140,7 @@ def command_split(root):
         write_debt(root, name, existing, order)
     if index_note() not in index:
         index.insert(1, index_note())
-    (root / INDEX).write_text(render_index(index), encoding="utf-8")
+    write_lf(root / INDEX, render_index(index))
     print("\n".join(sorted(debt_file(name) for name in files)))
 
 
@@ -163,14 +171,14 @@ def apply_change(root, base, new, index_text):
         _, section, item, name = entry
         entries = load(name).setdefault(section, [])
         moved = relink(item, INDEX, debt_file(name))
-        position = len(entries)
+        position = 0 if anchor is None else len(entries)
         if anchor is not None and anchor[1] == section and anchor[3] == name:
             anchored = relink(anchor[2], INDEX, debt_file(name))
             if anchored in entries:
                 position = entries.index(anchored) + 1
         entries.insert(position, moved)
 
-    matcher = difflib.SequenceMatcher(None, [entry[2] for entry in before], [entry[2] for entry in after], autojunk=False)
+    matcher = difflib.SequenceMatcher(None, [entry[1:3] for entry in before], [entry[1:3] for entry in after], autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             continue
@@ -215,7 +223,7 @@ def command_resolve(root):
         touched = apply_change(root, base, theirs, ours)
     except LookupError as error:
         sys.exit(str(error))
-    (root / INDEX).write_text(ours, encoding="utf-8")
+    write_lf(root / INDEX, ours)
     git(root, "add", "--", INDEX, *touched)
     print("\n".join(touched))
 

@@ -60,6 +60,7 @@ bool SaveexecWritesDestinationFirst() {
 
 void TranslationContext::sSaveexec(const RdnaInstruction& inst, IrOpcode operation, bool negateExec, bool negateSource, bool write64, bool negateResult, bool writeResult) {
     // Callers name the lane-wise operation; the exec mask words themselves combine bitwise.
+    const IrOpcode laneOperation = operation;
     if (operation == IrOpcode::LogicalAnd) operation = IrOpcode::BitwiseAnd32;
     else if (operation == IrOpcode::LogicalOr) operation = IrOpcode::BitwiseOr32;
     else if (operation == IrOpcode::LogicalXor) operation = IrOpcode::BitwiseXor32;
@@ -88,19 +89,40 @@ void TranslationContext::sSaveexec(const RdnaInstruction& inst, IrOpcode operati
         return;
     }
     const IrU32 oldExec(ir.GetExecLo());
+    const IrU1 oldLane(ir.GetExec());
     const IrU32 savedExec = hostExecWord(0u);
-    if (writeFirst) writeRawU32(inst.destination, savedExec);
+    const bool lanes = program.WaveSize() == 32u && (execSource || maskLanesExact(sourceAt(inst, 0u)));
+    const auto writeSaved = [&](IrU32 word, IrU1 lane) {
+        writeRawU32(inst.destination, word);
+        if (lanes && inst.destination.kind == RdnaOperandKind::ScalarRegister) {
+            const auto reg = static_cast<ScalarReg>(inst.destination.reg);
+            ir.SetThreadBitScalarReg(reg, lane.Value());
+            ir.SetScalarMaskTag(reg, ir.ConstantBool(true));
+        }
+    };
+    if (writeFirst) writeSaved(savedExec, oldLane);
     const IrU32 source = execSource ? oldExec : readU32(sourceAt(inst, 0u));
-    if (!writeFirst && !writeResult) writeRawU32(inst.destination, savedExec);
+    IrU1 sourceLane;
+    if (lanes) sourceLane = execSource ? oldLane : readMask(sourceAt(inst, 0u));
+    if (!writeFirst && !writeResult) writeSaved(savedExec, oldLane);
     IrValue& execOperand = negateExec ? ir.BitwiseNot(oldExec.Value()) : oldExec.Value();
     IrValue& sourceOperand = negateSource ? ir.BitwiseNot(source.Value()) : source.Value();
     IrValue& combined = ir.Emit(operation, IrType::U32, {&execOperand, &sourceOperand});
     const IrU32 newExec(negateResult ? ir.BitwiseNot(combined) : combined);
     ir.SetExecLo(newExec.Value());
-    if (writeResult) writeRawU32(inst.destination, hostExecWord(0u));
+    IrU1 newLane;
+    if (lanes) {
+        IrValue& execLane = negateExec ? ir.LogicalNot(oldLane.Value()) : oldLane.Value();
+        IrValue& sourceLaneOperand = negateSource ? ir.LogicalNot(sourceLane.Value()) : sourceLane.Value();
+        IrValue& combinedLane = ir.Emit(laneOperation, IrType::U1, {&execLane, &sourceLaneOperand});
+        newLane = IrU1(negateResult ? ir.LogicalNot(combinedLane) : combinedLane);
+    } else {
+        newLane = threadBit({newExec, IrU32(ir.GetExecHi())});
+    }
+    if (writeResult) writeSaved(hostExecWord(0u), newLane);
     const IrU1 nonZero(ir.INotEqual(newExec.Value(), ir.Constant(0u)));
     ir.SetScc(nonZero.Value());
-    ir.SetExec(threadBit({newExec, IrU32(ir.GetExecHi())}).Value());
+    ir.SetExec(newLane.Value());
 }
 
 void TranslationContext::addU32(const RdnaInstruction& inst, bool vector, bool useCarryIn) {
@@ -259,6 +281,13 @@ void TranslationContext::sSwappcB64(const RdnaInstruction& inst) {
     IrValue& base = ir.Emit(IrOpcode::GetShaderBase, IrType::U64, {});
     const IrU64 link(ir.Emit(IrOpcode::IAdd64, IrType::U64, {&base, &ir.ConstantU64(static_cast<std::uint64_t>(currentProgramCounter) + 4u)}));
     writeU32Pair(inst.destination, extractU64(link));
+}
+
+void TranslationContext::TranslateUnlinkedCall(const RdnaInstruction& inst) {
+    const std::array<IrU32, 2> target = readU32Pair(inst.source0);
+    (void)ir.Emit(IrOpcode::UnlinkedCall, IrType::Void, {&target[0].Value(), &target[1].Value(), &ir.Constant(inst.programCounter)});
+    program.Info().usesFaultBuffer = true;
+    sSwappcB64(inst);
 }
 
 void TranslationContext::sCselectB32(const RdnaInstruction& inst) {

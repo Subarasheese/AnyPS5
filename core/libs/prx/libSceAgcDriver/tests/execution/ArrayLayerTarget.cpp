@@ -42,6 +42,7 @@ constexpr std::size_t LayerBytes = 65536;
 constexpr std::size_t SurfaceBytes = LayerBytes * Layers;
 constexpr std::uint32_t Format32Float = 22;
 constexpr std::uint32_t TileR64KBX = 0x1b;
+constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type2DArray = 13;
 constexpr std::uint32_t Color32FloatInfo = (4u << 2u) | (7u << 8u);
 constexpr std::uint32_t TiledAttrib3 = 0x4dc6c000u;
@@ -59,8 +60,14 @@ constexpr std::array<std::array<float, 4>, 3> Triangle{{
 }};
 
 alignas(256) std::array<std::array<std::uint32_t, 9>, Layers> LoadCodes{};
+alignas(256) constexpr std::array<std::uint32_t, 13> Sample2DCode{
+    0x7e020d00, 0x060202f0, 0x100202ff, 0x3c000000, 0x7e0402ff, 0x3b800000, 0xf09c0108, 0x00610301,
+    0x34080082, 0xbf8c3f70, 0xe0701000, 0x80000304, 0xbf810000,
+};
 alignas(256) std::array<std::uint32_t, 16> PixelCode{};
 alignas(256) std::array<std::uint32_t, Threads> Output{};
+
+void SampleSliceZero(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::uint32_t swizzleMode);
 
 std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
@@ -113,13 +120,13 @@ private:
     std::uint8_t* block = nullptr;
 };
 
-std::array<std::uint32_t, 8> ArrayDescriptor(std::uint64_t address, std::uint32_t swizzleMode) {
+std::array<std::uint32_t, 8> SurfaceDescriptor(std::uint64_t address, std::uint32_t swizzleMode, std::uint32_t type, std::uint32_t lastLayer) {
     return {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32Float << 20u) | (((Side - 1u) & 3u) << 30u),
         ((Side - 1u) >> 2u) | ((Side - 1u) << 14u),
-        0xfacu | (swizzleMode << 20u) | (Type2DArray << 28u),
-        Layers - 1u,
+        0xfacu | (swizzleMode << 20u) | (type << 28u),
+        lastLayer,
         0u,
         0u,
         0u,
@@ -146,16 +153,25 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> co
     device.WaitIdle();
 }
 
-void LoadLayer(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint32_t layer, std::uint32_t swizzleMode) {
+void Load(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::array<std::uint32_t, 8>& texture) {
     Output.fill(0xdeadbeefu);
-    auto& code = LoadCodes[layer];
-    code = {0x7e020280, 0x7e040280u | layer, 0xf0001128, 0x00010300, 0x34080082, 0xbf8c3f70, 0xe0701000, 0x80000304, 0xbf810000};
     std::vector<std::uint32_t> userData(16, 0u);
     const auto buffer = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
-    const auto texture = ArrayDescriptor(surface, swizzleMode);
+    const std::array<std::uint32_t, 4> pointSampler{0u, 0xfffu << 12u, 1u << 26u, 0u};
+    std::copy(pointSampler.begin(), pointSampler.end(), userData.begin() + 12);
     std::copy(buffer.begin(), buffer.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     Dispatch(device, code, userData);
+}
+
+void LoadLayer(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint32_t layer, std::uint32_t swizzleMode) {
+    auto& code = LoadCodes[layer];
+    code = {0x7e020280, 0x7e040280u | layer, 0xf0001128, 0x00010300, 0x34080082, 0xbf8c3f70, 0xe0701000, 0x80000304, 0xbf810000};
+    Load(device, code, SurfaceDescriptor(surface, swizzleMode, Type2DArray, Layers - 1u));
+}
+
+void Sample2D(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint32_t swizzleMode) {
+    Load(device, Sample2DCode, SurfaceDescriptor(surface, swizzleMode, Type2D, 0u));
 }
 
 void RequireOutput(std::uint32_t inside, std::uint32_t outside, const std::string& what) {
@@ -165,22 +181,23 @@ void RequireOutput(std::uint32_t inside, std::uint32_t outside, const std::strin
     }
 }
 
-AgcDriver::Graphics::ColorTarget DecodeTarget(std::uint64_t address, std::uint32_t slice, std::uint32_t swizzleMode) {
+AgcDriver::Graphics::ColorTarget DecodeTarget(std::uint64_t address, std::uint32_t slice, std::uint32_t swizzleMode, bool collapsed) {
     AgcDriver::Registers cx;
     cx[0x318] = static_cast<std::uint32_t>(address >> 8u);
     cx[0x31b] = slice | (slice << 13u);
     cx[0x31c] = Color32FloatInfo;
     cx[0x31d] = 0;
     cx[0x3b0] = ((Side - 1u) << 14u) | (Side - 1u);
-    cx[0x3b8] = (TiledAttrib3 & ~(0x1fu << 14u)) | (swizzleMode << 14u) | (Layers - 1u);
+    cx[0x3b8] = (TiledAttrib3 & ~(0x1fu << 14u)) | (swizzleMode << 14u) | (collapsed ? 0u : Layers - 1u);
     cx[0x390] = static_cast<std::uint32_t>(address >> 40u);
     const auto color = AgcDriver::Graphics::DecodeColorBuffer(cx, 0);
     Require(color.format == VK_FORMAT_R32_SFLOAT && color.bytes == LayerBytes && color.address == address + slice * LayerBytes, "the COLOR_32 float view did not decode as a 128x128 R32 slice of the array");
-    Require(color.arrayAddress == address && color.arrayLastSlice == Layers - 1u && color.arraySlice == slice, "the color view did not keep its array and slice");
+    if (collapsed) Require(color.arrayAddress == 0 && color.arrayLastSlice == 0, "a collapsed slice view unexpectedly describes a whole array");
+    else Require(color.arrayAddress == address && color.arrayLastSlice == Layers - 1u && color.arraySlice == slice, "the color view did not keep its array and slice");
     return color;
 }
 
-void DrawSlice(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint32_t slice, std::uint32_t swizzleMode) {
+void DrawSlice(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint32_t slice, std::uint32_t swizzleMode, bool collapsed) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     std::size_t at = 0;
@@ -207,7 +224,7 @@ void DrawSlice(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint
     const auto vertexResult = ShaderRecompiler::Recompile(vertex);
     const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
 
-    const auto color = DecodeTarget(surface, slice, swizzleMode);
+    const auto color = DecodeTarget(surface, slice, swizzleMode, collapsed);
     VkPipelineColorBlendAttachmentState blend{};
     blend.colorWriteMask = 0xf;
     AgcDriver::Graphics::State state{};
@@ -246,29 +263,49 @@ void DrawSlice(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint
     device.WaitIdle();
 }
 
-void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::uint32_t swizzleMode) {
+void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::uint32_t swizzleMode, bool collapsed = false, std::uint32_t slice = 1) {
     const auto surface = AddressOf(texels);
     std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
     AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
     AgcDriver::GuestMemory::BumpCollectEpoch();
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     const auto drawn = std::bit_cast<std::uint32_t>(Drawn);
-    DrawSlice(device, surface, 1, swizzleMode);
-    const auto pending = StorageTexture::FindPending(surface, SurfaceBytes);
-    Require(pending != nullptr && pending->Descriptor().dimension == TextureDimension::k2DArray && pending->Descriptor().baseAddress == surface && pending->Descriptor().depthOrLastArray == Layers - 1u, "the draw into slice 1 did not render into the image of its array");
-    LoadLayer(device, surface, 1, swizzleMode);
-    RequireOutput(drawn, Initial, "slice 1 read through the array after the draw");
-    for (const std::uint32_t other : {0u, 2u, 3u}) {
+    DrawSlice(device, surface, slice, swizzleMode, collapsed);
+    const auto pending = StorageTexture::FindPending(collapsed ? surface + slice * LayerBytes : surface, collapsed ? LayerBytes : SurfaceBytes);
+    if (collapsed) Require(pending != nullptr && pending->Descriptor().dimension == TextureDimension::k2D && pending->Descriptor().baseAddress == surface + slice * LayerBytes, "a collapsed slice did not render into its shifted surface");
+    else Require(pending != nullptr && pending->Descriptor().dimension == TextureDimension::k2DArray && pending->Descriptor().baseAddress == surface && pending->Descriptor().depthOrLastArray == Layers - 1u, "the draw into slice 1 did not render into the image of its array");
+    LoadLayer(device, surface, slice, swizzleMode);
+    RequireOutput(drawn, Initial, "slice " + std::to_string(slice) + " read through the array after the draw");
+    for (std::uint32_t other = 0; other < Layers; ++other) {
+        if (other == slice) continue;
         LoadLayer(device, surface, other, swizzleMode);
-        RequireOutput(Initial, Initial, "slice " + std::to_string(other) + " after the draw into slice 1");
+        RequireOutput(Initial, Initial, "slice " + std::to_string(other) + " after the draw into slice " + std::to_string(slice));
     }
     StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
     device.WaitIdle();
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
     AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
     AgcDriver::GuestMemory::BumpCollectEpoch();
-    LoadLayer(device, surface, 1, swizzleMode);
-    RequireOutput(drawn, Initial, "slice 1 uploaded again from guest memory");
+    LoadLayer(device, surface, slice, swizzleMode);
+    RequireOutput(drawn, Initial, "slice " + std::to_string(slice) + " uploaded again from guest memory");
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    SampleSliceZero(device, texels, swizzleMode);
+}
+
+void SampleSliceZero(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::uint32_t swizzleMode) {
+    const auto surface = AddressOf(texels);
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    DrawSlice(device, surface, 0, swizzleMode, false);
+    const auto pending = StorageTexture::FindPending(surface, LayerBytes);
+    Require(pending != nullptr && pending->Descriptor().dimension == TextureDimension::k2DArray, "the draw into slice 0 did not render into the image of its array");
+    const auto plain = SurfaceDescriptor(surface, swizzleMode, Type2D, 0u);
+    Require(AgcDriver::Graphics::Texture::CanCopyFrom(*pending, AgcDriver::Graphics::DecodeTextureResource(plain)), "a 2D texture over slice 0 cannot view the array image's first layer");
+    Sample2D(device, surface, swizzleMode);
+    RequireOutput(std::bit_cast<std::uint32_t>(Drawn), Initial, "slice 0 sampled as a 2D texture after the draw");
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
+    device.WaitIdle();
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
 }
 
@@ -281,6 +318,7 @@ int main() {
         if (!device) return VulkanTestSkipped;
         Run(*device, block.Data(), TileR64KBX);
         Run(*device, block.Data(), static_cast<std::uint32_t>(AgcDriver::Graphics::ColorTileMode::D64KBX));
+        for (std::uint32_t slice = 1; slice < Layers; ++slice) Run(*device, block.Data(), TileR64KBX, true, slice);
         std::puts("array layer target tests passed");
         return 0;
     } catch (const std::exception& error) {

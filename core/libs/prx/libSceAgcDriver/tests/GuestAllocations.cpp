@@ -7,6 +7,7 @@
 #include <cstring>
 #include <atomic>
 #include <exception>
+#include <memory>
 #include <thread>
 #include <array>
 #include <algorithm>
@@ -28,6 +29,35 @@ void reject(TAction action) {
     throw std::runtime_error("expected guest allocation ownership rejection");
 }
 
+void leaseSnapshotTests() {
+    std::array<std::byte, 128> memory{};
+    const auto address = reinterpret_cast<std::uintptr_t>(memory.data());
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(memory.data(), 64, true, true, true);
+    }
+    std::weak_ptr<const GuestAllocations::Range> held;
+    {
+        const auto first = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        const auto second = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        Require(!first.empty() && first.size() == second.size() && &first[0] == &second[0], "two leases taken without a registry change do not share one snapshot");
+        const auto found = std::find_if(first.begin(), first.end(), [&](const auto& range) { return range->address == address; });
+        Require(found != first.end(), "the shared snapshot misses a registered range");
+        held = *found;
+        Require(held.use_count() == 2, "the shared snapshot of two leases holds a range more than once");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(memory.data() + 64, 64, true, true, true);
+        }
+        const auto third = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        Require(&third[0] != &first[0] && std::any_of(third.begin(), third.end(), [&](const auto& range) { return range->address == address + 64; }), "a lease taken after a registry change still shares the old snapshot");
+    }
+    Require(held.use_count() == 1, "a snapshot outlived its leases");
+    GuestAllocations::Mutation mutation;
+    mutation.Remove(memory.data());
+    mutation.Remove(memory.data() + 64);
+}
+
 }
 
 void RunGuestLeaseWaitTests() {
@@ -38,8 +68,10 @@ void RunGuestLeaseWaitTests() {
         mutation.Add(memory.data(), 64, true, true, true);
         mutation.Add(memory.data() + 64, 64, true, true, true);
     }
-    auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    std::erase_if(lease, [&](const auto& range) { return range->address != address; });
+    GuestAllocations::Lease::Ranges lease;
+    for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
+        if (range->address == address) lease.push_back(range);
+    }
     std::atomic<bool> mutationEntered = false;
     std::atomic<bool> lookupFinished = false;
     std::exception_ptr failure;
@@ -56,8 +88,10 @@ void RunGuestLeaseWaitTests() {
         } catch (...) { failure = std::current_exception(); }
     });
     mutationEntered.wait(false);
-    auto other = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    std::erase_if(other, [&](const auto& range) { return range->address != address + 64; });
+    GuestAllocations::Lease::Ranges other;
+    for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
+        if (range->address == address + 64) other.push_back(range);
+    }
     const bool found = other.size() == 1 && other.front()->address == address + 64;
     lookupFinished.store(true);
     lease.clear();
@@ -74,6 +108,7 @@ void RunGuestLeaseWaitTests() {
 }
 
 void RunGuestAllocationTests() {
+    leaseSnapshotTests();
     void* pointer = GuestHeap::GuestHeapAllocate_nid_postfix(32);
     Require(reinterpret_cast<std::uintptr_t>(pointer) % alignof(std::max_align_t) == 0, "guest malloc is not suitably aligned");
     std::memset(pointer, 0x55, 32);

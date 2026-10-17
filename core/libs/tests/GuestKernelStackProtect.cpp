@@ -24,7 +24,7 @@ static constexpr std::uintptr_t Page = 0x4000;
 static constexpr std::size_t GuardBytes = 0x10000;
 static constexpr std::size_t HostBytes = 0x40000;
 
-static void Require(bool value) { if (!value) std::abort(); }
+#define Require(value) do { if (!(value)) { std::fprintf(stderr, "GuestKernelStackProtect failed at line %d\n", __LINE__); std::abort(); } } while (false)
 
 struct PageState {
     bool mapped;
@@ -81,6 +81,18 @@ static void* APS5_VABI Worker(void* arg) {
     Require(sceKernelIsStack(&local, &start, &end) == SCE_OK);
     const auto low = (reinterpret_cast<std::uintptr_t>(start) + Page - 1) & ~(Page - 1);
     Require(low + GuardBytes + Page < reinterpret_cast<std::uintptr_t>(&local));
+#ifdef __linux__
+    std::uintptr_t hostGuard = 0;
+    for (auto cursor = low; cursor >= Page && low - cursor <= 4 * 1024 * 1024; cursor -= Page) {
+        const auto page = QueryPage(cursor);
+        if (!page.mapped) break;
+        if (!page.writable) { hostGuard = cursor; break; }
+    }
+    Require(hostGuard != 0);
+    const auto hostGuardBefore = QueryPage(hostGuard).raw;
+    Require(mprotect_nid_postfix(reinterpret_cast<void*>(hostGuard), Page, 3) == -1);
+    Require(QueryPage(hostGuard).raw == hostGuardBefore);
+#endif
     auto* guard = reinterpret_cast<volatile unsigned char*>(low);
     Require(mprotect_nid_postfix(const_cast<unsigned char*>(guard), GuardBytes, 0) == 0);
 #ifdef _WIN32
@@ -142,7 +154,38 @@ static void* APS5_VABI WriteLeftGuard(void*) {
     return nullptr;
 }
 
+#ifdef _WIN32
+static void ProtectWholeStack() {
+    int local = 0;
+    void* start = nullptr;
+    void* end = nullptr;
+    Require(sceKernelIsStack(&local, &start, &end) == SCE_OK);
+    const auto stackBytes = reinterpret_cast<std::uintptr_t>(end) - reinterpret_cast<std::uintptr_t>(start);
+    Require(mprotect_nid_postfix(start, stackBytes, 0xc2) == 0);
+    Require(QueryPage(reinterpret_cast<std::uintptr_t>(start)).writable);
+    static_cast<volatile unsigned char*>(start)[0] = 6;
+}
+
+static DWORD WINAPI ProtectReservedStack(void*) {
+    ProtectWholeStack();
+    return 0;
+}
+
+static void ProtectHostStacks() {
+    ProtectWholeStack();
+    HANDLE thread = CreateThread(nullptr, HostBytes * 4, ProtectReservedStack, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    Require(thread != nullptr);
+    Require(WaitForSingleObject(thread, INFINITE) == WAIT_OBJECT_0);
+    DWORD exitCode = 1;
+    Require(GetExitCodeThread(thread, &exitCode) != 0 && exitCode == 0);
+    Require(CloseHandle(thread) != 0);
+}
+#endif
+
 int main() {
+#ifdef _WIN32
+    ProtectHostStacks();
+#endif
     std::atomic<bool> passed{false};
     Pthread thread = nullptr;
     Require(scePthreadCreate(&thread, nullptr, Worker, &passed, nullptr) == SCE_OK);
@@ -152,7 +195,11 @@ int main() {
     Require(scePthreadJoin(thread, nullptr) == SCE_OK);
     for (std::uintptr_t offset = 0; offset < GuardBytes; offset += Page) {
         const auto left = QueryPage(leftGuard.load() + offset);
+#ifdef __linux__
+        Require(!left.mapped || left.writable || left.raw == 1);
+#else
         Require(!left.mapped || left.writable);
+#endif
     }
     Require(scePthreadCreate(&thread, nullptr, WriteLeftGuard, nullptr, nullptr) == SCE_OK);
     Require(scePthreadJoin(thread, nullptr) == SCE_OK);

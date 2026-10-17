@@ -1,7 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_NATIVE_INCLUDE_NATIVEBACKEND_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_NATIVE_INCLUDE_NATIVEBACKEND_HPP
 
-// Native PC graphics backend for GT7 (PPSA01317).
+// Native PC graphics backend for GT7.
 //
 // The game's own CPU code builds its frame (pipelines, passes, renderables); this backend renders
 // it natively on the PC GPU (see NativeDevice.hpp) instead of emulating the PS5 GPU.
@@ -16,7 +16,7 @@
 namespace AgcDriver::Native {
 
 bool Enabled();
-// The native renderer (APS5_NATIVE_GPU=1, in development): GT7's command buffers run on the native
+// The default native renderer (in development): GT7's command buffers run on the native
 // executor (native compute and draws on the driver's Vulkan device, no PM4 emulation).
 bool GpuNative();
 // CPU-only profiling (APS5_NATIVE_SKIP_DRAWS=1): draw packets are counted and not rendered.

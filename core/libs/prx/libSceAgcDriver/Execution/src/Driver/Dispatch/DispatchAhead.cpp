@@ -35,6 +35,10 @@ bool& Driver::gateOpened() {
     return opened;
 }
 
+std::uint64_t Driver::DispatchesAdoptedAhead() const {
+    return dispatchesAdoptedAhead.load(std::memory_order_relaxed);
+}
+
 void Driver::clearResolvedAhead() {
     auto& resolved = resolvedAhead();
     if (resolved.empty()) return;
@@ -146,7 +150,7 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
                 const auto argumentsEnd = arguments + 3u * sizeof(std::uint32_t);
                 const bool written = std::any_of(writes.begin(), writes.end(), [&](const auto& range) { return range.first < argumentsEnd && arguments < range.second; })
                     || std::any_of(labels.begin(), labels.end(), [&](const RunLabel& label) { return label.address < argumentsEnd && arguments < label.address + label.size; });
-                if (unknownWrites || written) {
+                if ((unknownWrites || written) && indirectArgumentsPath(packet, arguments) != IndirectGpu) {
                     ++stats.writtenBefore;
                     break;
                 }
@@ -155,6 +159,7 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
             try {
                 if (opcode == 0x15) dispatch(scratch, packet, submission);
                 else dispatchIndirect(scratch, packet, submission);
+                Pm4::NoteDispatchRegisters(packet, scratch);
             } catch (const std::exception&) {
                 ++stats.failures;
                 break;

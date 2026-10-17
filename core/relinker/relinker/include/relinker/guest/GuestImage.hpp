@@ -5,6 +5,7 @@
 #include <domain/Types.hpp>
 #include <relinker/domain/ISyscallScanner.hpp>
 #include <filesystem>
+#include <domain/IProgress.hpp>
 #include <set>
 #include <string>
 #include <vector>
@@ -65,11 +66,17 @@ struct GuestArtifact {
     std::vector<std::uint8_t> Bytes;
     std::vector<Domain::CallRegistryEntry> Imports;
     std::filesystem::path SourcePath;
+    std::vector<std::string> NeededLibraries;
+};
+
+struct GuestModuleInput {
+    std::filesystem::path Path;
+    std::vector<std::uint8_t> Bytes;
 };
 
 class GuestModuleBuilder {
 public:
-    std::vector<GuestArtifact> Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, bool windows, bool macos, bool toIntel, bool toRosetta, ISyscallScanner& syscallScanner, bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& sceModulePath, const std::vector<std::string>& moduleDirectories = {}) const;
+    std::vector<GuestArtifact> Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, bool windows, bool macos, bool toIntel, bool toRosetta, ISyscallScanner& syscallScanner, bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& root, const std::vector<std::filesystem::path>& runtimeDirectories, std::vector<GuestModuleInput> modules, Domain::IProgress& progress) const;
 };
 
 }

@@ -1,6 +1,7 @@
 #include <relinker/analysis/CodeInstructionCollector.hpp>
 #include <relinker/analysis/UnusedNidFilter/IControlFlowGraph.hpp>
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
+#include <relinker/analysis/SceCodeExtent.hpp>
 #include <codegen/x86/X64InstructionDecoder.hpp>
 #include <codegen/CodegenException.hpp>
 #include <io/BufferUtils.hpp>
@@ -12,6 +13,7 @@
 #include <span>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 namespace Relinker {
 
@@ -34,7 +36,13 @@ public:
 
 }
 
-std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers) const {
+std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress, std::set<Domain::VirtualAddress>* entryRoots) const {
+    std::uint64_t lastProgress = 0;
+    const auto report = [&](std::uint64_t completed) {
+        if (completed <= lastProgress) return;
+        lastProgress = completed;
+        if (progress) progress(completed, 10000);
+    };
     const auto range = [&](std::uint64_t offset, std::uint64_t size) {
         if (offset > bytes.size() || size > bytes.size() - offset) throw Domain::RelinkerException("Code analysis: file range exceeds image", offset);
     };
@@ -47,8 +55,9 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
         }
         throw Domain::RelinkerException("Code analysis: unmapped address", address);
     };
+    auto codeHeaders = headers;
     const auto isCode = [&](std::uint64_t address) {
-        for (const auto& header : headers) if (header.Type == 1 && (header.Flags & 1) != 0 && address >= header.MappedAddress && address - header.MappedAddress < header.FileSize) return true;
+        for (const auto& header : codeHeaders) if (header.Type == 1 && (header.Flags & 1) != 0 && address >= header.MappedAddress && address - header.MappedAddress < header.FileSize) return true;
         return false;
     };
     std::map<std::uint64_t, std::uint64_t> tags;
@@ -85,6 +94,21 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
         range(offset, size);
         return offset;
     };
+    if (sceBase) {
+        const auto unwindFunctions = UnusedNidFilter::ReadExceptionFunctions(bytes, headers, {}, {});
+        for (auto& header : codeHeaders) {
+            if (header.Type != 1 || (header.Flags & 1) == 0) continue;
+            range(header.Offset, header.FileSize);
+            const std::span<const std::uint8_t> segment(bytes.data() + header.Offset, header.FileSize);
+            const auto end = FindSceCodeEnd(segment, header.MappedAddress, unwindFunctions, value(3, 0x61000027).value_or(0), value(2, 0x6100002d).value_or(0)).value_or(header.MappedAddress + header.FileSize);
+            auto begin = header.MappedAddress;
+            for (const auto& interpreter : headers)
+                if (interpreter.Type == 3 && interpreter.MappedAddress >= begin && interpreter.MappedAddress < end) begin = interpreter.MappedAddress + std::min(interpreter.FileSize, end - interpreter.MappedAddress);
+            header.Offset += begin - header.MappedAddress;
+            header.MappedAddress = begin;
+            header.FileSize = end - begin;
+        }
+    }
     std::set<std::uint64_t> roots;
     std::map<std::uint64_t, std::uint64_t> functions;
     const auto addRoot = [&](std::uint64_t address) { if (isCode(address)) roots.insert(address); };
@@ -223,6 +247,10 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
     const Codegen::X64InstructionDecoder decoder;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> skipped;
     std::set<std::uint64_t> staticTargets;
+    std::uint64_t functionBytes = 0;
+    for (const auto& [begin, end] : functions) functionBytes += end - begin;
+    std::uint64_t decodedBytes = 0;
+    report(1000);
     for (const auto& [begin, end] : functions) {
         const auto offset = fileOffset(begin, end - begin);
         for (auto address = begin; address < end;) {
@@ -253,8 +281,14 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
                 addRoot(target);
             }
             address += info.Length;
+            decodedBytes += info.Length;
+            if (progress && (decodedBytes & 65535) < info.Length) report(1000 + 2500 * decodedBytes / functionBytes);
         }
     }
+    report(3500);
+    std::uint64_t scanBytes = 0;
+    for (const auto& header : headers) if (header.Type == 1 && (header.Flags & 1) != 0) scanBytes += header.FileSize;
+    std::uint64_t scannedBytes = 0;
     for (const auto& header : headers) {
         if (header.Type != 1 || (header.Flags & 1) == 0 || header.FileSize < 16) continue;
         range(header.Offset, header.FileSize);
@@ -263,11 +297,15 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
         const auto paddedStart = [&](std::size_t address) { return address % 16 == 0 && address >= 2 && text[address - 1] == 0xcc && text[address - 2] == 0xcc; };
         const auto nextPaddedStart = [&](std::size_t address) {
             address = (address + 16) & ~std::size_t{15};
-            while (address < size && !paddedStart(address)) address += 16;
+            while (address < size && !paddedStart(address)) {
+                if (progress && address % 65536 == 0) report(3500 + 2500 * (scannedBytes + address) / scanBytes);
+                address += 16;
+            }
             return address;
         };
         bool afterTransfer = false;
         for (std::size_t position = nextPaddedStart(0); position < size;) {
+            if (progress && position % 65536 < 16) report(3500 + 2500 * (scannedBytes + position) / scanBytes);
             const auto aligned = (position + 15) & ~std::size_t{15};
             const bool zeroPadding = afterTransfer && aligned != position && aligned <= size && std::all_of(text + position, text + aligned, [](const std::uint8_t value) { return value == 0; });
             afterTransfer = false;
@@ -301,7 +339,9 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
             afterTransfer = info.FlowKind != Codegen::ControlFlowKind::Sequential && info.FlowKind != Codegen::ControlFlowKind::ConditionalBranch;
             position = next;
         }
+        scannedBytes += header.FileSize;
     }
+    report(6000);
     const auto decodesInSegment = [&](std::uint64_t address) {
         for (const auto& header : headers) {
             if (header.Type != 1 || (header.Flags & 1) == 0 || address < header.MappedAddress || address - header.MappedAddress >= header.FileSize) continue;
@@ -322,18 +362,18 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
     }
     std::size_t previousRoots = 0;
     std::unordered_set<Domain::VirtualAddress> decodedInstructions;
-    std::vector<std::unordered_set<Domain::VirtualAddress>> sectionReachable(headers.size());
+    std::vector<std::unordered_set<Domain::VirtualAddress>> sectionReachable(codeHeaders.size());
     do {
         previousRoots = roots.size();
-        for (std::size_t i = 0; i < headers.size(); ++i) {
-            const auto& header = headers[i];
+        for (std::size_t i = 0; i < codeHeaders.size(); ++i) {
+            const auto& header = codeHeaders[i];
             if (header.Type != 1 || (header.Flags & 1) == 0 || header.FileSize == 0) continue;
             range(header.Offset, header.FileSize);
             std::vector<std::uint64_t> entries;
             for (const auto root : roots) if (root >= header.MappedAddress && root - header.MappedAddress < header.FileSize) entries.push_back(root);
             if (entries.empty()) continue;
             const std::span<const std::uint8_t> text(bytes.data() + header.Offset, header.FileSize);
-            const auto graph = UnusedNidFilter::BuildControlFlowGraph(text, header.MappedAddress, entries.front(), entries, pointers, true, sectionReachable[i]);
+            const auto graph = UnusedNidFilter::BuildControlFlowGraph(text, header.MappedAddress, entries.front(), entries, pointers, true, sectionReachable[i], [&](std::uint64_t count) { report(6000 + 2500 * count / std::max<std::uint64_t>(scanBytes, 1)); });
             for (const auto address : graph->ReachableVaddrs()) {
                 if (!decodedInstructions.insert(address).second) continue;
                 instructions.insert(address);
@@ -344,8 +384,12 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
             }
         }
     } while (roots.size() != previousRoots);
+    report(8500);
+    std::uint64_t checked = 0;
     std::uint64_t previousEnd = 0;
     for (const auto address : instructions) {
+        if (progress && checked % 4096 == 0) report(8500 + 1499 * checked / instructions.size());
+        ++checked;
         if (address < previousEnd) {
             std::uint64_t spanEnd = previousEnd;
             try {
@@ -394,6 +438,8 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
             break;
         }
     }
+    report(10000);
+    if (entryRoots) *entryRoots = std::move(roots);
     return instructions;
 }
 

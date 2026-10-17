@@ -5,7 +5,7 @@
 namespace Elfpatcher::Windows {
 
 WindowsImports WindowsImportBuilder::Build(const std::uint32_t sectionRva) const {
-    const std::vector<std::string> names = {"ExitProcess", "FormatMessageA", "FreeLibrary", "GetCommandLineW", "GetFileAttributesW", "GetLastError", "GetModuleFileNameW", "GetModuleHandleA", "GetModuleHandleW", "GetProcAddress", "GetStdHandle", "GetSystemDirectoryW", "LoadLibraryExA", "LoadLibraryExW", "LocalFree", "MultiByteToWideChar", "RaiseException", "SetCurrentDirectoryW", "VirtualAlloc", "WideCharToMultiByte", "WriteFile", "lstrcatA", "lstrcmpA", "lstrcmpiA", "lstrcpyA", "lstrlenA"};
+    const std::vector<std::string> names = {"CloseHandle", "CreateFileW", "ExitProcess", "FormatMessageA", "FreeLibrary", "GetCommandLineW", "GetEnvironmentVariableW", "GetFileAttributesW", "GetLastError", "GetModuleFileNameW", "GetModuleHandleA", "GetModuleHandleW", "GetProcAddress", "GetStdHandle", "GetSystemDirectoryW", "LoadLibraryExA", "LoadLibraryExW", "LocalFree", "MultiByteToWideChar", "RaiseException", "SetCurrentDirectoryW", "SetEnvironmentVariableW", "SetStdHandle", "VirtualAlloc", "WaitForSingleObject", "WideCharToMultiByte", "WriteFile", "lstrcatA", "lstrcmpA", "lstrcmpiA", "lstrcpyA", "lstrlenA"};
     WindowsImports result{{".idata", sectionRva, SectionRead | SectionWrite | 0x40u, std::vector<std::uint8_t>(40)}, {sectionRva, 40}, {}, {}};
     auto& bytes = result.Section.Data;
     const auto lookupOffset = bytes.size();
@@ -52,7 +52,7 @@ std::vector<std::string> WindowsImportBuilder::ReadLibraries(const Domain::SysVD
     // AnyPS5 implements the C runtime in libc.prx. Windows GetProcAddress
     // does not search a module's dependencies as ELF symbol lookup does.
     // Keep the requested module first, then make its shared runtime visible.
-    if (unique.contains("libSceLibcInternal.prx") && !unique.contains("libc.prx"))
+    if ((unique.contains("libSceLibcInternal.prx") || unique.contains("libkernel.prx")) && !unique.contains("libc.prx"))
         result.push_back("libc.prx");
     return result;
 }

@@ -1,6 +1,8 @@
 import contextlib
 import io
 import json
+import os
+import subprocess
 import tempfile
 import sys
 import unittest
@@ -94,6 +96,31 @@ class DatabaseCacheTests(unittest.TestCase):
 class NidArgumentTests(unittest.TestCase):
     options = ["-h", "--help", "--db", "--nid", "--json"]
 
+    def test_name_and_nid_modes_conflict_even_with_empty_filters(self):
+        for name_option in ("--name", "--symbol", "--na", "--sym"):
+            for nid_option in ("--nid", "--ni"):
+                for names, nids in (
+                        ([name_option], [nid_option]),
+                        ([name_option, "ceilf"], [nid_option]),
+                        ([name_option + "=ceilf"], [nid_option]),
+                        ([name_option], [nid_option, "AAAAAAAAAAA"]),
+                        ([name_option], [nid_option + "=AAAAAAAAAAA"])):
+                    for arguments in (names + nids, nids + names):
+                        with self.subTest(arguments=arguments), \
+                                contextlib.redirect_stdout(io.StringIO()) as output, \
+                                contextlib.redirect_stderr(io.StringIO()) as error, \
+                                patch.object(nid_names, "load_db", return_value={}) as database, \
+                                patch.object(nid_names, "collect_unknowns", return_value={}) as sources, \
+                                patch.object(nid_names, "collect_real_names", return_value=set()) as definitions:
+                            with self.assertRaises(SystemExit) as exited:
+                                nid_names.main([*arguments, "--json"])
+                            self.assertEqual(exited.exception.code, 2)
+                            self.assertIn("--name/--symbol cannot be combined with --nid", error.getvalue())
+                            self.assertEqual(output.getvalue(), "")
+                            database.assert_not_called()
+                            sources.assert_not_called()
+                            definitions.assert_not_called()
+
     def test_invalid_nids_fail_before_database_or_source_access(self):
         for nid in ("short", "ABCDEFGHIJKL", "ABCDEFGHIJ/", "ABCDEFGHIJ_", "ABCDEFGHIJ\u00e9", "", "--jsooon"):
             with self.subTest(nid=nid):
@@ -178,6 +205,31 @@ class SourceCollectionTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
+    def cli(self, *arguments):
+        tools = self.root / "tools"
+        tools.mkdir(exist_ok=True)
+        tool = tools / "nid_names.py"
+        tool.write_bytes(Path(nid_names.__file__).read_bytes())
+        return subprocess.run([sys.executable, str(tool), *map(str, arguments)],
+                              env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+                              capture_output=True, timeout=10)
+
+    def test_report_preserves_unicode_paths_with_legacy_stdout(self):
+        self.write_source('APS5_EXPORT("AAAAAAAAAAA", exampleUnknown00);\n', "\u8cc7\u6599.cpp")
+        database = self.root / "aerolib.csv"
+        database.write_bytes(b"")
+        result = self.cli("--db", database)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+        self.assertIn("core/libs/prx/libSceExample/\u8cc7\u6599.cpp", result.stdout.decode("utf-8"))
+
+    def test_error_preserves_unicode_paths_with_legacy_stderr(self):
+        database = self.root / "\u8cc7\u6599"
+        database.mkdir()
+        result = self.cli("--db", database)
+        self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", errors="replace"))
+        self.assertIn("\u8cc7\u6599", result.stderr.decode("utf-8"))
+        self.assertNotIn(b"Traceback", result.stderr)
+
     def test_comments_and_literals_do_not_create_export_records(self):
         self.write_source('''// APS5_EXPORT("AAAAAAAAAAA", exampleUnknown00);
 /* int APS5_VABI sceCommented() { return 0; } */
@@ -188,6 +240,20 @@ int APS5_VABI sceReal() { return 0; }
 ''')
         self.assertEqual(nid_names.collect_unknowns(), {"CCCCCCCCCCC": "core/libs/prx/libSceExample/Export.cpp:exampleUnknown02"})
         self.assertEqual(nid_names.collect_real_names(), {"sceReal"})
+
+    def test_assembly_export_macros_are_real_names(self):
+        self.write_source('''asm(".text\n"
+    APS5_ASM_FUNCTION("sceAsmCall_nid_postfix")
+    "ret\n"
+    APS5_SIGNAL_ASM_FUNCTION("sigAsmCall_nid_postfix")
+    "ret\n");
+// APS5_ASM_FUNCTION("sceCommented_nid_postfix")
+auto example = "APS5_ASM_FUNCTION(\"sceQuoted_nid_postfix\")";
+''')
+        self.assertEqual(nid_names.collect_real_names(), {
+            "sceAsmCall", "sceAsmCall_nid_postfix",
+            "sigAsmCall", "sigAsmCall_nid_postfix",
+        })
 
     def test_formatted_alias_macro_is_detected(self):
         self.write_source('APS5_EXPORT (\n "AAAAAAAAAAA" ,\n exampleUnknown00\n );\n')
@@ -240,9 +306,46 @@ int APS5_VABI sceReal() { return 0; }
 ''')
         self.assertEqual(nid_names.collect_real_names(), {"sceReal"})
 
+    def test_name_option_computes_symbol_nid(self):
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["nid_names.py", "--name", "ceilf", "floorf"]), contextlib.redirect_stdout(output):
+            self.assertEqual(nid_names.main(), 0)
+        text = output.getvalue()
+        self.assertIn("ceilf", text)
+        self.assertIn("GAUuLKGhsCw", text)
+        self.assertIn("floorf", text)
+        self.assertIn("mKhVDmYciWA", text)
+
+    def test_name_option_with_json_emits_symbols_list(self):
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["nid_names.py", "--name", "ceilf", "--json"]), contextlib.redirect_stdout(output):
+            self.assertEqual(nid_names.main(), 0)
+        data = json.loads(output.getvalue())
+        self.assertEqual(data, {"symbols": [{"name": "ceilf", "nid": "GAUuLKGhsCw"}]})
+
+    def test_symbol_alias_does_not_load_database(self):
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["nid_names.py", "--symbol", "truncf"]), \
+                patch.object(nid_names, "load_db", side_effect=AssertionError("unexpected db load")), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(nid_names.main(), 0)
+        self.assertIn("Vo8rvWtZw3g", output.getvalue())
+
+    def test_name_option_rejects_nid_and_keeps_long_names(self):
+        with patch.object(sys, "argv", ["nid_names.py", "--name", "ceilf", "--nid", "AAAAAAAAAAA"]), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                nid_names.main()
+        long_name = "a" * 50
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["nid_names.py", "--name", long_name]), contextlib.redirect_stdout(output):
+            self.assertEqual(nid_names.main(), 0)
+        self.assertIn(long_name, output.getvalue())
+
     def test_spliced_line_comment_and_macro_tokens(self):
         self.write_source('// continued \\\nAPS5_EXPORT("AAAAAAAAAAA", exampleUnknown00);\nAPS5_EX\\\nPORT("BBBBBBBBBBB", exampleUnknown01);\n')
         self.assertEqual(nid_names.collect_unknowns(), {"BBBBBBBBBBB": "core/libs/prx/libSceExample/Export.cpp:exampleUnknown01"})
+
 
 
 if __name__ == "__main__":

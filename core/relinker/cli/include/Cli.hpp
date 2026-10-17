@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <optional>
 
 namespace Cli {
 
@@ -22,6 +23,9 @@ struct Args {
     bool autorun = false;
     bool windowsDiagnostics = false;
     bool windowsGui = false;
+    std::optional<std::uint64_t> windowsFixedBase;
+    bool traceImports = false;
+    std::optional<std::uint64_t> linuxFixedBase;
     std::uint32_t unusedFilterLevel = 0;
     std::string inputPath;
     std::string outputPath;
@@ -29,6 +33,7 @@ struct Args {
     std::string runPath = "$ORIGIN/libs";
     std::set<std::string> excludedSceModules;
     std::vector<std::string> moduleDirectories;
+    std::vector<std::string> executables;
 };
 
 Args ParseArgs(int argc, char* argv[]);

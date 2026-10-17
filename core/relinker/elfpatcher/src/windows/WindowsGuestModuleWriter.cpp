@@ -6,6 +6,7 @@
 #include <elfpatcher/windows/WindowsRelocationBuilder.hpp>
 #include <elfpatcher/windows/WindowsTrampolineBuilder.hpp>
 #include <io/BufferUtils.hpp>
+#include <io/NativePath.hpp>
 #include <algorithm>
 #include <map>
 #include <iterator>
@@ -58,8 +59,8 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
             } else if (type == 18) {
                 const auto tls = std::find_if(guest.Headers.begin(), guest.Headers.end(), [](const auto& header) { return header.Type == 7; });
                 if (tls == guest.Headers.end() || (symbolIndex != 0 && (symbol.Section == 0 || (symbol.Info & 15) != 6))) throw Domain::RelinkerException("Unsupported external static TLS relocation", target);
-                const auto size = Io::AlignUp64(tls->MemorySize, std::max<std::uint64_t>(tls->Alignment, 16));
-                image.WritePointer(target, symbol.Value + addend - size);
+                const auto threadPointerOffset = Io::AlignUp64(tls->MemorySize, std::max<std::uint64_t>(tls->Alignment, 1));
+                image.WritePointer(target, symbol.Value + addend - threadPointerOffset);
             } else if (type == 1 || type == 6 || type == 7) {
                 if (symbolIndex == 0 || (type != 1 && addend != 0) || (symbol.Info & 15) == 6) throw Domain::RelinkerException("Invalid guest symbol relocation", target);
                 if (symbol.Section == Relinker::AbsoluteSection) image.WritePointer(target, symbol.Value + addend);
@@ -70,7 +71,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
                 } else {
                     if (symbol.Name.empty()) throw Domain::RelinkerException("Empty guest import", target);
                     image.WritePointer(target, 0);
-                    runtime.Imports.push_back({symbol.Name, rva, addend, 1, symbol.Library});
+                    runtime.Imports.push_back({symbol.Name, rva, addend, 1, symbol.Library, type == 7 || (type == 6 && (symbol.Info & 15) == 2)});
                 }
             } else throw Domain::RelinkerException("Unsupported Windows guest relocation " + std::to_string(type), target);
         }
@@ -84,7 +85,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
     try {
         directories[9] = WindowsTlsBuilder().Build(guest.Bytes, guest.Headers, image, sections, relocations, nextRva, &tlsIndex);
     } catch (Domain::RelinkerException& error) {
-        error.InputPath = guest.SourcePath.string();
+        if (error.InputPath.empty()) error.InputPath = Io::Utf8Path(guest.SourcePath);
         throw;
     }
     WindowsTrampolineBuilder().Build(guest.Trampolines, image, sections, nextRva);

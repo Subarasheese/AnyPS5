@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
+#include <string>
 #include <thread>
 
 extern "C" {
@@ -17,6 +19,7 @@ int APS5_VABI scePadGetHandle(int, int, int);
 int APS5_VABI scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(bool);
 int APS5_VABI scePadSetVibrationMode(int, int);
 int APS5_VABI scePadInit_nid_postfix(void);
+int APS5_VABI scePadUnknown_n3kSX62fgNo();
 int APS5_VABI scePadRead_nid_postfix(int, PadData*, int);
 int APS5_VABI scePadReadState(int, PadData*);
 int APS5_VABI scePadSetTiltCorrectionState(int, bool);
@@ -28,6 +31,16 @@ int APS5_VABI scePadIsRemoteController(int, bool*);
 
 static void Require(bool value) { if (!value) std::abort(); }
 
+static void RequireUnknownPadNidNotImplemented() {
+    try {
+        scePadUnknown_n3kSX62fgNo();
+    } catch (const std::runtime_error& error) {
+        Require(std::string(error.what()) == "scePadUnknown_n3kSX62fgNo not implemented");
+        return;
+    }
+    std::abort();
+}
+
 static void CheckInputCommands() {
     const auto path = std::filesystem::temp_directory_path() / ("anyps5-pad-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup {
@@ -36,7 +49,7 @@ static void CheckInputCommands() {
     } cleanup{path};
     const auto write = [&](const char* command) { std::ofstream(path) << command << '\n'; };
     write("1 16384 200");
-    Pad::InputCommandFile commands(path.string().c_str());
+    Pad::InputCommandFile commands(path);
     Require(commands.Buttons(1000) == 0);
     write("2 16384 200");
     Require(commands.Buttons(101000) == 0x4000);
@@ -85,7 +98,7 @@ static void CheckInputCommands() {
     Require(accepted.buttons == 0x2000 && accepted.hasSticks && accepted.sticks[3] == 4);
     std::filesystem::remove(path);
     Require(commands.Buttons(3001000) == 0);
-    Pad::InputCommandFile disabled(nullptr);
+    Pad::InputCommandFile disabled(std::filesystem::path{});
     Require(disabled.Buttons(0) == 0);
 }
 
@@ -99,7 +112,7 @@ static float SettleOrientationW() {
 }
 
 static void CheckTiltCorrection(int handle) {
-    Require(scePadInit_nid_postfix() == 0);
+    RequireUnknownPadNidNotImplemented();
     PadInputState tilted;
     tilted.hasMotion = true;
     tilted.accel = {9.80665f, 0.0f, 0.0f};
@@ -110,6 +123,24 @@ static void CheckTiltCorrection(int handle) {
     Require(SettleOrientationW() == 1.0f);
     Require(scePadSetTiltCorrectionState(handle, true) == PAD_OK);
     Require(SettleOrientationW() < 0.999f);
+    PadPublishInput_nid_postfix(PadInputState{});
+}
+
+static void CheckAngularVelocityDeadband(int handle) {
+    PadInputState moving;
+    moving.hasMotion = true;
+    moving.accel = {0.0f, 9.80665f, 0.0f};
+    moving.gyro = {0.01f, 0.0175f, -0.017f};
+    PadPublishInput_nid_postfix(moving);
+    PadData data{};
+    Require(scePadReadState(handle, &data) == PAD_OK);
+    Require(data.angular_velocity_x == 0.01f && data.angular_velocity_y == 0.0175f && data.angular_velocity_z == -0.017f);
+    Require(scePadSetAngularVelocityDeadbandState(handle, true) == PAD_OK);
+    Require(scePadReadState(handle, &data) == PAD_OK);
+    Require(data.angular_velocity_x == 0.0f && data.angular_velocity_y == 0.0175f && data.angular_velocity_z == 0.0f);
+    Require(scePadSetAngularVelocityDeadbandState(handle, false) == PAD_OK);
+    Require(scePadReadState(handle, &data) == PAD_OK);
+    Require(data.angular_velocity_x == 0.01f && data.angular_velocity_z == -0.017f);
     PadPublishInput_nid_postfix(PadInputState{});
 }
 
@@ -222,16 +253,35 @@ static void CheckInjectedState(const std::filesystem::path& path) {
 
 int main() {
     CheckInputCommands();
+    Require(scePadUnknown_n3kSX62fgNo() == static_cast<int>(0x80920005));
     const auto path = std::filesystem::temp_directory_path() / ("anyps5-pad-state-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup {
         std::filesystem::path path;
         ~Cleanup() { std::error_code error; std::filesystem::remove(path, error); }
-    } cleanup{path};
+    };
+    auto commandPath = path;
+    commandPath += std::filesystem::path(u8"-žluťoučký-漢字");
+    Cleanup cleanup{commandPath};
 #ifdef _WIN32
-    Require(_putenv_s("APS5_PAD_INPUT_FILE", path.string().c_str()) == 0);
+    Require(_wputenv_s(L"APS5_PAD_INPUT_FILE", commandPath.c_str()) == 0);
 #else
-    Require(setenv("APS5_PAD_INPUT_FILE", path.string().c_str(), 1) == 0);
+    Require(setenv("APS5_PAD_INPUT_FILE", commandPath.string().c_str(), 1) == 0);
 #endif
+    {
+        std::uint32_t sequence = 0;
+        PadOutputState snapshot;
+        Pad::SetVibration(12, 34);
+        PadSubmitAudioHaptics_nid_postfix(100, 150);
+        Require(PadFetchOutput_nid_postfix(&sequence, &snapshot));
+        Require(snapshot.audioVibrationLarge == 100 && snapshot.audioVibrationSmall == 150);
+        Require(snapshot.vibrationLarge == 12 && snapshot.vibrationSmall == 34);
+        PadSubmitAudioHaptics_nid_postfix(0, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        Require(PadFetchOutput_nid_postfix(&sequence, &snapshot));
+        Require(snapshot.audioVibrationLarge == 0 && snapshot.audioVibrationSmall == 0);
+        Require(snapshot.vibrationLarge == 12 && snapshot.vibrationSmall == 34);
+        Pad::SetVibration(0, 0);
+    }
     constexpr int noHandle = static_cast<int>(0x80920008);
     constexpr int user = 0x10000000;
 
@@ -246,6 +296,8 @@ int main() {
     Require(scePadGetHandle(user, 0, 0) == noHandle);
     Require(scePadOpen_nid_postfix(user, PAD_PORT_TYPE_SPECIAL, 0, nullptr) == static_cast<int>(0x80920007));
     Require(scePadGetHandle(user, 0, 0) == noHandle);
+    Require(scePadInit_nid_postfix() == 0);
+    Require(scePadUnknown_n3kSX62fgNo() == static_cast<int>(0x809200ff));
     const int handle = scePadOpen_nid_postfix(user, 0, 0, nullptr);
     Require(handle > 0);
     Require(scePadGetHandle(user, 0, 0) == handle);
@@ -253,16 +305,19 @@ int main() {
     Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == noHandle);
     Require(scePadGetHandle(user, 0, 0) == handle);
     CheckTiltCorrection(handle);
+    CheckAngularVelocityDeadband(handle);
     CheckTouchContact();
     CheckPartialTrigger();
     CheckReadQueue(handle);
     CheckReadStateHandle(handle);
     CheckRemoteController(handle);
-    CheckInjectedState(path);
+    CheckInjectedState(commandPath);
     Require(scePadSetVibrationMode(handle, 1) == 0);
     Require(scePadSetVibrationMode(handle, 2) == 0);
     Require(scePadSetVibrationMode(handle, 3) == 0);
     Require(scePadSetVibrationMode(handle, 4) == PAD_ERROR_INVALID_ARG);
+    Require(scePadSetVibrationMode(handle, 5) == 0);
+    Require(scePadSetVibrationMode(handle, 6) == PAD_ERROR_INVALID_ARG);
     Require(scePadSetVibrationMode(handle, -1) == PAD_ERROR_INVALID_ARG);
     Require(scePadGetHandle(0xff, 16, 0) == handle);
     Require(scePadGetHandle(user, 16, 0) == noHandle);
@@ -272,6 +327,7 @@ int main() {
     Require(scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(true) == 0);
     Require(scePadSetAngularVelocityDeadbandState(handle, false) == 0);
     Require(scePadSetAngularVelocityDeadbandState(handle + 1, false) == PAD_ERROR_INVALID_HANDLE);
+    Require(scePadSetAngularVelocityDeadbandState(handle + 1, true) == PAD_ERROR_INVALID_HANDLE);
     Require(scePadSetAngularVelocityBiasCorrectionState(handle, false) == PAD_OK);
     Require(scePadSetAngularVelocityBiasCorrectionState(handle + 1, false) == PAD_ERROR_INVALID_HANDLE);
 }

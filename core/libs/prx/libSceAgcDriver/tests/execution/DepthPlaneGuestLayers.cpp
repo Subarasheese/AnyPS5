@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -225,15 +226,7 @@ void FillLayer(std::uint8_t* layer, float depth) {
     for (std::size_t offset = 0; offset < LayerBytes; offset += sizeof(depth)) std::memcpy(layer + offset, &depth, sizeof(depth));
 }
 
-void Run(const Context& base, const WatchedBlock& block) {
-    TextureDetiler detiler(base);
-    auto context = base;
-    context.detiler = &detiler;
-    const auto address = block.Address();
-    FillLayer(block.Data(), 1.0f);
-    FillLayer(block.Data() + LayerBytes, 0.25f);
-    Require(DepthSliceBytes({Side, Side}, 4u) == LayerBytes, "the depth slice of the test surface is not one layer of the guest block");
-    DepthSurfaceView(context, DepthTarget{address, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0, 0});
+GuestTextureResource ArrayOver(std::uint64_t address) {
     GuestTextureResource resource{};
     resource.baseAddress = address;
     resource.width = Side;
@@ -247,8 +240,19 @@ void Run(const Context& base, const WatchedBlock& block) {
     resource.dstSelY = 5;
     resource.dstSelZ = 6;
     resource.dstSelW = 7;
-    const std::array<std::uint32_t, 8> words{};
-    const VkComponentMapping components{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    return resource;
+}
+
+constexpr std::array<std::uint32_t, 8> words{};
+constexpr VkComponentMapping components{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+
+void Run(const Context& context, const WatchedBlock& block) {
+    const auto address = block.Address();
+    FillLayer(block.Data(), 1.0f);
+    FillLayer(block.Data() + LayerBytes, 0.25f);
+    Require(DepthSliceBytes({Side, Side}, 4u) == LayerBytes, "the depth slice of the test surface is not one layer of the guest block");
+    DepthSurfaceView(context, DepthTarget{address, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0, 0});
+    const auto resource = ArrayOver(address);
     watchedBegin = address + LayerBytes;
     watchedEnd = address + BlockBytes;
     AgcDriver::GuestMemory::SetFlushHook(&CountReads);
@@ -295,6 +299,90 @@ void Run(const Context& base, const WatchedBlock& block) {
     AgcDriver::GuestMemory::SetFlushHook(nullptr);
 }
 
+void RecordedUploads(const Context& context, const WatchedBlock& block) {
+    const auto resource = ArrayOver(block.Address());
+    Recorder recorder(context);
+    recorder.Activate();
+    for (int round = 1; round <= 3; ++round) {
+        FillLayer(block.Data() + LayerBytes, 0.125f * static_cast<float>(round));
+        const auto before = recorder.OpenKeptBytes();
+        Require(DepthSurfaceTexture(context, words, resource, components) != nullptr, "the 2D array over the depth surface was not sampled through its depth planes while recording");
+        const auto kept = recorder.OpenKeptBytes() - before;
+        Require(kept >= LayerBytes, "the recorded upload of a written guest layer added " + std::to_string(kept) + " bytes to the open batch's kept bytes, less than the " + std::to_string(LayerBytes) + " bytes of the layer it holds until the batch completes");
+    }
+    recorder.Sync();
+}
+
+void RunCubeGather(const Context& base, const WatchedBlock& block) {
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.width = Side;
+    resource.height = Side;
+    resource.depthOrLastArray = 5;
+    resource.mipCount = 2;
+    resource.tileMode = TextureTileMode::kZ64KBX;
+    resource.dimension = TextureDimension::kCube;
+    resource.format = Format32Float;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto geometry = DescribeSurface(resource);
+    Require(geometry.layerBytes != LayerBytes, "the cube fixture's per-layer footprint must not match one host depth slice");
+    const auto address = block.Address();
+    resource.baseAddress = address;
+    ClearDepthSurfaces(context.device);
+    for (std::uint32_t layer = 0; layer < 6; ++layer) {
+        DepthSurfaceView(context, DepthTarget{address + geometry.GuestLayerOffset(layer), 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0, 0});
+    }
+    imageToBufferCopies = 0;
+    bufferToImageCopies = 0;
+    const auto texture = DepthSurfaceTexture(context, words, resource, components);
+    Require(texture != nullptr, "a cube over six depth surfaces at the descriptor's layer offsets was not sampled through their depth planes");
+    if (imageToBufferCopies.load() != 6 || bufferToImageCopies.load() != 1) {
+        throw std::runtime_error("sampling a cube over six depth surfaces recorded " + std::to_string(imageToBufferCopies.load()) + " depth surface copies and " + std::to_string(bufferToImageCopies.load()) + " plane copy fills, expected 6 and 1");
+    }
+    ClearDepthSurfaces(context.device);
+}
+
+void RunCubeTiledSlice(const Context& base, const WatchedBlock& block) {
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    constexpr VkExtent2D extent{64, 64};
+    GuestTextureResource resource{};
+    resource.width = extent.width;
+    resource.height = extent.height;
+    resource.depthOrLastArray = 5;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kZ64KBX;
+    resource.dimension = TextureDimension::kCube;
+    resource.format = Format32Float;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto geometry = DescribeSurface(resource);
+    const auto slice = DepthSliceBytes(extent, 4u);
+    Require(geometry.layerBytes == slice && geometry.sliceLinearBytes != slice, "the tiled cube fixture must have a layer footprint equal to a depth slice but a different linear footprint");
+    const auto address = block.Address();
+    resource.baseAddress = address;
+    ClearDepthSurfaces(context.device);
+    for (std::uint32_t layer = 0; layer < 6; ++layer) {
+        DepthSurfaceView(context, DepthTarget{address + geometry.GuestLayerOffset(layer), 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0, 0});
+    }
+    imageToBufferCopies = 0;
+    bufferToImageCopies = 0;
+    const auto texture = DepthSurfaceTexture(context, words, resource, components);
+    Require(texture != nullptr, "a tiled cube whose linear layer footprint differs from a depth slice was not sampled through its depth planes");
+    if (imageToBufferCopies.load() != 6 || bufferToImageCopies.load() != 1) {
+        throw std::runtime_error("sampling a tiled cube over six depth surfaces recorded " + std::to_string(imageToBufferCopies.load()) + " depth surface copies and " + std::to_string(bufferToImageCopies.load()) + " plane copy fills, expected 6 and 1");
+    }
+    ClearDepthSurfaces(context.device);
+}
+
 }
 
 int main() {
@@ -312,9 +400,15 @@ int main() {
             return Skipped;
         }
         {
+            TextureDetiler detiler(device->GetContext());
+            auto context = device->GetContext();
+            context.detiler = &detiler;
             WatchedBlock block;
             Require(AgcDriver::GuestMemory::Watched(block.Address(), BlockBytes), "depth plane guest layers: the guest block is not write-watched");
-            Run(device->GetContext(), block);
+            Run(context, block);
+            RecordedUploads(context, block);
+            RunCubeGather(context, block);
+            RunCubeTiledSlice(context, block);
         }
         device.reset();
         std::puts("depth plane guest layer tests passed");

@@ -62,7 +62,7 @@ def main():
             artifact = case / "app0" / "Media" / "Plugins" / "plugin.prx.guest.prx"
             assert artifact.read_bytes().startswith(b"MZ" if windows else b"\x7fELF"), artifact
             assert list((case / "app0").rglob("*.guest.prx")) == [artifact]
-            assert "    Media/Plugins/plugin.prx.guest.prx\n" in result.stdout, result.stdout
+            assert "        |-- Media/\n              |-- Plugins/\n                    |-- plugin.prx.guest.prx\n" in result.stdout, result.stdout
             if windows and os.name == "nt":
                 run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
                 assert run.returncode == 42, (run.returncode, run.stdout, run.stderr)
@@ -100,7 +100,7 @@ def main():
             artifact = case / "app0" / "root.prx.guest.prx"
             assert list((case / "app0").rglob("*.guest.prx")) == [artifact], list(case.rglob("*.guest.prx"))
             assert artifact.read_bytes().startswith(b"MZ" if windows else b"\x7fELF"), artifact
-            assert "    root.prx.guest.prx\n" in result.stdout, result.stdout
+            assert "        |-- root.prx.guest.prx\n" in result.stdout, result.stdout
             if windows:
                 assert "__aps5_guest_initialize" in pe_export_names(artifact.read_bytes())
             else:
@@ -120,6 +120,16 @@ def main():
             else:
                 assert "$ORIGIN/app0/needed.prx.guest.prx" in needed_libraries(output.read_bytes()), needed_libraries(output.read_bytes())
 
+            case = work / f"{windows}-root-executable"
+            (case / "picker").mkdir(parents=True)
+            (case / "picker" / "picker.bin").write_bytes(main_fixture())
+            (case / "root.prx").write_bytes(module_with_symbol(True))
+            result, output = convert(case, windows, ["--module-dir", ".", "--executable", "picker/picker.bin"])
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            picker = case / ("picker.picker.bin" + output.suffix)
+            assert picker.read_bytes().startswith(b"MZ" if windows else b"\x7fELF"), picker
+            assert list((case / "app0").rglob("*.guest.prx")) == [case / "app0" / "root.prx.guest.prx"], list(case.rglob("*.guest.prx"))
+
             case = work / f"{windows}-plugins"
             for rejected, message in ((str(plugins), "inside the guest module parent directory"),
                                       ("../outside", "inside the guest module parent directory"),
@@ -127,6 +137,19 @@ def main():
                                       ("sce_module", "Duplicate guest module directory")):
                 result, output = convert(case, windows, ["--module-dir", rejected])
                 assert result.returncode == 2 and message in result.stderr, (rejected, result.stderr)
+
+            aliases = [["SCE_MODULE"], ["Media/Plugins", "media/plugins"]] if (case / "MEDIA").exists() else []
+            if os.name != "nt":
+                (case / "linked").symlink_to("sce_module", target_is_directory=True)
+                aliases.append(["linked"])
+            for names in aliases:
+                result, output = convert(case, windows, [option for name in names for option in ("--module-dir", name)])
+                assert result.returncode == 2 and "Duplicate guest module directory" in result.stderr, (names, result.stderr)
+            if not (case / "MEDIA").exists():
+                (case / "SCE_MODULE").mkdir()
+                result, output = convert(case, windows, ["--module-dir", "SCE_MODULE"])
+                assert result.returncode == 0, (result.stdout, result.stderr)
+                (case / "SCE_MODULE").rmdir()
 
             result, output = convert(case, windows, ["--skip-sce-module", "--module-dir", "Media/Plugins"])
             assert result.returncode != 0 and "conflicts with --skip-sce-module" in result.stderr, result.stderr

@@ -1,6 +1,7 @@
 #include <relinker/guest/GuestImage.hpp>
 #include <relinker/parsing/ElfReader.hpp>
 #include <io/BufferUtils.hpp>
+#include <io/NativePath.hpp>
 #include <algorithm>
 #include <bit>
 #include <limits>
@@ -87,8 +88,8 @@ std::vector<std::string> GuestImageReader::ReadModuleNames(const std::vector<std
     return names;
 }
 
-GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector<std::uint8_t> bytes, const bool windows) const {
-    const auto fail = [&](const std::string& message) { throw Domain::RelinkerException(path.string() + ": " + message); };
+GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector<std::uint8_t> bytes, const bool windows) const try {
+    const auto fail = [&](const std::string& message) { throw Domain::RelinkerException(Io::Utf8Path(path) + ": " + message); };
     const auto range = [&](std::uint64_t offset, std::uint64_t size) {
         if (offset > bytes.size() || size > bytes.size() - offset) {
             std::ostringstream message;
@@ -148,7 +149,7 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
         if (tag == 1) needed.push_back(value);
         else if (tag == 0x61000045) moduleImports.push_back(value);
         else if (tag == 0x6100000d || tag == 0x61000043) moduleExports.push_back(value);
-        else if (tag < 0x60000000 || tag == 0x6100003f || (tag >= 0x61000027 && tag <= 0x6100003b)) {
+        else if (tag < 0x60000000 || tag == 0x6ffffef5 || tag == 0x6100003f || (tag >= 0x61000027 && tag <= 0x6100003b)) {
             if (!tags.emplace(tag, value).second) fail("Duplicate dynamic tag " + std::to_string(tag));
         }
     }
@@ -194,7 +195,35 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
     std::uint64_t symSize = 0;
     if (tags.contains(0x6100003f)) symSize = tags.at(0x6100003f);
     else if (tags.contains(4)) symSize = static_cast<std::uint64_t>(Io::ReadU32(bytes, translate(tags.at(4), 8) + 4)) * 24;
-    else fail("Missing dynamic symbol count");
+    else if (tags.contains(0x6ffffef5)) {
+        const auto address = tags.at(0x6ffffef5);
+        const auto header = translate(address, 16);
+        const auto bucketCount = Io::ReadU32(bytes, header);
+        const auto firstSymbol = Io::ReadU32(bytes, header + 4);
+        const auto bloomCount = Io::ReadU32(bytes, header + 8);
+        if (bucketCount == 0 || bloomCount == 0 || firstSymbol == 0) fail("Invalid GNU hash header");
+        const std::uint64_t bucketOffset = 16 + static_cast<std::uint64_t>(bloomCount) * 8;
+        const auto chainOffset = bucketOffset + static_cast<std::uint64_t>(bucketCount) * 4;
+        const auto start = translate(address, chainOffset);
+        std::uint64_t lastBucket = 0;
+        for (std::uint64_t index = 0; index < bucketCount; ++index) {
+            const auto bucket = Io::ReadU32(bytes, start + bucketOffset + index * 4);
+            if (bucket != 0 && bucket < firstSymbol) fail("Invalid GNU hash bucket");
+            lastBucket = std::max(lastBucket, static_cast<std::uint64_t>(bucket));
+        }
+        std::uint64_t symbolCount = firstSymbol;
+        if (lastBucket != 0) {
+            symbolCount = lastBucket;
+            for (;;) {
+                const auto offset = chainOffset + (symbolCount - firstSymbol) * 4;
+                if (offset > std::numeric_limits<std::uint64_t>::max() - address) fail("Invalid GNU hash chain");
+                const auto chain = Io::ReadU32(bytes, translate(address + offset, 4));
+                ++symbolCount;
+                if (chain & 1) break;
+            }
+        }
+        symSize = symbolCount * 24;
+    } else fail("Missing dynamic symbol count");
     if (symSize == 0 || symSize % 24 != 0 || symSize / 24 > std::numeric_limits<std::uint32_t>::max()) fail("Invalid dynamic symbol count");
     const auto symOffset = table(6, 0x61000039, symSize);
     image.Dynamic.DynSymData.assign(bytes.begin() + symOffset, bytes.begin() + symOffset + symSize);
@@ -333,6 +362,9 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
     if (tags.contains(33) && tags.at(33) != 0 && image.Init == 0) fail("Guest PREINIT_ARRAY has no module initializer");
     image.Bytes = std::move(bytes);
     return image;
+} catch (Domain::RelinkerException& error) {
+    if (error.InputPath.empty()) error.InputPath = Io::Utf8Path(path);
+    throw;
 }
 
 }

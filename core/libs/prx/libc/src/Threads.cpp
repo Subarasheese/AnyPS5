@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <limits>
@@ -24,18 +25,18 @@ struct Xtime {
 constexpr std::int64_t nanosPerSecond = 1000000000;
 constexpr std::int64_t longestSleepSeconds = 86400;
 
-timespec XtimeDeadline(const Xtime& time) {
+timespec XtimeDeadline(const Xtime& time, const char* function) {
     constexpr auto largest = std::numeric_limits<std::int64_t>::max();
     constexpr auto smallest = std::numeric_limits<std::int64_t>::min();
     const auto carry = time.nsec / nanosPerSecond;
     auto nanos = time.nsec % nanosPerSecond;
     auto seconds = time.sec;
     if ((carry > 0 && seconds > largest - carry) || (carry < 0 && seconds < smallest - carry))
-        throw std::overflow_error("_Thrd_sleep: xtime seconds overflow");
+        throw std::overflow_error(std::string(function) + ": xtime seconds overflow");
     seconds += carry;
     if (nanos < 0) {
         if (seconds == smallest)
-            throw std::overflow_error("_Thrd_sleep: xtime seconds overflow");
+            throw std::overflow_error(std::string(function) + ": xtime seconds overflow");
         nanos += nanosPerSecond;
         --seconds;
     }
@@ -44,6 +45,7 @@ timespec XtimeDeadline(const Xtime& time) {
 
 constexpr int threadSuccess = 0;
 constexpr int threadNomem = 1;
+constexpr int threadTimedout = 2;
 constexpr int threadBusy = 3;
 constexpr int threadError = 4;
 
@@ -105,6 +107,10 @@ int APS5_VABI _Mtx_init_nid_postfix(void** handle, int type) {
     mutex->type = type;
     *handle = mutex;
     return threadSuccess;
+}
+
+int APS5_VABI _Mtx_init_with_name_nid_postfix(void** handle, int type, const char*) {
+    return _Mtx_init_nid_postfix(handle, type);
 }
 
 void APS5_VABI _Mtx_destroy_nid_postfix(void** handle) {
@@ -216,6 +222,44 @@ int APS5_VABI _Cnd_wait_nid_postfix(void** conditionHandle, void** mutexHandle) 
     return threadSuccess;
 }
 
+int APS5_VABI _Cnd_timedwait_nid_postfix(void** conditionHandle, void** mutexHandle, const Xtime* target) {
+    if (!target)
+        APS5_INVALID_ARG_EX;
+    const auto deadline = XtimeDeadline(*target, "_Cnd_timedwait");
+    constexpr auto maxDuration = std::chrono::system_clock::duration::max();
+    constexpr auto minDuration = std::chrono::system_clock::duration::min();
+    constexpr auto maxSeconds = std::chrono::duration_cast<std::chrono::seconds>(maxDuration).count();
+    constexpr auto minSeconds = std::chrono::duration_cast<std::chrono::seconds>(minDuration).count();
+    constexpr auto maxNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(maxDuration - std::chrono::seconds(maxSeconds)).count();
+    if (deadline.tv_sec > maxSeconds || (deadline.tv_sec == maxSeconds && deadline.tv_nsec > maxNanos) ||
+        deadline.tv_sec < minSeconds)
+        throw std::overflow_error("_Cnd_timedwait: xtime seconds overflow");
+    auto* condition = ResolveCondition(conditionHandle, "_Cnd_timedwait");
+    auto* mutex = ResolveMutex(mutexHandle, "_Cnd_timedwait");
+    if (!IsOwnedByCaller(mutex))
+        return threadSuccess;
+    if (mutex->count != 1)
+        return threadSuccess;
+    mutex->count = 0;
+    mutex->owner.store(std::thread::id{}, std::memory_order_release);
+    std::unique_lock lock(mutex->native, std::adopt_lock);
+    bool timeout = false;
+    try {
+        const auto deadlineTime = std::chrono::system_clock::time_point(
+            std::chrono::seconds(deadline.tv_sec) + std::chrono::nanoseconds(deadline.tv_nsec));
+        timeout = (condition->native.wait_until(lock, deadlineTime) == std::cv_status::timeout);
+    } catch (const std::system_error&) {
+        lock.release();
+        mutex->owner.store(std::this_thread::get_id(), std::memory_order_release);
+        mutex->count = 1;
+        throw;
+    }
+    lock.release();
+    mutex->owner.store(std::this_thread::get_id(), std::memory_order_release);
+    mutex->count = 1;
+    return timeout ? threadTimedout : threadSuccess;
+}
+
 int APS5_VABI _Cnd_broadcast_nid_postfix(void** handle) {
     ResolveCondition(handle, "_Cnd_broadcast")->native.notify_all();
     return threadSuccess;
@@ -229,7 +273,7 @@ int SignalCondition_nid_no_patch(void** handle) {
 int APS5_VABI _Thrd_sleep_nid_postfix(const Xtime* target, Xtime*) {
     if (!target)
         APS5_INVALID_ARG_EX;
-    const auto deadline = XtimeDeadline(*target);
+    const auto deadline = XtimeDeadline(*target, "_Thrd_sleep");
     for (;;) {
         timespec now{};
         if (clock_gettime(CLOCK_REALTIME, &now) != 0)
@@ -250,4 +294,10 @@ int APS5_VABI _Thrd_sleep_nid_postfix(const Xtime* target, Xtime*) {
     }
 }
 
+
+int APS5_VABI _Cnd_signal_nid_postfix(void** handle) {
+    return SignalCondition_nid_no_patch(handle);
 }
+
+}
+

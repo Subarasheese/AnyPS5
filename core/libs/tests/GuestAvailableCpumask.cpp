@@ -1,9 +1,13 @@
 #include "SceTypes.hpp"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <stdexcept>
+#include <thread>
+#include <utility>
 
 extern "C" {
 KernelCpumask APS5_VABI sceKernelGetAvailableCpumask(void);
@@ -22,6 +26,8 @@ int APS5_VABI getpid_nid_postfix(void);
 int* APS5_VABI __error_nid_postfix();
 Pthread APS5_VABI pthread_self_nid_postfix(void);
 int APS5_VABI pthread_getaffinity_np_nid_postfix(Pthread thread, std::size_t cpusetSize, void* cpuset);
+int APS5_VABI pthread_setaffinity_np_nid_postfix(Pthread thread, std::size_t cpusetSize, const void* cpuset);
+int APS5_VABI scePthreadGetthreadid(void);
 }
 
 static constexpr int SCE_OK = 0;
@@ -40,6 +46,8 @@ struct RestoreProcessMask {
 };
 
 static constexpr std::size_t GUEST_CPUSET_BYTES = 32;
+static constexpr int GUEST_ESRCH = 3;
+static constexpr int GUEST_EDEADLK = 11;
 static constexpr int GUEST_EINVAL = 22;
 static constexpr int GUEST_EFAULT = 14;
 static constexpr int GUEST_ERANGE = 34;
@@ -57,6 +65,13 @@ static KernelCpumask ReadCpuset(Pthread thread) {
 
 static void* APS5_VABI Worker(void* arg) {
     static_cast<std::future<void>*>(arg)->get();
+    return nullptr;
+}
+
+static void* APS5_VABI RecordThreadId(void* arg) {
+    auto* data = static_cast<std::pair<std::atomic<int>*, std::future<void>*>*>(arg);
+    data->first->store(scePthreadGetthreadid(), std::memory_order_release);
+    data->second->get();
     return nullptr;
 }
 
@@ -223,6 +238,39 @@ int main() {
         Require(unionResult == 0 && unionSet[0] == (first | last));
         Require(ownResult == 0 && ownSet[0] == last);
     }
+    std::uint64_t request[GUEST_CPUSET_BYTES / sizeof(std::uint64_t)] = {first, 0, 0, 0};
+    Require(pthread_setaffinity_np_nid_postfix(pthread_self_nid_postfix(), GUEST_CPUSET_BYTES, request) == 0);
+    Require(ReadCpuset(pthread_self_nid_postfix()) == first);
+    std::promise<void> settle;
+    auto settled = settle.get_future();
+    Pthread target = nullptr;
+    Require(scePthreadCreate(&target, &attr, Worker, &settled, nullptr) == SCE_OK);
+    request[0] = last;
+    Require(pthread_setaffinity_np_nid_postfix(target, GUEST_CPUSET_BYTES, request) == 0);
+    Require(ReadCpuset(target) == last && ReadCpuset(pthread_self_nid_postfix()) == first);
+    request[0] = available | (1ull << 40);
+    request[3] = 1ull << 63;
+    Require(pthread_setaffinity_np_nid_postfix(target, GUEST_CPUSET_BYTES, request) == 0);
+    Require(ReadCpuset(target) == available);
+    const std::uint64_t outside[GUEST_CPUSET_BYTES / sizeof(std::uint64_t)] = {1ull << 40, 1, 0, 0};
+    Require(pthread_setaffinity_np_nid_postfix(target, GUEST_CPUSET_BYTES, outside) == GUEST_EDEADLK);
+    Require(pthread_setaffinity_np_nid_postfix(pthread_self_nid_postfix(), GUEST_CPUSET_BYTES, outside) == GUEST_EDEADLK);
+    Require(ReadCpuset(target) == available && ReadCpuset(pthread_self_nid_postfix()) == first);
+    for (const std::size_t size : {std::size_t{0}, std::size_t{8}, std::size_t{31}, std::size_t{33}, std::size_t{64}}) {
+        Require(pthread_setaffinity_np_nid_postfix(pthread_self_nid_postfix(), size, request) == GUEST_ERANGE);
+        Require(pthread_setaffinity_np_nid_postfix(target, size, request) == GUEST_ERANGE);
+    }
+    Require(pthread_setaffinity_np_nid_postfix(target, GUEST_CPUSET_BYTES, nullptr) == GUEST_EFAULT);
+    Require(pthread_setaffinity_np_nid_postfix(nullptr, GUEST_CPUSET_BYTES, request) == GUEST_EINVAL);
+    std::uint64_t unknownThread[8]{};
+    Require(pthread_setaffinity_np_nid_postfix(reinterpret_cast<Pthread>(unknownThread), GUEST_CPUSET_BYTES, request) == GUEST_ESRCH);
+    Require(pthread_setaffinity_np_nid_postfix(reinterpret_cast<Pthread>(unknownThread), 8, request) == GUEST_ESRCH);
+    settle.set_value();
+    Require(scePthreadJoin(target, nullptr) == SCE_OK);
+    Require(pthread_setaffinity_np_nid_postfix(target, GUEST_CPUSET_BYTES, request) == GUEST_ESRCH);
+    request[0] = available;
+    request[3] = 0;
+    Require(pthread_setaffinity_np_nid_postfix(pthread_self_nid_postfix(), GUEST_CPUSET_BYTES, request) == 0);
     Require(scePthreadAttrDestroy(&attr) == SCE_OK);
 
     Require(ReadCpuset(pthread_self_nid_postfix()) == available);
@@ -232,4 +280,47 @@ int main() {
     Require(pthread_getaffinity_np_nid_postfix(nullptr, GUEST_CPUSET_BYTES, rawSet) == GUEST_EINVAL);
     Require(pthread_getaffinity_np_nid_postfix(nullptr, 0, rawSet) == GUEST_EINVAL);
     Require(pthread_getaffinity_np_nid_postfix(pthread_self_nid_postfix(), GUEST_CPUSET_BYTES, nullptr) == GUEST_EFAULT);
+    Require(cpuset_getaffinity_nid_postfix(3, 1, scePthreadGetthreadid(), 8, processSet) == 0 && processSet[0] == available);
+    Require(cpuset_getaffinity_nid_postfix(3, 1, 999999, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_ESRCH);
+    Require(cpuset_getaffinity_nid_postfix(3, 2, 999999, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_ESRCH);
+    Require(cpuset_getaffinity_nid_postfix(99, 1, -1, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_EINVAL);
+    Require(cpuset_getaffinity_nid_postfix(99, 1, 999999, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_ESRCH);
+    Require(cpuset_getaffinity_nid_postfix(99, 2, 999999, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_ESRCH);
+    Require(cpuset_getaffinity_nid_postfix(3, 99, -1, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_EINVAL);
+    Require(cpuset_setaffinity_nid_postfix(3, 1, scePthreadGetthreadid(), 8, processSet) == 0);
+    Require(cpuset_setaffinity_nid_postfix(3, 1, 999999, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_ESRCH);
+    Require(cpuset_setaffinity_nid_postfix(3, 2, 999999, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_ESRCH);
+    Require(cpuset_setaffinity_nid_postfix(99, 1, -1, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_EINVAL);
+    Require(cpuset_setaffinity_nid_postfix(99, 1, 999999, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_ESRCH);
+    Require(cpuset_setaffinity_nid_postfix(99, 2, 999999, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_ESRCH);
+    Require(cpuset_setaffinity_nid_postfix(3, 99, -1, 8, processSet) == -1 && *__error_nid_postfix() == GUEST_EINVAL);
+    const auto throws = [](auto&& call) {
+        try {
+            call();
+            return false;
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+    };
+    Require(throws([&] { cpuset_getaffinity_nid_postfix(1, 1, -1, 8, processSet); }));
+    Require(throws([&] { cpuset_getaffinity_nid_postfix(2, 1, -1, 8, processSet); }));
+    Require(throws([&] { cpuset_getaffinity_nid_postfix(3, 3, -1, 8, processSet); }));
+    Require(throws([&] { cpuset_getaffinity_nid_postfix(3, 4, -1, 8, processSet); }));
+    Require(throws([&] { cpuset_setaffinity_nid_postfix(1, 1, -1, 8, processSet); }));
+    Require(throws([&] { cpuset_setaffinity_nid_postfix(2, 1, -1, 8, processSet); }));
+    Require(throws([&] { cpuset_setaffinity_nid_postfix(3, 3, -1, 8, processSet); }));
+    Require(throws([&] { cpuset_setaffinity_nid_postfix(3, 4, -1, 8, processSet); }));
+    std::promise<void> holdOther;
+    auto heldOther = holdOther.get_future();
+    std::atomic<int> otherTid{0};
+    Pthread otherThread = nullptr;
+    std::pair otherArg{&otherTid, &heldOther};
+    Require(scePthreadCreate(&otherThread, nullptr, RecordThreadId, &otherArg, nullptr) == SCE_OK);
+    while (otherTid.load(std::memory_order_acquire) == 0) std::this_thread::yield();
+    Require(throws([&] { cpuset_getaffinity_nid_postfix(3, 1, otherTid.load(), 8, processSet); }));
+    Require(throws([&] { cpuset_setaffinity_nid_postfix(3, 1, otherTid.load(), 8, processSet); }));
+    holdOther.set_value();
+    Require(scePthreadJoin(otherThread, nullptr) == SCE_OK);
+    Require(cpuset_getaffinity_nid_postfix(3, 1, otherTid.load(), 8, processSet) == -1 && *__error_nid_postfix() == GUEST_ESRCH);
+    Require(cpuset_setaffinity_nid_postfix(3, 1, otherTid.load(), 8, processSet) == -1 && *__error_nid_postfix() == GUEST_ESRCH);
 }

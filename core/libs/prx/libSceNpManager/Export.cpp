@@ -238,13 +238,27 @@ int APS5_VABI sceNpUnregisterPremiumEventCallback(void) {
     return 0;
 }
 
-int APS5_VABI sceNpGetUserIdByAccountId() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceNpGetUserIdByAccountId(uint64_t account_id, int* user_id) {
+    if (account_id == 0 || !user_id) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    return SCE_NP_ERROR_SIGNED_OUT;
 }
 
 int APS5_VABI sceNpGetSandboxInfo(void* sandbox_info) {
     (void)sandbox_info;
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+APS5_EXPORT("8weiQyIdI3A", sceNpUnknown_8weiQyIdI3A);
+int APS5_VABI sceNpUnknown_8weiQyIdI3A(int userId, void* buffer) {
+    (void)userId;
+    (void)buffer;
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+APS5_EXPORT("WxLcN76q19o", sceNpUnknown_WxLcN76q19o);
+int APS5_VABI sceNpUnknown_WxLcN76q19o(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

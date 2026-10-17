@@ -115,6 +115,7 @@ def td_target(module, td_path, td_lib):
 
 
 def generate(module, nids, db, td_path=None, td_lib=None):
+    module = re.sub(r"\.prx$", "", module, flags=re.IGNORECASE)
     prefix = module_prefix(module)
     path, lib = td_target(module, td_path, td_lib)
     used = set()
@@ -146,7 +147,7 @@ def generate(module, nids, db, td_path=None, td_lib=None):
         if display is not None:
             chunks.append("")
             chunks.append("int APS5_VABI %s(void) {" % func)
-            chunks.append('    NotImplemented_nid_no_patch("%s");' % nid)
+            chunks.append("    NotImplemented_nid_no_patch(__func__);")
             chunks.append("    return 0;")
             chunks.append("}")
             td.append("- [%s](%s) (%s) - unknown signature" % (display, path, lib))
@@ -197,7 +198,11 @@ def write_outputs(outputs):
             temporary.replace(path)
     finally:
         for temporary, path in staged:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except PermissionError:
+                temporary.chmod(0o600)
+                temporary.unlink(missing_ok=True)
 
 
 def main(argv=None):
@@ -211,6 +216,8 @@ def main(argv=None):
     ap.add_argument("--td-out", required=False, default=None, help="output file for TechnicalDebt lines, which go in docs/dev/debt/MODULE.md, default stderr when code uses stdout, otherwise stdout")
     ap.add_argument("--td-only", action="store_true", help="print only TechnicalDebt lines, no code")
     args = ap.parse_args(argv)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", newline="\n")
     try:
         if not args.td_only and args.out and args.td_out and same_file(args.out, args.td_out):
             ap.error("--out and --td-out must name different files")

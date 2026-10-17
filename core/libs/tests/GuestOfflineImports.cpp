@@ -14,6 +14,7 @@ int APS5_VABI sceHttpSendRequest(int, const void*, std::size_t);
 int APS5_VABI sceNpEntitlementAccessGetEntitlementKey(
     std::uint32_t, const NpUnifiedEntitlementLabel*, NpEntitlementAccessEntitlementKey*);
 int APS5_VABI sceNpEntitlementAccessGetGameTrialsFlag(std::uint32_t*);
+int APS5_VABI sceNpEntitlementAccessGetPftFlag(std::uint32_t*);
 int APS5_VABI sceNpEntitlementAccessRequestUnifiedEntitlementInfoList();
 int APS5_VABI sceNpEntitlementAccessPollUnifiedEntitlementInfoList();
 int APS5_VABI sceNpEntitlementAccessRequestServiceEntitlementInfoList();
@@ -25,7 +26,7 @@ int APS5_VABI sceNpEntitlementAccessPollServiceEntitlementInfo();
 int APS5_VABI sceRudpInit_nid_postfix(void*, int);
 int APS5_VABI sceRudpActivate();
 int APS5_VABI sceRudpGetStatus(void*, std::size_t);
-int APS5_VABI sceRudpTerminate();
+int APS5_VABI sceRudpEnd();
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -72,6 +73,11 @@ int main() {
     Require(trialsFlag[0] == 0 && trialsFlag[1] == 0x5a5a5a5au);
     Require(sceNpEntitlementAccessGetGameTrialsFlag(nullptr) == parameter);
 
+    std::array<std::uint32_t, 2> pftFlag{0xa5a5a5a5u, 0x5a5a5a5au};
+    Require(sceNpEntitlementAccessGetPftFlag(pftFlag.data()) == 0);
+    Require(pftFlag[0] == 0 && pftFlag[1] == 0x5a5a5a5au);
+    Require(sceNpEntitlementAccessGetPftFlag(nullptr) == parameter);
+
     constexpr int signedOut = static_cast<int>(0x80550006);
     Require(sceNpEntitlementAccessRequestUnifiedEntitlementInfoList() == signedOut);
     Require(sceNpEntitlementAccessPollUnifiedEntitlementInfoList() == signedOut);
@@ -95,6 +101,6 @@ int main() {
     Require(sceRudpGetStatus(status.data(), status.size()) == 0);
     for (unsigned char byte : status) Require(byte == 0);
     Require(sceRudpGetStatus(nullptr, 0) == static_cast<int>(0x80770004));
-    Require(sceRudpTerminate() == 0);
+    Require(sceRudpEnd() == 0);
     return 0;
 }

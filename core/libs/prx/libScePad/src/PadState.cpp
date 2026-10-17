@@ -3,6 +3,7 @@
 #include "prx/libScePad/include/InputCommandFile.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -14,6 +15,7 @@ namespace {
     std::mutex stateMutex;
     PadInputState state;
     PadOutputState output;
+    std::chrono::steady_clock::time_point audioHapticEnd;
     std::uint64_t timestamp = 0;
 
     struct QueuedInput {
@@ -30,6 +32,8 @@ namespace {
     std::uint64_t lastFuseTime = 0;
     float biasIntegral[3] = {0.0f, 0.0f, 0.0f};
     bool tiltCorrection = true;
+    bool angularVelocityDeadband = false;
+    constexpr float kAngularVelocityDeadband = 0.017453292f;
     std::uint8_t nextTouchId = 0;
     bool prevTouchActive[2] = {false, false};
     std::uint8_t touchIds[2] = {0, 0};
@@ -108,6 +112,11 @@ void Pad::Initialize() {
     initialized = true;
 }
 
+bool Pad::IsInitialized() {
+    std::lock_guard lock(stateMutex);
+    return initialized;
+}
+
 namespace {
 PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uint64_t now, const Pad::InputCommandFile::Input& injected) {
     PadData data{};
@@ -126,7 +135,12 @@ PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uin
     const bool live = state.hasMotion && output.motionEnabled;
     const std::array<float, 3> rest{0.0f, 9.80665f, 0.0f};
     const std::array<float, 3>& accel = live ? state.accel : rest;
-    const std::array<float, 3> gyro = live ? state.gyro : std::array<float, 3>{0.0f, 0.0f, 0.0f};
+    std::array<float, 3> gyro = live ? state.gyro : std::array<float, 3>{0.0f, 0.0f, 0.0f};
+    if (angularVelocityDeadband) {
+        for (float& axis : gyro) {
+            if (axis < kAngularVelocityDeadband && axis > -kAngularVelocityDeadband) axis = 0.0f;
+        }
+    }
     if (live) {
         float dt = lastFuseTime != 0 && now > lastFuseTime ? static_cast<float>(now - lastFuseTime) * 1e-6f : 0.0f;
         dt = std::min(dt, 0.1f);
@@ -177,7 +191,14 @@ PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uin
 }
 
 Pad::InputCommandFile::Input InjectedInput(std::uint64_t now) {
-    static Pad::InputCommandFile commands(std::getenv("APS5_PAD_INPUT_FILE"));
+    static Pad::InputCommandFile commands([] {
+#ifdef _WIN32
+        const auto* path = _wgetenv(L"APS5_PAD_INPUT_FILE");
+#else
+        const auto* path = std::getenv("APS5_PAD_INPUT_FILE");
+#endif
+        return path ? std::filesystem::path(path) : std::filesystem::path{};
+    }());
     static Pad::InputCommandFile::Input lastInjected;
     const auto injected = commands.Poll(now);
     if (injected != lastInjected) {
@@ -316,6 +337,11 @@ void Pad::SetTiltCorrection(bool enabled) {
     biasIntegral[0] = biasIntegral[1] = biasIntegral[2] = 0.0f;
 }
 
+void Pad::SetAngularVelocityDeadband(bool enabled) {
+    std::lock_guard lock(stateMutex);
+    angularVelocityDeadband = enabled;
+}
+
 void Pad::SetMotionEnabled(bool enabled) {
     std::lock_guard lock(stateMutex);
     if (output.motionEnabled == enabled) return;
@@ -345,8 +371,23 @@ extern "C" void PadReportInputFailure_nid_postfix(std::exception_ptr error) {
 
 extern "C" bool PadFetchOutput_nid_postfix(std::uint32_t* seenSequence, PadOutputState* out) {
     std::lock_guard lock(stateMutex);
+    if ((output.audioVibrationLarge || output.audioVibrationSmall) && std::chrono::steady_clock::now() >= audioHapticEnd) {
+        output.audioVibrationLarge = output.audioVibrationSmall = 0;
+        ++output.sequence;
+    }
     if (seenSequence == nullptr || out == nullptr || *seenSequence == output.sequence) return false;
     *seenSequence = output.sequence;
     *out = output;
     return true;
+}
+
+extern "C" void PadSubmitAudioHaptics_nid_postfix(std::uint8_t large, std::uint8_t small) {
+    std::lock_guard lock(stateMutex);
+    if (large == 0 && small == 0) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= audioHapticEnd) output.audioVibrationLarge = output.audioVibrationSmall = 0;
+    output.audioVibrationLarge = std::max(output.audioVibrationLarge, large);
+    output.audioVibrationSmall = std::max(output.audioVibrationSmall, small);
+    audioHapticEnd = now + std::chrono::milliseconds(80);
+    ++output.sequence;
 }

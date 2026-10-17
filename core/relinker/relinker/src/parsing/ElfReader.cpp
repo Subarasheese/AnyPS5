@@ -3,6 +3,7 @@
 #include <relinker/domain/Types.hpp>
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 namespace Relinker {
 
@@ -23,6 +24,10 @@ ElfReader::ElfReader(std::vector<std::uint8_t> fileBuffer)
 
 const std::vector<std::uint8_t>& ElfReader::GetRawBytes() const {
     return _fileBuffer;
+}
+
+std::vector<std::uint8_t> ElfReader::TakeBytes() {
+    return std::move(_fileBuffer);
 }
 
 std::string ElfReader::formatMagic() const {
@@ -130,6 +135,11 @@ std::vector<ProgramHeader> ElfReader::ReadProgramHeaders() const {
         ph.MemorySize = _readU64At(offset + 0x28);
         ph.Alignment = _readU64At(offset + 0x30);
 
+        if (ph.Type == PT_LOAD && ph.FileSize > ph.MemorySize)
+            throw RelinkerException("PT_LOAD file size exceeds memory size", ph.Offset);
+        if (ph.Type == PT_LOAD && !_rangeFits(ph.Offset, ph.FileSize, _fileBuffer.size()))
+            throw RelinkerException("Segment offset out of bounds", ph.Offset);
+
         headers.push_back(ph);
         offset += header.ProgramHeaderEntrySize;
     }
@@ -146,6 +156,10 @@ std::vector<ProgramHeader> ElfReader::ReadProgramHeaders() const {
             covered = true;
         }
         if (!covered) {
+            if (relro.FileSize > relro.MemorySize)
+                throw RelinkerException("PT_SCE_RELRO file size exceeds memory size", relro.Offset);
+            if (!_rangeFits(relro.Offset, relro.FileSize, _fileBuffer.size()))
+                throw RelinkerException("Segment offset out of bounds", relro.Offset);
             relro.Type = PT_LOAD;
             relro.Flags = PF_R | PF_W;
         }
@@ -253,12 +267,8 @@ std::vector<DynamicTag> ElfReader::ReadDynamicTags(const ProgramHeader& dynamicH
 FileByteOffset ElfReader::TranslateVirtualAddress(VirtualAddress address) const {
     for (const auto& segment : ReadProgramHeaders()) {
         if (segment.Type == PT_LOAD && address >= segment.MappedAddress &&
-            address - segment.MappedAddress < segment.FileSize) {
-            if (!_rangeFits(segment.Offset, segment.FileSize, _fileBuffer.size())) {
-                throw RelinkerException("PT_LOAD file mapping out of bounds", segment.Offset);
-            }
+            address - segment.MappedAddress < segment.FileSize)
             return segment.Offset + (address - segment.MappedAddress);
-        }
     }
 
     throw RelinkerException("Virtual address not mapped by any PT_LOAD segment", address);

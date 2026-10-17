@@ -119,10 +119,29 @@ static void AcceptedSocketsFollowListenerBlocking() {
     for (const int descriptor : {firstClient, secondClient, blocking, inherited, listener}) Require(close_nid_postfix(descriptor) == 0);
 }
 
+static void UnboundSocketNameIsZero() {
+    for (const int family : {2, 28}) {
+        for (const int type : {1, 2}) {
+            const int descriptor = socket_nid_postfix(family, type, 0);
+            Require(descriptor >= 0);
+            const std::uint32_t expected = family == 2 ? 16 : 28;
+            std::array<std::uint8_t, 32> name;
+            name.fill(0xaa);
+            std::uint32_t size = name.size();
+            Require(getsockname_nid_postfix(descriptor, name.data(), &size) == 0);
+            Require(size == expected && name[0] == expected && name[1] == family);
+            for (std::uint32_t index = 2; index < expected; ++index) Require(name[index] == 0);
+            Require(name[expected] == 0xaa);
+            Require(close_nid_postfix(descriptor) == 0);
+        }
+    }
+}
+
 int main() {
     StreamReceiveReportsNoSender();
     ListenersShareAPortAcrossFamilies();
     AcceptedSocketsFollowListenerBlocking();
+    UnboundSocketNameIsZero();
     const int listener = socket_nid_postfix(2, 1, 6);
     Require(listener >= 0);
     std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};

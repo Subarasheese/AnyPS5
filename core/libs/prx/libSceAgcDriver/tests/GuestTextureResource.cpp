@@ -96,6 +96,18 @@ void rejectFields(const Fields& f, std::string_view reason) {
 
 void RunGuestTextureResourceTests() {
     Fields base;
+    const auto baseWords = pack(base);
+    Require(!IsNullTextureResource(baseWords), "a nonzero 2D texture was classified as null");
+    Fields nullBase = base;
+    nullBase.base40 = 0;
+    Require(IsNullTextureResource(pack(nullBase)), "a zero-base texture was not classified as null");
+    Fields nullType = base;
+    nullType.typeRaw = 0;
+    Require(IsNullTextureResource(pack(nullType)), "a type-0 texture with a nonzero base was not classified as null");
+    nullType.typeRaw = 1;
+    Require(IsNullTextureResource(pack(nullType)), "a type-1 texture with a nonzero base was not classified as null");
+    nullType.typeRaw = 2;
+    Require(!IsNullTextureResource(pack(nullType)), "a reserved type-2 texture was classified as null");
     auto result = DecodeTextureResource(pack(base));
     Require(result.baseAddress == (base.base40 << 8u), "decoded base address changed");
     Require(result.width == 16 && result.height == 16, "decoded width or height changed");
@@ -244,6 +256,65 @@ void RunGuestTextureResourceTests() {
     cubeNotMultiple.depth = 4;
     rejectFields(cubeNotMultiple, "multiple of 6");
 
+    Fields multisampled = base;
+    multisampled.typeRaw = 14;
+    multisampled.width = 297;
+    multisampled.height = 297;
+    multisampled.tileModeRaw = 0x1b;
+    multisampled.lastLevel = 2;
+    multisampled.maxMip = 2;
+    result = DecodeTextureResource(pack(multisampled));
+    Require(result.dimension == TextureDimension::k2DMsaa && result.samples == 4 && result.width == 297 && result.height == 297, "4x multisampled descriptor decoded incorrectly");
+    Require(result.mipCount == 1 && result.allocatedMipCount == 1 && result.baseLevel == 0 && result.lastLevel == 0, "a multisampled descriptor's sample count was decoded as mip levels");
+    Require(DecodeTextureResource(pack(base)).samples == 1, "a single-sample descriptor decoded with several samples");
+    const std::array<std::uint32_t, 8> canvas{0x021f2000u, 0x03800000u, 0x804a004au, 0xe1b20facu, 0x00000000u, 0x00400020u, 0x00000000u, 0x00000000u};
+    result = DecodeTextureResource(canvas);
+    Require(result.dimension == TextureDimension::k2DMsaa && result.samples == 4 && result.baseAddress == 0x21f200000ull && result.width == 297 && result.height == 297 && result.format == 56 && result.tileMode == TextureTileMode::kR64KBX, "the 4x canvas descriptor of PPSA99006 decoded incorrectly");
+    Fields fewerFragments = multisampled;
+    fewerFragments.maxMip = 1;
+    rejectFields(fewerFragments, "same sample count");
+    Fields singleSampleType = multisampled;
+    singleSampleType.lastLevel = 0;
+    singleSampleType.maxMip = 0;
+    rejectFields(singleSampleType, "same sample count");
+    Fields offsetLevel = multisampled;
+    offsetLevel.baseLevel = 1;
+    rejectFields(offsetLevel, "same sample count");
+    Fields multisampledSlice = multisampled;
+    multisampledSlice.depth = 1;
+    rejectFields(multisampledSlice, "nonzero depth or base array");
+    Fields multisampledArray = multisampled;
+    multisampledArray.typeRaw = 15;
+    rejectFields(multisampledArray, "unsupported image type");
+
+    for (const auto format : {7u, 22u}) {
+        for (const auto log2 : {1u, 2u, 3u}) {
+            auto nativeDepth = base;
+            nativeDepth.typeRaw = 14;
+            nativeDepth.format = format;
+            nativeDepth.tileModeRaw = 24;
+            nativeDepth.lastLevel = log2;
+            nativeDepth.maxMip = log2;
+            nativeDepth.msaaDepth = true;
+            const auto decoded = DecodeTextureResource(pack(nativeDepth));
+            Require(decoded.iterate256 && decoded.samples == (1u << log2) && decoded.tileMode == TextureTileMode::kZ64KBX && decoded.format == format, "a native multisampled depth descriptor lost ITERATE_256 or its identity");
+            Require(decoded.mipCount == 1 && decoded.allocatedMipCount == 1 && decoded.baseLevel == 0 && decoded.lastLevel == 0, "native multisampled depth retained sample counts as mip levels");
+            auto wrongTile = nativeDepth;
+            wrongTile.tileModeRaw = 27;
+            rejectFields(wrongTile, "ITERATE_256");
+            auto wrongFormat = nativeDepth;
+            wrongFormat.format = 56;
+            rejectFields(wrongFormat, "ITERATE_256");
+            auto wrongType = nativeDepth;
+            wrongType.typeRaw = 9;
+            rejectFields(wrongType, "ITERATE_256");
+            wrongType.typeRaw = 15;
+            rejectFields(wrongType, "ITERATE_256");
+            auto mismatchedSamples = nativeDepth;
+            mismatchedSamples.maxMip = log2 - 1u;
+            rejectFields(mismatchedSamples, "same sample count");
+        }
+    }
     Fields badType = base;
     badType.typeRaw = 0;
     rejectFields(badType, "unsupported image type");
@@ -315,7 +386,7 @@ void RunGuestTextureResourceTests() {
 
     Fields badMsaa = base;
     badMsaa.msaaDepth = true;
-    rejectFields(badMsaa, "MSAA");
+    rejectFields(badMsaa, "ITERATE_256");
 
     Fields blockSize = base;
     blockSize.maxUncompBlkSize = 1;
@@ -438,6 +509,9 @@ void RunGuestTextureResourceTests() {
     Require(MatchesGuestDimension(Shape::Image2D, TextureDimension::k2D), "2D shape must match 2D dimension");
     Require(!MatchesGuestDimension(Shape::Image2D, TextureDimension::k2DArray), "2D shape must not match 2D array dimension");
     Require(MatchesGuestDimension(Shape::Image2DArray, TextureDimension::k2DArray), "2D array shape must match 2D array dimension");
+    Require(MatchesGuestDimension(Shape::Image2DMultisample, TextureDimension::k2DMsaa), "multisampled shape must match the multisampled dimension");
+    Require(!MatchesGuestDimension(Shape::Image2DMultisample, TextureDimension::k2D), "multisampled shape must not match 2D dimension");
+    Require(!MatchesGuestDimension(Shape::Image2D, TextureDimension::k2DMsaa), "2D shape must not match the multisampled dimension");
     Require(MatchesGuestDimension(Shape::Image2DArray, TextureDimension::kCube), "a cube must be readable as a 2D array of its faces");
     Require(MatchesGuestDimension(Shape::ImageCube, TextureDimension::kCube), "cube shape must match cube dimension");
     Require(!MatchesGuestDimension(Shape::ImageCube, TextureDimension::k1D), "cube shape must not match 1D dimension");
@@ -445,6 +519,24 @@ void RunGuestTextureResourceTests() {
     Require(!MatchesGuestDimension(Shape::Image3D, TextureDimension::k2D), "3D shape must never match a guest dimension");
     Require(!MatchesGuestDimension(Shape::Image3D, TextureDimension::k2DArray), "3D shape must never match a guest dimension");
     Require(!MatchesGuestDimension(Shape::Image3D, TextureDimension::kCube), "3D shape must never match a guest dimension");
+
+    const auto layered = [](TextureDimension dimension, std::uint32_t lastLayer, std::uint32_t baseArray = 0) {
+        GuestTextureResource resource{};
+        resource.dimension = dimension;
+        resource.depthOrLastArray = lastLayer;
+        resource.baseArray = baseArray;
+        return resource;
+    };
+    const auto twoSlices = layered(TextureDimension::k2DArray, 1);
+    Require(ArrayLayersServeView(twoSlices, layered(TextureDimension::k2D, 0)), "a 2D texture must view the first layer of a 2D array color surface (slice-0 view with MIP0_DEPTH 1)");
+    Require(ArrayLayersServeView(twoSlices, twoSlices), "a 2D array must view the same 2D array");
+    Require(ArrayLayersServeView(layered(TextureDimension::k2DArray, 3), twoSlices), "a 2D array must view the first layers of a larger 2D array");
+    Require(!ArrayLayersServeView(twoSlices, layered(TextureDimension::k2DArray, 3)), "a 2D array view must not reach past the surface's layers");
+    Require(!ArrayLayersServeView(twoSlices, layered(TextureDimension::k2D, 0, 1)), "a 2D view of a later layer must not be served by the array's first layer");
+    Require(ArrayLayersServeView(layered(TextureDimension::k2D, 0), layered(TextureDimension::k2D, 0)), "a 2D texture must view the same 2D surface");
+    Require(!ArrayLayersServeView(layered(TextureDimension::k2D, 0), twoSlices), "a 2D surface must not serve a 2D array view");
+    Require(!ArrayLayersServeView(layered(TextureDimension::k3D, 1), layered(TextureDimension::k2D, 0)), "a 3D surface's first slice must not serve a 2D texture");
+    Require(!ArrayLayersServeView(layered(TextureDimension::kCube, 5), layered(TextureDimension::k2D, 0)), "a cube's first face must not serve a 2D texture");
 
     Fields streamed = base;
     streamed.minLodWarn = 0xabc;

@@ -13,6 +13,8 @@
 #ifdef _WIN32
 #include <io.h>
 #include "prx/libc/include/FileLock.hpp"
+extern "C" void* HostStandardHandle_nid_no_patch(int descriptor);
+extern "C" void KeepStandardHandle_nid_no_patch(int descriptor, void* handle);
 #endif
 
 struct GuestFilePrefix {
@@ -69,6 +71,10 @@ public:
         return _handle;
     }
 
+    bool IsOpen() const {
+        return _handle != nullptr;
+    }
+
     bool IsDynamic() const {
         return _dynamic;
     }
@@ -81,8 +87,11 @@ public:
 #ifdef _WIN32
         std::wstring wideMode;
         for (const char character : std::string_view(mode)) wideMode.push_back(static_cast<unsigned char>(character));
-        GuestFileLockForget_nid_no_patch(::_fileno(previous));
+        const int replaced = previous ? _fileno(previous) : -1;
+        auto* const standard = HostStandardHandle_nid_no_patch(replaced);
+        GuestFileLockForget_nid_no_patch(replaced);
         _handle = ::_wfreopen(filename.c_str(), wideMode.c_str(), previous);
+        KeepStandardHandle_nid_no_patch(replaced, standard);
 #else
         if (::fileno(previous) == 2) KeepHostStandardError_nid_no_patch();
         _handle = std::freopen(filename.c_str(), mode, previous);
@@ -98,6 +107,7 @@ public:
         return true;
     }
     void SyncStatus() {
+        if (!_handle) return;
         _guest.readRemaining = 0;
         _guest.writeRemaining = 0;
         _guest.flags = static_cast<std::int16_t>((_guest.flags & ~0x60) |
@@ -105,6 +115,7 @@ public:
     }
 
     void SyncUnlockedStatus() {
+        if (!_handle) return;
         _guest.readRemaining = 0;
         _guest.writeRemaining = 0;
 #ifdef _WIN32
@@ -124,6 +135,7 @@ public:
     }
 
     void ClearError() {
+        if (!_handle) return;
         std::clearerr(GetHandle());
         guestError = false;
         SyncStatus();

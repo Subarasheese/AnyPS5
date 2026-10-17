@@ -614,10 +614,10 @@ struct NativeImages::State {
         surface.uploaded = true;
         surface.drawn = ++drawSerial;
         imageOut = surface.image;
-        const std::array<std::uint32_t, 6> key{static_cast<std::uint32_t>(color.format), color.mip, color.arraySlice, std::max(color.viewLayers, 1u), color.depthSlice, 0};
+        const std::array<std::uint32_t, 6> key{static_cast<std::uint32_t>(color.format), color.mip, color.arraySlice, std::max(color.layers, 1u), color.depthSlice, 0};
         if (const auto found = surface.attachments.find(key); found != surface.attachments.end()) return found->second;
         const bool volume = resource.dimension == TextureDimension::k3D;
-        const auto layers = std::max(color.viewLayers, 1u);
+        const auto layers = std::max(color.layers, 1u);
         const auto made = view(surface.image, layers > 1 || volume ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, color.format, {}, {VK_IMAGE_ASPECT_COLOR_BIT, color.mip, 1, volume ? 0u : color.arraySlice, volume ? 1u : layers});
         surface.attachments.emplace(key, made);
         return made;
@@ -704,7 +704,7 @@ struct NativeImages::State {
         try {
             // Texel-coordinate S#s (FORCE_UNNORMALIZED): the translated shader normalizes their
             // coordinates itself, so the sampler is an ordinary normalized one.
-            const auto decoded = Graphics::DecodeSamplerResource(words, (words[0] & 0x8000u) != 0u);
+            const auto decoded = Graphics::DecodeSamplerResource(words, (words[0] & 0x8000u) != 0u, false, false, true);
             const auto make = [&](bool point) {
                 VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
                 VkSamplerReductionModeCreateInfo reduction{VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO};

@@ -19,6 +19,7 @@ struct IrProgramMetadata {
     std::vector<ExportInfo> exportInfo;
     std::uint32_t pixelLinearInputs = 0;
     std::uint32_t pixelPerspectiveInputs = 0;
+    std::uint32_t pixelVertexOrderInputs = 0;
     bool barycentricEmulation = false;
     // SpirvTarget::gpuResolvedResources: no SRT read is folded into the CPU-flattened table and
     // every buffer takes its V# at run time (the shader resolves its resources on the GPU).
@@ -33,6 +34,7 @@ struct IrProgramMetadata {
     std::uint32_t vectorWindowSize = 0;
     bool vectorWindowIndexedWrites = false;
     std::uint32_t tessellationControlStride = 0;
+    std::uint32_t tessellationPatchStride = 0;
 };
 
 }

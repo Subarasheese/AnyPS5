@@ -1,3 +1,4 @@
+#include "TestProgress.hpp"
 #include <relinker/analysis/UnusedNidFilter.hpp>
 #include <relinker/analysis/UnusedNidFilter/StrictReachability.hpp>
 #include <relinker/output/SysVDynamicSectionBuilder.hpp>
@@ -270,6 +271,45 @@ void exceptionLandingPads() {
     emit(input, 31, {0xC3});
     importThunk(input, 64, 0x2000);
     require(AnalyzeStrictReachability(input).ImportSlots.contains(0x2000), "Exception-only import was removed");
+    const auto checkLanding = [&](std::uint64_t base, std::uint64_t offset, bool signedOffset, bool rejected) {
+        auto data = bytes;
+        write<std::uint8_t>(data, 0x280, 0);
+        write<std::uint64_t>(data, 0x281, base);
+        write<std::uint8_t>(data, 0x289, 0xFF);
+        write<std::uint8_t>(data, 0x28A, signedOffset ? 12 : 4);
+        write<std::uint8_t>(data, 0x28B, 25);
+        write<std::uint64_t>(data, 0x28C, 0);
+        write<std::uint64_t>(data, 0x294, 1);
+        write<std::uint64_t>(data, 0x29C, offset);
+        write<std::uint8_t>(data, 0x2A4, 0);
+        try {
+            const auto functions = Relinker::UnusedNidFilter::ReadExceptionFunctions(data, headers, {}, {});
+            require(!rejected, "Overflowing LSDA landing pad address was accepted");
+            const auto expected = offset == 0 ? std::vector<std::uint64_t>{0x1000} :
+                std::vector<std::uint64_t>{0x1000, base + offset};
+            require(functions.size() == 1 && functions[0].ExtraTargets == expected,
+                    "Valid LSDA landing pad address changed");
+        } catch (const Relinker::RelinkerException& error) {
+            require(rejected && std::string(error.what()).find("LSDA landing pad address overflowed") != std::string::npos,
+                    "LSDA landing pad rejected for an unexpected reason");
+        }
+    };
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    for (const std::uint64_t base : {std::uint64_t{0x1000}, maximum - 16}) {
+        checkLanding(base, 0, false, false);
+        checkLanding(base, maximum - base, false, false);
+        checkLanding(base, maximum - base + 1, false, true);
+        checkLanding(base, maximum, false, true);
+    }
+    checkLanding(0x1000, maximum, true, false);
+    checkLanding(0x1000, std::uint64_t{0} - 0x1000, true, false);
+    checkLanding(0x1000, std::uint64_t{0} - 0x1001, true, true);
+    checkLanding(maximum - 16, 16, true, false);
+    checkLanding(maximum - 16, 17, true, true);
+    checkLanding(0, 0, true, false);
+    checkLanding(0, maximum, false, false);
+    checkLanding(std::uint64_t{1} << 63, std::uint64_t{1} << 63, true, false);
+    checkLanding((std::uint64_t{1} << 63) - 1, std::uint64_t{1} << 63, true, true);
     write<std::uint8_t>(bytes, 0x282, 0xFF);
     requireFailure([&] { Relinker::UnusedNidFilter::ReadExceptionFunctions(bytes, headers, {}, {}); }, "Malformed LSDA was accepted");
 }
@@ -343,7 +383,7 @@ void filterCallbackDataImports() {
     const auto bytes = elfFixture(input);
     for (const std::uint32_t relocationType : {1, 6}) {
         const std::vector<Relinker::NidReference> references = {{"callbackData", {}, relocationType, 0x300, 0x2000, 0}, {"deadData", {}, relocationType, 0x318, 0x2008, 0}};
-        const auto filtered = Relinker::MakeStrictUnusedNidFilter()->Filter(references, bytes, input.Text, input.TextVaddr);
+        const auto filtered = Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, bytes, input.Text, input.TextVaddr);
         require(filtered.size() == 1 && filtered[0].Nid == references[0].Nid, "Strict ELF filter lost callback data or retained unreachable data");
     }
 }
@@ -354,7 +394,7 @@ void filterAndPltCompaction() {
     importThunk(input, 16, 0x2008);
     const auto bytes = elfFixture(input);
     const std::vector<Relinker::NidReference> references = {{"live", {}, 7, 0x300, 0x2000, 0}, {"dead", {}, 7, 0x318, 0x2008, 0}};
-    const auto filtered = Relinker::MakeStrictUnusedNidFilter()->Filter(references, bytes, input.Text, input.TextVaddr);
+    const auto filtered = Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, bytes, input.Text, input.TextVaddr);
     require(filtered.size() == 1 && filtered[0].Nid == references[0].Nid, "Strict ELF filter did not remove only the dead PLT import");
     for (std::size_t index = 0; index < references.size(); ++index) {
         const auto offset = index * 16;
@@ -377,13 +417,13 @@ void filterAndPltCompaction() {
     require(section.RelaPltData.size() == 24 && section.DynSymData.size() == 48, "Compacted PLT retained a dead dynamic symbol");
     auto truncated = bytes;
     truncated.resize(70);
-    requireFailure([&] { Relinker::MakeStrictUnusedNidFilter()->Filter(references, truncated, input.Text, input.TextVaddr); }, "Truncated ELF was accepted");
+    requireFailure([&] { Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, truncated, input.Text, input.TextVaddr); }, "Truncated ELF was accepted");
     auto exceptional = bytes;
     write<std::uint16_t>(exceptional, 56, 3);
     write<std::uint32_t>(exceptional, 176, 0x6474E550);
     write<std::uint64_t>(exceptional, 184, 0x380);
     write<std::uint64_t>(exceptional, 208, 8);
-    requireFailure([&] { Relinker::MakeStrictUnusedNidFilter()->Filter(references, exceptional, input.Text, input.TextVaddr); }, "Exception metadata was ignored");
+    requireFailure([&] { Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, exceptional, input.Text, input.TextVaddr); }, "Exception metadata was ignored");
 }
 
 void relativeRelocationTableBounds() {
@@ -397,7 +437,9 @@ void relativeRelocationTableBounds() {
     bytes[6] = 1;
     write<std::uint16_t>(bytes, 16, 3);
     write<std::uint16_t>(bytes, 18, 62);
+    write<std::uint32_t>(bytes, 20, 1);
     write<std::uint64_t>(bytes, 32, 64);
+    write<std::uint16_t>(bytes, 52, 64);
     write<std::uint16_t>(bytes, 54, 56);
     write<std::uint16_t>(bytes, 56, 2);
 
@@ -524,7 +566,7 @@ void sceDynlibDataOffsets() {
     }
     try {
         const std::vector<Relinker::NidReference> references = {{"live", {}, 6, 0x900, 0x2000, 0}};
-        const auto filtered = Relinker::MakeStrictUnusedNidFilter()->Filter(references, bytes, input.Text, input.TextVaddr);
+        const auto filtered = Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, bytes, input.Text, input.TextVaddr);
         if (filtered.size() != 1) failures += "SCE relocation target did not keep its import";
     } catch (const std::exception& error) {
         failures += std::string("SCE strict filter: ") + error.what();
@@ -537,7 +579,7 @@ void sceDynlibDataOffsets() {
     require(Relinker::UnusedNidFilter::BuildRelativeRelocationIndex(noSegment)->TargetOfSlot(0x2040) == 0x1010,
             "SCE relocation without PT_SCE_DYNLIBDATA was not read at its absolute file offset");
     const std::vector<Relinker::NidReference> references = {{"live", {}, 6, 0x900, 0x2000, 0}};
-    require(Relinker::MakeStrictUnusedNidFilter()->Filter(references, noSegment, input.Text, input.TextVaddr).size() == 1,
+    require(Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, noSegment, input.Text, input.TextVaddr).size() == 1,
             "Strict filter lost an SCE relocation without PT_SCE_DYNLIBDATA");
 
     auto jmprel = bytes;
@@ -584,7 +626,7 @@ void sceDynlibDataOffsets() {
     write<std::uint64_t>(overflow, 0x308, std::numeric_limits<std::uint64_t>::max());
     requireFailure([&] { (void)Relinker::UnusedNidFilter::BuildRelativeRelocationIndex(overflow); },
                    "SCE relocation file offset overflow was accepted");
-    requireFailure([&] { (void)Relinker::MakeStrictUnusedNidFilter()->Filter(references, overflow, input.Text, input.TextVaddr); },
+    requireFailure([&] { (void)Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, overflow, input.Text, input.TextVaddr); },
                    "Strict filter accepted an overflowing SCE table offset");
 
     auto duplicate = bytes;
@@ -592,7 +634,7 @@ void sceDynlibDataOffsets() {
     write<std::uint32_t>(duplicate, 288, 0x61000000);
     requireFailure([&] { (void)Relinker::UnusedNidFilter::BuildRelativeRelocationIndex(duplicate); },
                    "Duplicate PT_SCE_DYNLIBDATA segments were accepted");
-    requireFailure([&] { (void)Relinker::MakeStrictUnusedNidFilter()->Filter(references, duplicate, input.Text, input.TextVaddr); },
+    requireFailure([&] { (void)Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, duplicate, input.Text, input.TextVaddr); },
                    "Strict filter accepted duplicate PT_SCE_DYNLIBDATA segments");
 
     auto sectionRelative = bytes;
@@ -606,19 +648,19 @@ void sceDynlibDataOffsets() {
     write<std::uint64_t>(sectionRelative, 0x358, 48);
     write<std::uint8_t>(sectionRelative, 0x61C, 3);
     write<std::uint64_t>(sectionRelative, 0x908, (std::uint64_t{1} << 32) | 8);
-    require(Relinker::MakeStrictUnusedNidFilter()->Filter(references, sectionRelative, input.Text, input.TextVaddr).size() == 1,
+    require(Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, sectionRelative, input.Text, input.TextVaddr).size() == 1,
             "Strict filter rejected a RELATIVE relocation against a zero-value section symbol");
     auto valuedSection = sectionRelative;
     write<std::uint64_t>(valuedSection, 0x620, 0x10);
-    requireFailure([&] { (void)Relinker::MakeStrictUnusedNidFilter()->Filter(references, valuedSection, input.Text, input.TextVaddr); },
+    requireFailure([&] { (void)Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, valuedSection, input.Text, input.TextVaddr); },
                    "Strict filter accepted a RELATIVE relocation against a section symbol with a value");
     auto untyped = sectionRelative;
     write<std::uint8_t>(untyped, 0x61C, 0);
-    requireFailure([&] { (void)Relinker::MakeStrictUnusedNidFilter()->Filter(references, untyped, input.Text, input.TextVaddr); },
+    requireFailure([&] { (void)Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, untyped, input.Text, input.TextVaddr); },
                    "Strict filter accepted a RELATIVE relocation against a non-section symbol");
     auto outside = sectionRelative;
     write<std::uint64_t>(outside, 0x908, (std::uint64_t{2} << 32) | 8);
-    requireFailure([&] { (void)Relinker::MakeStrictUnusedNidFilter()->Filter(references, outside, input.Text, input.TextVaddr); },
+    requireFailure([&] { (void)Relinker::MakeStrictUnusedNidFilter(testProgress)->Filter(references, outside, input.Text, input.TextVaddr); },
                    "Strict filter accepted a RELATIVE relocation symbol outside the symbol table");
 }
 

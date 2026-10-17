@@ -160,18 +160,23 @@ struct VirtualQueryInfo {
     std::uint64_t offset;
     std::int32_t protection;
     std::int32_t memory_type;
-    std::uint32_t is_flexible : 1;
-    std::uint32_t is_direct : 1;
-    std::uint32_t is_stack : 1;
-    std::uint32_t is_pooled : 1;
-    std::uint32_t is_committed : 1;
-    std::uint32_t is_gpu_prt : 1;
-    std::uint32_t amm_usage : 1;
-    std::uint32_t reserved : 1;
+    std::uint8_t is_flexible : 1;
+    std::uint8_t is_direct : 1;
+    std::uint8_t is_stack : 1;
+    std::uint8_t is_pooled : 1;
+    std::uint8_t is_committed : 1;
+    std::uint8_t is_gpu_prt : 1;
+    std::uint8_t amm_usage : 1;
+    std::uint8_t reserved : 1;
     char name[32];
     std::uint8_t gpu_mask_id;
     std::uint8_t reserved2;
 };
+static_assert(sizeof(VirtualQueryInfo) == 72);
+static_assert(alignof(VirtualQueryInfo) == 8);
+static_assert(offsetof(VirtualQueryInfo, name) == 33);
+static_assert(offsetof(VirtualQueryInfo, gpu_mask_id) == 65);
+static_assert(offsetof(VirtualQueryInfo, reserved2) == 66);
 
 struct KernelSemaPrivate;
 struct KernelEventFlagPrivate;
@@ -675,10 +680,13 @@ struct AvPlayerVideoEx {
     std::uint8_t luma_bit_depth;
     std::uint8_t chroma_bit_depth;
     bool video_full_range_flag;
-    std::uint8_t reserved1[37];
+    std::uint8_t reserved1[5];
+    double frame_rate;
+    std::uint8_t reserved2[24];
 };
 static_assert(sizeof(AvPlayerVideoEx) == 80);
 static_assert(offsetof(AvPlayerVideoEx, crop_left_offset) == 20 && offsetof(AvPlayerVideoEx, pitch) == 36);
+static_assert(offsetof(AvPlayerVideoEx, frame_rate) == 48);
 
 struct AvPlayerTimedTextEx {
     std::uint8_t language_code[4];
@@ -1181,7 +1189,7 @@ struct ImeEvent {
     ImeEventParam param;
 };
 
-using EventHandler = void (*)(void* arg, const ImeEvent* event);
+using EventHandler = void (APS5_VABI *)(void* arg, const ImeEvent* event);
 
 struct Param {
     std::int32_t user_id;
@@ -1264,6 +1272,13 @@ struct NetEpollEvent {
 struct NetCtlNatInfo { std::uint8_t opaque[128]; };
 
 union NetCtlInfo { std::uint8_t opaque[256]; };
+
+struct NetCtlIfStat {
+    std::uint32_t device;
+    std::uint64_t tx_bytes;
+    std::uint64_t rx_bytes;
+    std::uint32_t reserved[8];
+};
 
 using NetCtlCallback = void (*)(int, void*);
 
@@ -1460,7 +1475,13 @@ struct SaveDataSearchInfo {
     std::uint8_t reserved[32];
 };
 static_assert(sizeof(SaveDataSearchInfo) == 48);
-struct SaveDataMemoryData { void* buf; std::size_t buf_size; std::size_t offset; };
+struct SaveDataMemoryData {
+    void* buf;
+    std::size_t buf_size;
+    std::size_t offset;
+    std::uint8_t reserved[40];
+};
+static_assert(sizeof(SaveDataMemoryData) == 64);
 
 struct SaveDataMount3 {
     int user_id;
@@ -1743,23 +1764,29 @@ struct JpegEncOutputInfo {
 };
 
 struct JpegDecCreateParam {
-    std::uint32_t size;
+    std::uint32_t this_size;
     std::uint32_t attribute;
+    std::uint32_t max_image_width;
 };
 
 struct JpegDecParseParam {
     const void* jpeg_mem_addr;
     std::uint32_t jpeg_mem_size;
-    std::uint32_t reserved0;
+    std::uint16_t decode_mode;
+    std::uint16_t down_scale;
 };
 
 struct JpegDecDecodeParam {
     const void* jpeg_mem_addr;
     void* image_mem_addr;
+    void* coefficient_mem_addr;
     std::uint32_t jpeg_mem_size;
     std::uint32_t image_mem_size;
+    std::uint32_t coefficient_mem_size;
+    std::uint16_t decode_mode;
+    std::uint16_t down_scale;
     std::uint16_t pixel_format;
-    std::uint16_t reserved0;
+    std::uint16_t alpha_value;
     std::uint32_t image_pitch;
 };
 
@@ -1767,8 +1794,13 @@ struct JpegDecImageInfo {
     std::uint32_t image_width;
     std::uint32_t image_height;
     std::uint16_t color_space;
-    std::uint16_t bit_depth;
-    std::uint32_t image_flag;
+    std::uint16_t component_number;
+    std::uint8_t component_id[4];
+    std::uint8_t sampling_factor[4];
+    std::uint32_t coefficient_mem_size;
+    std::uint32_t suitable_csc_attribute;
+    std::uint32_t output_image_width;
+    std::uint32_t output_image_height;
 };
 
 struct PlayGoInitParams {
@@ -1935,6 +1967,42 @@ struct VideoOutVblankStatus {
     std::uint8_t phase = 0;
     std::uint8_t pad1[6] = {};
 };
+
+struct VideoOutBufferAttribute {
+    std::uint32_t pixel_format;
+    std::uint32_t tiling_mode;
+    std::uint32_t aspect_ratio;
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t pitch_in_pixel;
+    std::uint32_t option;
+    std::uint32_t reserved0;
+    std::uint64_t reserved1;
+};
+static_assert(sizeof(VideoOutBufferAttribute) == 40);
+
+struct VideoOutFlipStatusPs4 {
+    std::uint64_t count = 0;
+    std::uint64_t processTime = 0;
+    std::uint64_t tsc = 0;
+    std::int64_t flipArg = 0;
+    std::uint64_t submitTsc = 0;
+    std::uint64_t reserved0 = 0;
+    std::int32_t gcQueueNum = 0;
+    std::int32_t flipPendingNum = 0;
+    std::int32_t currentBuffer = 0;
+    std::uint32_t reserved1 = 0;
+};
+static_assert(sizeof(VideoOutFlipStatusPs4) == 64);
+
+struct VideoOutVblankStatusPs4 {
+    std::uint64_t count = 0;
+    std::uint64_t processTime = 0;
+    std::uint64_t tsc = 0;
+    std::uint8_t flags = 0;
+    std::uint8_t pad[7] = {};
+};
+static_assert(sizeof(VideoOutVblankStatusPs4) == 32);
 
 struct VideoOutOutputStatus {
     std::uint32_t resolution = 0;

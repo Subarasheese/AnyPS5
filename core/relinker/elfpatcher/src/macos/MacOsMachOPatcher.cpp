@@ -15,6 +15,19 @@ std::string MachOLoadPath(const std::string& path, const std::string& origin) {
     return path;
 }
 
+std::vector<std::string> MachORunPaths(const std::string& paths, const std::string& origin) {
+    std::vector<std::string> result;
+    for (std::size_t begin = 0;;) {
+        const auto end = paths.find(':', begin);
+        const auto path = paths.substr(begin, end == std::string::npos ? end : end - begin);
+        if (path.empty()) throw Domain::RelinkerException("Empty macOS run path component is not supported");
+        result.push_back(MachOLoadPath(path, origin));
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    return result;
+}
+
 std::vector<std::string> ReadNeededLibraries(const Domain::SysVDynamicSection& dynamicSection) {
     const auto& bytes = dynamicSection.DynamicSegmentData;
     if (bytes.size() % 16 != 0) throw Domain::RelinkerException("Invalid dynamic segment size");
@@ -38,7 +51,7 @@ std::string MachODependency(const std::string& name, const std::string& origin) 
     return "@rpath/" + name;
 }
 
-std::vector<std::uint8_t> MacOsMachOPatcher::Patch(const std::vector<std::uint8_t>& sourceElf, const std::vector<Domain::ProgramHeader>& originalHeaders, const Domain::SysVDynamicSection& dynamicSection, const std::uint64_t originalPltGotVaddr, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Codegen::TrampolineSite>& trampolines) {
+std::vector<std::uint8_t> MacOsMachOPatcher::Patch(std::vector<std::uint8_t> sourceElf, const std::vector<Domain::ProgramHeader>& originalHeaders, const Domain::SysVDynamicSection& dynamicSection, const std::uint64_t originalPltGotVaddr, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Codegen::TrampolineSite>& trampolines) {
     if (dependencyDiagnostics)
         throw Domain::RelinkerException("macOS target does not support --windows-diagnostics");
     static_cast<void>(lazyBinding);
@@ -46,7 +59,7 @@ std::vector<std::uint8_t> MacOsMachOPatcher::Patch(const std::vector<std::uint8_
     Windows::WindowsLoadImage image(sourceElf, originalHeaders);
     if (originalPltGotVaddr != 0)
         image.GetRva(originalPltGotVaddr, 8);
-    const auto relocations = Windows::WindowsRelocationBuilder().Apply(image, dynamicSection);
+    const auto relocations = Windows::WindowsRelocationBuilder().Apply(image, dynamicSection, originalHeaders);
 
     MacOsImageInput input;
     input.Executable = true;
@@ -55,12 +68,12 @@ std::vector<std::uint8_t> MacOsMachOPatcher::Patch(const std::vector<std::uint8_
     input.Image = &image;
     input.Rebases = relocations.BaseRelocations;
     for (const auto& import : relocations.Imports)
-        input.Binds.push_back({"_" + import.Name, import.TargetRva, static_cast<std::int64_t>(import.Addend)});
+        input.Binds.push_back({"_" + import.Name, import.TargetRva, static_cast<std::int64_t>(import.Addend), import.Weak});
     for (const auto& library : ReadNeededLibraries(dynamicSection))
         input.Dylibs.push_back(MachODependency(library, "@executable_path"));
     if (std::find(input.Dylibs.begin(), input.Dylibs.end(), "@rpath/libkernel.prx") == input.Dylibs.end())
         input.Dylibs.push_back("@rpath/libkernel.prx");
-    input.RunPaths.push_back(MachOLoadPath(runPath, "@executable_path"));
+    input.RunPaths = MachORunPaths(runPath, "@executable_path");
     input.EntryRva = image.GetEntryRva();
     input.Trampolines = &trampolines;
     return WriteMacOsImage(input);

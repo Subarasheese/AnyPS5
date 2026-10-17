@@ -14,6 +14,9 @@
 #include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <unwind.h>
 
 extern "C" unsigned __cxa_uncaught_exceptions_nid_postfix();
@@ -32,6 +35,7 @@ extern "C" void __cxa_vec_delete3_nid_postfix(void*, std::size_t, std::size_t, v
 extern "C" _Unwind_Reason_Code _Unwind_Backtrace_nid_postfix(_Unwind_Trace_Fn, void*);
 extern "C" _Unwind_Reason_Code _Unwind_ForcedUnwind_nid_postfix(_Unwind_Exception*, _Unwind_Stop_Fn, void*);
 extern "C" std::uintptr_t _Unwind_GetIP_nid_postfix(_Unwind_Context*);
+extern "C" std::uintptr_t _Unwind_GetGR_nid_postfix(_Unwind_Context*, int);
 extern "C" void (*_ZSt13set_terminatePFvvE_nid_postfix(void(*)()))();
 
 thread_local int destroyed = 0;
@@ -171,6 +175,9 @@ void CheckDefaultTerminateMessage() {
     if (child == 0) {
         close(channel[0]);
         dup2(channel[1], 2);
+#ifdef __linux__
+        assert(prctl(PR_SET_DUMPABLE, 0) == 0);
+#endif
         throw std::runtime_error(message);
     }
     close(channel[1]);
@@ -259,6 +266,26 @@ int main() {
     int frames = 0;
     auto backtrace = _Unwind_Backtrace_nid_postfix([](_Unwind_Context* context, void* argument) {
         assert(_Unwind_GetIP_nid_postfix(context) != 0);
+        ++*static_cast<int*>(argument);
+        return _URC_NO_REASON;
+    }, &frames);
+    assert(backtrace == _URC_END_OF_STACK && frames >= 2);
+    frames = 0;
+    backtrace = _Unwind_Backtrace_nid_postfix([](_Unwind_Context* context, void* argument) {
+        const auto* slots = *reinterpret_cast<const std::uintptr_t* const*>(context);
+        const auto validRegister = reinterpret_cast<bool (*)(_Unwind_Context*, int)>(slots[2]);
+        const auto getRegister = reinterpret_cast<std::uintptr_t (*)(_Unwind_Context*, int)>(slots[3]);
+        const auto setRegister = reinterpret_cast<void (*)(_Unwind_Context*, int, std::uintptr_t)>(slots[4]);
+        const auto validFloatRegister = reinterpret_cast<bool (*)(_Unwind_Context*, int)>(slots[5]);
+        const auto isSignalFrame = reinterpret_cast<bool (*)(_Unwind_Context*)>(slots[11]);
+        assert(validRegister(context, -1) && validRegister(context, -2) && validRegister(context, 16) && !validRegister(context, 17));
+        assert(getRegister(context, -1) == _Unwind_GetIP_nid_postfix(context) && getRegister(context, -1) != 0);
+        assert(getRegister(context, -2) == _Unwind_GetGR_nid_postfix(context, 7));
+        const auto rbx = getRegister(context, 3);
+        setRegister(context, 3, rbx + 1);
+        assert(_Unwind_GetGR_nid_postfix(context, 3) == rbx + 1);
+        setRegister(context, 3, rbx);
+        assert(!validFloatRegister(context, 17) && !isSignalFrame(context));
         ++*static_cast<int*>(argument);
         return _URC_NO_REASON;
     }, &frames);

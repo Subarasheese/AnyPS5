@@ -233,7 +233,84 @@ static void CheckDeadlinesBeyondTheClockRange() {
     Require(pthread_rwlock_destroy_nid_postfix(&rwlock) == 0);
 }
 
+struct WaitingWriter {
+    PthreadRwlock* rwlock;
+    std::atomic<bool> started{false};
+    std::atomic<bool> acquired{false};
+    Pthread thread = nullptr;
+};
+
+static void* APS5_VABI WriteOnceStarted(void* arg) {
+    auto& writer = *static_cast<WaitingWriter*>(arg);
+    writer.started.store(true);
+    Require(pthread_rwlock_wrlock_nid_postfix(writer.rwlock) == 0);
+    writer.acquired.store(true);
+    Require(pthread_rwlock_unlock_nid_postfix(writer.rwlock) == 0);
+    return nullptr;
+}
+
+static void StartWaitingWriter(WaitingWriter& writer) {
+    Require(scePthreadCreate(&writer.thread, nullptr, WriteOnceStarted, &writer, nullptr) == SCE_OK);
+    while (!writer.started.load()) std::this_thread::yield();
+}
+
+static int TryReadUntilRefused(PthreadRwlock* rwlock) {
+    for (int attempt = 0; attempt < 2000; ++attempt) {
+        const int result = pthread_rwlock_tryrdlock_nid_postfix(rwlock);
+        if (result != 0) return result;
+        Require(pthread_rwlock_unlock_nid_postfix(rwlock) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return 0;
+}
+
+struct RefusalProbe {
+    PthreadRwlock* rwlock;
+    std::atomic<int> result{-1};
+};
+
+static void* APS5_VABI ProbeRefusal(void* arg) {
+    auto& probe = *static_cast<RefusalProbe*>(arg);
+    probe.result.store(TryReadUntilRefused(probe.rwlock));
+    return nullptr;
+}
+
+static void CheckWaitingWriterHoldsBackNewReaders() {
+    PthreadRwlock rwlock = nullptr;
+    Holder reader{&rwlock, false};
+    Start(reader);
+    WaitingWriter writer{&rwlock};
+    StartWaitingWriter(writer);
+    Require(TryReadUntilRefused(&rwlock) == GUEST_EBUSY);
+    const KernelTimespec soon = After(20);
+    Require(pthread_rwlock_timedrdlock_nid_postfix(&rwlock, &soon) == GUEST_ETIMEDOUT);
+    Require(!writer.acquired.load());
+    reader.release.store(true);
+    Require(scePthreadJoin(reader.thread, nullptr) == SCE_OK);
+    Require(scePthreadJoin(writer.thread, nullptr) == SCE_OK);
+    Require(writer.acquired.load());
+    Require(pthread_rwlock_destroy_nid_postfix(&rwlock) == 0);
+
+    PthreadRwlock recursive = nullptr;
+    Require(pthread_rwlock_rdlock_nid_postfix(&recursive) == 0);
+    WaitingWriter queued{&recursive};
+    StartWaitingWriter(queued);
+    RefusalProbe probe{&recursive};
+    Pthread prober = nullptr;
+    Require(scePthreadCreate(&prober, nullptr, ProbeRefusal, &probe, nullptr) == SCE_OK);
+    Require(scePthreadJoin(prober, nullptr) == SCE_OK);
+    Require(probe.result.load() == GUEST_EBUSY);
+    Require(pthread_rwlock_rdlock_nid_postfix(&recursive) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&recursive) == 0);
+    Require(!queued.acquired.load());
+    Require(pthread_rwlock_unlock_nid_postfix(&recursive) == 0);
+    Require(scePthreadJoin(queued.thread, nullptr) == SCE_OK);
+    Require(queued.acquired.load());
+    Require(pthread_rwlock_destroy_nid_postfix(&recursive) == 0);
+}
+
 int main() {
+    CheckWaitingWriterHoldsBackNewReaders();
     CheckConcurrentFirstWrlockExcludes();
     CheckDeadlinesBeyondTheClockRange();
     const KernelTimespec invalid{0, NANOS_PER_SECOND};

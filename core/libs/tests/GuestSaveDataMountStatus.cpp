@@ -4,6 +4,7 @@
 #include <cstring>
 #include <filesystem>
 #include <random>
+#include <set>
 #include <string>
 #include <system_error>
 
@@ -18,6 +19,9 @@ namespace {
 constexpr std::uint32_t MountReadWrite = 2;
 constexpr std::uint32_t MountCreate = 4;
 constexpr std::uint32_t MountCreate2 = 32;
+constexpr int SaveDataErrorParameter = -2137063424;
+constexpr int SaveDataErrorBusy = -2137063421;
+constexpr int SaveDataErrorNotFound = -2137063416;
 
 int failures = 0;
 
@@ -41,6 +45,60 @@ void MountAndCheck(const char* name, std::uint32_t mode, std::uint32_t expectedS
     Check(sceSaveDataUmount2(0, &result.mount_point) == 0, what + ": unmounts");
 }
 
+void CheckFailedMountKeepsResult() {
+    SceSaveDataDirName held{};
+    std::memcpy(held.data, "held", sizeof("held"));
+    SaveDataMount3 mount{};
+    mount.dir_name = &held;
+    mount.mount_mode = MountReadWrite | MountCreate2;
+    SaveDataMountResult result{};
+    Check(sceSaveDataMount3(&mount, &result) == 0, "first mount of a save");
+    const SaveDataMountResult mounted = result;
+    Check(sceSaveDataMount3(&mount, &result) == SaveDataErrorBusy, "second mount of a mounted save is BUSY");
+    Check(std::memcmp(&result, &mounted, sizeof(result)) == 0, "a BUSY mount leaves the result as it was");
+    SceSaveDataDirName absent{};
+    std::memcpy(absent.data, "absent", sizeof("absent"));
+    mount.dir_name = &absent;
+    mount.mount_mode = MountReadWrite;
+    Check(sceSaveDataMount3(&mount, &result) == SaveDataErrorNotFound, "open of a missing save is NOT_FOUND");
+    Check(std::memcmp(&result, &mounted, sizeof(result)) == 0, "a NOT_FOUND mount leaves the result as it was");
+    Check(sceSaveDataUmount2(0, &result.mount_point) == 0, "the kept mount point unmounts the save");
+}
+
+std::set<std::filesystem::path> Tree() {
+    std::set<std::filesystem::path> paths;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(std::filesystem::current_path())) paths.insert(entry.path());
+    return paths;
+}
+
+void CheckInvalidNameIsRejected(const char* data, std::size_t size, const std::string& label) {
+    for (const std::uint32_t mode : {MountReadWrite | MountCreate2, MountReadWrite | MountCreate, MountReadWrite}) {
+        SceSaveDataDirName dirName{};
+        std::memcpy(dirName.data, data, size);
+        SaveDataMount3 mount{};
+        mount.dir_name = &dirName;
+        mount.mount_mode = mode;
+        SaveDataMountResult result;
+        std::memset(&result, 0xCD, sizeof(result));
+        const SaveDataMountResult before = result;
+        const std::string what = label + " with mount mode " + std::to_string(mode);
+        Check(sceSaveDataMount3(&mount, &result) == SaveDataErrorParameter, what + " is a parameter error");
+        Check(std::memcmp(&result, &before, sizeof(result)) == 0, what + " leaves the result as it was");
+    }
+}
+
+void CheckInvalidNamesAreRejected() {
+    const auto before = Tree();
+    for (const char* invalid : {"", ".", "..", "a/b", "a\\b", "c:d"}) {
+        CheckInvalidNameIsRejected(invalid, std::strlen(invalid) + 1, std::string("\"") + invalid + "\"");
+    }
+    char unterminated[sizeof(SceSaveDataDirName::data)];
+    std::memset(unterminated, 'a', sizeof(unterminated));
+    CheckInvalidNameIsRejected(unterminated, sizeof(unterminated), "an unterminated name");
+    Check(Tree() == before, "rejected names create nothing");
+    MountAndCheck("after", MountReadWrite | MountCreate2, 1u, "CREATE2 after the rejected names");
+}
+
 }
 
 int main() {
@@ -53,6 +111,8 @@ int main() {
     MountAndCheck("fresh", MountReadWrite | MountCreate2, 0u, "CREATE2 of an existing save");
     MountAndCheck("made", MountReadWrite | MountCreate, 1u, "CREATE of a missing save");
     MountAndCheck("made", MountReadWrite, 0u, "open of an existing save");
+    CheckFailedMountKeepsResult();
+    CheckInvalidNamesAreRejected();
     std::filesystem::current_path(previous);
     std::error_code error;
     std::filesystem::remove_all(root, error);

@@ -1,7 +1,8 @@
 # GT7 native Vulkan work in progress
 
 This branch contains experimental Gran Turismo 7 (PS5) bring-up and a native Vulkan
-backend for a relinked executable. It is unfinished, is not an official PC port,
+backend for a relinked executable. Native rendering is the default on this GT7 branch.
+It is unfinished, is not an official PC port,
 and does not yet provide full-speed gameplay or verified PS5-equivalent graphics.
 
 ## Current progress (2026-10-17)
@@ -31,7 +32,9 @@ and does not yet provide full-speed gameplay or verified PS5-equivalent graphics
 - `core/shader/recompiler`: GPU-resolved resources, runtime shader addresses,
   shader translation, and persistent caches.
 - `agc_shader_replay` and `agc_graphics_library_prepare`: offline shader tools.
-- `APS5_NATIVE_GPU=1` enables the experimental native backend;
+- The experimental GT7 native backend is the default on this branch.
+  `APS5_EMULATED_GPU=1` selects the alternate emulated GPU path;
+  `APS5_NATIVE_SKIP_DRAWS=1` selects CPU-only profiling.
   `APS5_NATIVE_STATS=1` and `APS5_NATIVE_GPU_TIMES=1` enable diagnostics.
 
 This branch includes implementation source and compatibility stubs only. It does
@@ -44,17 +47,21 @@ from the game, assets, keys, runtime captures, or generated shader caches.
 
 Tool for automatic executables porting to Linux and Windows.
 
+[**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
+
+![anyps5_collage1](https://github.com/user-attachments/assets/ed2f0b2d-33d3-46d7-ab88-767ca872fc99)
+
 Includes a [relinker](core/relinker) that converts executable to the target system's native format and implementations of [system prx libraries](core/libs/prx) suitable for dynamic linking. No emulation or separate runtime process.
 
-[Usage](docs/user/USAGE.md), [Build instructions](docs/dev/BUILD.md), [Architecture](docs/dev/ARCHITECTURE.md), [Technical debt of the project](docs/dev/TechnicalDebt.md), [code style conventions](docs/dev/CONVENTIONS.md), [contributing](CONTRIBUTING.md)
+[**Discord**](https://discord.gg/BHFztBPUe), [Usage](docs/user/USAGE.md), [Build instructions](docs/dev/BUILD.md), [Architecture](docs/dev/ARCHITECTURE.md), [Technical debt of the project](docs/dev/TechnicalDebt.md), [code style conventions](docs/dev/CONVENTIONS.md), [contributing](CONTRIBUTING.md)
 
 ## Status
 
-[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/) [![shaders](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/)
+[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![shaders](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
 
-[![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/)
+[![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
 
-[![progress history](https://boykopovar.github.io/AnyPS5/history.svg)](https://boykopovar.github.io/AnyPS5/history.html)
+[Progress history](https://boykopovar.github.io/AnyPS5/history.html)
 
 <sub>* System libraries: percentage of the functions known to the project so far (declared in [core/libs/prx](core/libs/prx)), not of every PS5 system function. The total grows as more functions are declared.</sub>
 

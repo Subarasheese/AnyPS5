@@ -21,6 +21,73 @@
 #include <mach-o/loader.h>
 #endif
 
+namespace {
+constexpr int CursorInstructionRegister = -1;
+constexpr int CursorStackRegister = -2;
+constexpr int CursorRegisterCount = 17;
+
+std::uintptr_t* CursorRegister(_Unwind_Context* context, int number) {
+    if (number == CursorInstructionRegister) return &context->registers[16];
+    if (number == CursorStackRegister) return &context->registers[7];
+    if (number >= 0 && number < CursorRegisterCount) return &context->registers[number];
+    return nullptr;
+}
+
+bool APS5_VABI CursorValidRegister(_Unwind_Context* context, int number) {
+    return CursorRegister(context, number) != nullptr;
+}
+
+std::uintptr_t APS5_VABI CursorGetRegister(_Unwind_Context* context, int number) {
+    auto* value = CursorRegister(context, number);
+    if (!value) NotImplemented_nid_no_patch("libunwind cursor: read of an unknown register");
+    return value ? *value : 0;
+}
+
+void APS5_VABI CursorSetRegister(_Unwind_Context* context, int number, std::uintptr_t value) {
+    auto* slot = CursorRegister(context, number);
+    if (!slot) NotImplemented_nid_no_patch("libunwind cursor: write of an unknown register");
+    else *slot = value;
+}
+
+bool APS5_VABI CursorValidFloatRegister(_Unwind_Context*, int) {
+    return false;
+}
+
+bool APS5_VABI CursorIsSignalFrame(_Unwind_Context* context) {
+    return context->signalFrame;
+}
+
+void APS5_VABI CursorUnsupported(_Unwind_Context*) {
+    NotImplemented_nid_no_patch("libunwind cursor: operation other than register access or isSignalFrame");
+}
+
+template<class Function> std::uintptr_t Slot(Function function) {
+    return reinterpret_cast<std::uintptr_t>(function);
+}
+
+const std::uintptr_t CursorSlots[] = {
+    Slot(&CursorUnsupported),
+    Slot(&CursorUnsupported),
+    Slot(&CursorValidRegister),
+    Slot(&CursorGetRegister),
+    Slot(&CursorSetRegister),
+    Slot(&CursorValidFloatRegister),
+    Slot(&CursorUnsupported),
+    Slot(&CursorUnsupported),
+    Slot(&CursorUnsupported),
+    Slot(&CursorUnsupported),
+    Slot(&CursorUnsupported),
+    Slot(&CursorIsSignalFrame),
+    Slot(&CursorUnsupported),
+    Slot(&CursorUnsupported),
+    Slot(&CursorUnsupported),
+};
+}
+
+const std::uintptr_t* UnwindCursorSlots_nid_no_patch() {
+    return CursorSlots;
+}
+
 #if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
 
 extern "C" _Unwind_Reason_Code __gxx_personality_v0(int, _Unwind_Action, std::uint64_t, _Unwind_Exception*, _Unwind_Context*);

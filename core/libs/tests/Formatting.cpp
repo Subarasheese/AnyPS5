@@ -3,6 +3,7 @@
 #include "prx/libc/include/GuestHeap.hpp"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -101,6 +102,8 @@ static bool CheckWidePrecision() {
     Require(snprintf_nid_postfix(output, sizeof(output), "[%5.1ls]", u"\u00e9") == 7 && std::strcmp(output, "[     ]") == 0);
     Require(snprintf_nid_postfix(output, sizeof(output), "[%-5.2ls]", u"\u00e9") == 7 && std::strcmp(output, "[\xc3\xa9   ]") == 0);
     Require(FormatList(output, sizeof(output), "%.3ls", u"\U0001f600") == 0 && output[0] == 0);
+    Require(FormatList(output, sizeof(output), "%ls[% u][% 4u][%+ lu][%- 3hhu][% x][%+o]", u"", 5u, 5u, 5ULL, 5u, 255u, 8u) == 25
+        && std::strcmp(output, "[5][   5][5][5  ][ff][10]") == 0);
     Require(FormatList(output, sizeof(output), "%.*ls:%d", -1, u"\u00e9", 7) == 4 && std::strcmp(output, "\xc3\xa9:7") == 0);
     const char16_t bounded[] = {u'A', u'B'};
     Require(snprintf_nid_postfix(output, sizeof(output), "%.2ls", bounded) == 2 && std::strcmp(output, "AB") == 0);
@@ -111,6 +114,10 @@ static bool CheckWidePrecision() {
     Require(snprintf_nid_postfix(output, sizeof(output), "[%ls]", static_cast<const char16_t*>(nullptr)) == 8 && std::strcmp(output, "[(null)]") == 0);
     Require(snprintf_nid_postfix(output, sizeof(output), "a%lcb%C", 0, 0) == 4 && std::memcmp(output, "a\0b\0", 5) == 0);
     Require(FormatList(output, sizeof(output), "%%ls:%2$d:%1$d", 3, 7) == 7 && std::strcmp(output, "%ls:7:3") == 0);
+    Require(FormatList(output, sizeof(output), "%ls[%f][%+f][% F][%5.1e]", u"", -NAN, -NAN, NAN, -NAN) == 22
+        && std::strcmp(output, "[nan][nan][NAN][  nan]") == 0);
+    Require(FormatList(output, sizeof(output), "%ls[%-6g][%06a][%LG][%+f]", u"", NAN, -NAN, -static_cast<long double>(NAN), -INFINITY) == 27
+        && std::strcmp(output, "[nan   ][   nan][NAN][-inf]") == 0);
     for (std::size_t capacity = 0; capacity <= 6; ++capacity) {
         std::memset(output, '!', sizeof(output));
         int count = -1;

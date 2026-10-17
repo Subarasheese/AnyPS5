@@ -105,7 +105,7 @@ const bool hooksInstalled = [] {
 }
 
 bool GpuNative() {
-    static const bool native = Enabled() && EnvSet("APS5_NATIVE_GPU");
+    static const bool native = Enabled() && !SkipsDraws();
     return native;
 }
 
