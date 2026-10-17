@@ -6,6 +6,14 @@
 
 ### Experimental GT7 native backend
 
+- Native layered depth attachments now allocate and clear all decoded view layers,
+  and sampled array views select a bounded layer range. Mismatched attachment
+  layer counts are rejected. Sharing contents between overlapping independently
+  addressed depth views remains unresolved. A bounded native run exercised layered
+  draws without omissions; visual correctness remains unverified.
+- The GT7 import shim retains only unresolved exports. Its obsolete SSL, audio,
+  application-content and network exports were removed because preloading the
+  shim otherwise intercepts implementations now supplied by the runtime.
 - The default GT7 native backend is incomplete. Startup/title-screen UI has rendered,
   but 3D output, PS5 visual equivalence, full-speed gameplay, MSAA handling and
   complete memory-aliasing/coherency behavior are not established. Loop-guard

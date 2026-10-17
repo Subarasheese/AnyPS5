@@ -151,7 +151,7 @@ struct State {
 inline constexpr std::uint32_t PositionExportLayoutBits = 0xffffu | (1u << 21u) | (1u << 22u) | (1u << 23u);
 
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
-State DecodeState(const QueueState& queue, bool vertexWorkgroup = false);
+State DecodeState(const QueueState& queue, bool vertexWorkgroup = false, bool layeredDepth = false);
 std::array<VkSampleLocationEXT, 32> SampleLocations(const State& state);
 VkExtent2D SampleLocationGrid(const State& state);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);

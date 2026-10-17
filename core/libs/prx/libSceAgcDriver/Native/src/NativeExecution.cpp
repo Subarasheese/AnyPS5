@@ -269,7 +269,7 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet) {
             return false;
         }
         if (draw.indexCount == 0 || draw.instanceCount == 0) return true;
-        state = Graphics::DecodeState(queue, false);
+        state = Graphics::DecodeState(queue, false, true);
     } catch (const std::exception& error) {
         CountDrawFallback(std::string("state: ") + error.what());
         return false;

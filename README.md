@@ -7,6 +7,11 @@ and does not yet provide full-speed gameplay or verified PS5-equivalent graphics
 
 ## Current progress (2026-10-17)
 
+- Post-merge native-default bring-up removed obsolete preloaded exports that
+  intercepted implemented runtime functions, and added layered depth attachments.
+  A 600-second run recorded 24,445 native draws with no draw omissions. It remained
+  on the loading screen while preparing shaders/pipelines; menu access and
+  steady-state performance of this merged build are not yet established.
 - Native Vulkan renders the startup screens and parts of the title-screen UI.
   The 3D background remains black, and some graphics are incomplete.
 - Recent title-screen runs completed 600 seconds without a failed GPU batch,

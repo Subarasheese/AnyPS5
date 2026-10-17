@@ -155,7 +155,7 @@ struct NativeImages::State {
         VkFormat format = VK_FORMAT_UNDEFINED;
         VkExtent2D extent{};
         VkImageView attachment = VK_NULL_HANDLE;
-        VkImageView sampled = VK_NULL_HANDLE;
+        std::uint32_t layers = 1;
     };
     std::map<std::uint64_t, Depth> depths;
     struct Registered {
@@ -625,21 +625,24 @@ struct NativeImages::State {
 
     // A T#'s sampled slots made to read a depth buffer (the depth plane as R).
     void pointAtDepth(std::uint32_t index, const GuestTextureResource& resource, Depth& depth) {
-        if (depth.sampled == VK_NULL_HANDLE) {
-            depth.sampled = view(depth.image, VK_IMAGE_VIEW_TYPE_2D, depth.format, {}, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1});
-        }
-        static_cast<void>(resource);
-        write(SampledBase[0] + Slot2D, index, depth.sampled, false);
-        write(ShaderRecompiler::RuntimeAbi::FirstComparisonImageBinding + Slot2D, index, depth.sampled, false);
-        const auto arrayView = view(depth.image, VK_IMAGE_VIEW_TYPE_2D_ARRAY, depth.format, {}, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1});
+        const auto baseLayer = resource.baseArray;
+        if (baseLayer >= depth.layers) throw std::runtime_error("native depth sampled view starts outside its array");
+        const auto sampled = view(depth.image, VK_IMAGE_VIEW_TYPE_2D, depth.format, {}, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, baseLayer, 1});
+        write(SampledBase[0] + Slot2D, index, sampled, false);
+        write(ShaderRecompiler::RuntimeAbi::FirstComparisonImageBinding + Slot2D, index, sampled, false);
+        const auto lastLayer = std::min(resource.depthOrLastArray, depth.layers - 1u);
+        if (lastLayer < baseLayer) throw std::runtime_error("native depth sampled view has a reversed slice range");
+        const auto arrayView = view(depth.image, VK_IMAGE_VIEW_TYPE_2D_ARRAY, depth.format, {}, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, baseLayer, lastLayer - baseLayer + 1u});
         write(SampledBase[0] + Slot2DArray, index, arrayView, false);
         write(ShaderRecompiler::RuntimeAbi::FirstComparisonImageBinding + Slot2DArray, index, arrayView, false);
     }
 
     VkImageView depthView(VkCommandBuffer commands, const Graphics::DepthTarget& target) {
+        if (target.lastSlice < target.firstSlice) throw std::runtime_error("native depth attachment has a reversed slice range");
+        const auto layers = target.lastSlice - target.firstSlice + 1u;
         const auto address = target.address != 0 ? target.address : target.stencilAddress;
         auto found = depths.find(address);
-        if (found != depths.end() && (found->second.format != target.format || found->second.extent.width != target.extent.width || found->second.extent.height != target.extent.height)) {
+        if (found != depths.end() && (found->second.format != target.format || found->second.extent.width != target.extent.width || found->second.extent.height != target.extent.height || found->second.layers != layers)) {
             // GT7 reused the memory for a depth buffer of another shape: a new image (the old one
             // is kept; recorded work may still use it).
             depths.erase(found);
@@ -650,12 +653,13 @@ struct NativeImages::State {
         Depth depth;
         depth.format = target.format;
         depth.extent = target.extent;
+        depth.layers = layers;
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.imageType = VK_IMAGE_TYPE_2D;
         info.format = target.format;
         info.extent = {target.extent.width, target.extent.height, 1};
         info.mipLevels = 1;
-        info.arrayLayers = 1;
+        info.arrayLayers = layers;
         info.samples = VK_SAMPLE_COUNT_1_BIT;
         info.tiling = VK_IMAGE_TILING_OPTIMAL;
         info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -667,10 +671,10 @@ struct NativeImages::State {
         toGeneral(commands, made, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, aspects);
         // A new depth buffer starts at GT7's clear values (what its HTILE says before the first clear).
         const VkClearDepthStencilValue clear{target.clearDepth, target.clearStencil};
-        const VkImageSubresourceRange range{aspects, 0, 1, 0, 1};
+        const VkImageSubresourceRange range{aspects, 0, 1, 0, layers};
         fn<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, made, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
-        depth.attachment = view(made, VK_IMAGE_VIEW_TYPE_2D, target.format, {}, range);
+        depth.attachment = view(made, layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, target.format, {}, range);
         auto& stored = depths.emplace(address, depth).first->second;
         // T#s GT7 already made over this memory now read the depth buffer.
         for (const auto& [words, record] : registered) {

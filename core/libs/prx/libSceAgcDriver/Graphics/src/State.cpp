@@ -1014,7 +1014,7 @@ ReversedBlend TranslateReversedBlend(std::uint32_t blendControl, std::uint8_t co
     return {blend, routing->code};
 }
 
-State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
+State DecodeState(const QueueState& queue, bool vertexWorkgroup, bool layeredDepth) {
     if (auto reason = DepthMaintenanceRejection(queue); !reason.empty()) throw std::runtime_error(reason);
     const auto& cx = queue.context;
     State result{};
@@ -1193,7 +1193,11 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         result.renderLayers = result.color.layers;
         for (const auto& color : result.colors) Require(color.layers == result.renderLayers, "color targets with different layer counts are unsupported");
         if (result.renderLayers > 1) {
-            Require(!result.depth, "layered rendering with a depth target is unsupported");
+            Require(layeredDepth || !result.depth, "layered rendering with a depth target is unsupported");
+            if (result.depth) {
+                Require(result.depth->lastSlice >= result.depth->firstSlice, "depth view has a reversed slice range");
+                Require(result.depth->lastSlice - result.depth->firstSlice + 1u >= result.renderLayers, "depth target has fewer layers than the color targets");
+            }
             result.layerExports = read(cx, 0x207) & (1u << 18u);
         }
         if (result.depth) result.renderExtent = {std::min(result.renderExtent.width, result.depth->extent.width), std::min(result.renderExtent.height, result.depth->extent.height)};
