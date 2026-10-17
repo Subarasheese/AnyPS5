@@ -1,6 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StageLibraryCapture.hpp"
 #include "ShaderDiskCache.hpp"
+#include "prx/libSceAgcDriver/Native/include/NativeDevice.hpp"
+#include <memory>
+#include <cstdlib>
+#include <algorithm>
 #include "ShaderCacheDirectory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -13,11 +17,14 @@
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_graphics_library_prepare [--live] [--mesh-only] <directory of captures or requests>...\n");
+        std::fprintf(stderr, "usage: agc_graphics_library_prepare [--live] [--mesh-only] [--native-compute] <directory of captures or requests>...\n");
         return 2;
     }
     try {
-        AgcDriver::VulkanDevice device;
+        const bool nativeCompute = std::any_of(argv + 1, argv + argc, [](const char* argument) { return std::string_view(argument) == "--native-compute"; });
+        auto driver = std::make_shared<AgcDriver::VulkanDevice>();
+        auto& device = *driver;
+        auto* native = nativeCompute ? &AgcDriver::Native::NativeDevice::Create(driver) : nullptr;
         std::uint64_t prepared = 0;
         std::uint64_t liveOnly = 0;
         std::set<std::uint64_t> registrationModules;
@@ -25,6 +32,7 @@ int main(int argc, char** argv) {
         bool live = false;
         bool meshOnly = false;
         for (int argument = 1; argument < argc; ++argument) {
+            if (std::string_view(argv[argument]) == "--native-compute") continue;
             if (std::string_view(argv[argument]) == "--live") { live = true; continue; }
             if (std::string_view(argv[argument]) == "--mesh-only") { meshOnly = true; continue; }
             for (const auto& file : std::filesystem::directory_iterator(argv[argument])) {
@@ -35,6 +43,18 @@ int main(int argc, char** argv) {
                     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(
                         std::string_view(reinterpret_cast<const char*>(requestBytes.data()), requestBytes.size()));
                     const auto stage = request.request.shader.stage;
+                    if (nativeCompute) {
+                        if (stage != ShaderRecompiler::ShaderStage::Compute) continue;
+                        request.request.target = native->ComputeTarget(request.request.context.waveSize);
+                        if (request.request.context.floatMode && std::getenv("APS5_NATIVE_EXACT_DENORMALS") == nullptr) request.request.context.floatMode->floatMode |= 0x30u;
+                        const auto result = ShaderRecompiler::Recompile(request.request);
+                        if (!liveModules.insert(result.PipelineVariantId()).second) continue;
+                        std::string failure;
+                        if (!native->PrebuildCompute(result, failure)) throw std::runtime_error("native compute preparation: " + failure);
+                        std::printf("Prepared native compute pipeline %llu: %s\n", static_cast<unsigned long long>(++prepared), file.path().filename().string().c_str());
+                        std::fflush(stdout);
+                        continue;
+                    }
                     const bool fragment = stage == ShaderRecompiler::ShaderStage::Fragment;
                     const bool mesh = stage == ShaderRecompiler::ShaderStage::Mesh;
                     if (meshOnly && !mesh) continue;
@@ -76,7 +96,7 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     continue;
                 }
-                if (!file.is_regular_file()) continue;
+                if (nativeCompute || !file.is_regular_file()) continue;
                 const auto filename = file.path().filename().string();
                 const bool fragmentCapture = filename.ends_with(".fragment.bin");
                 const bool vertexCapture = filename.ends_with(".vertex.bin");
@@ -120,7 +140,8 @@ int main(int argc, char** argv) {
             }
         }
         ShaderRecompiler::ShaderDiskCache::Flush();
-        std::printf("Prepared %llu graphics libraries; %llu registration modules require live bindings\n",
+        device.SavePipelineCache();
+        std::printf("Prepared %llu pipelines/libraries; %llu registration modules require live bindings\n",
                     static_cast<unsigned long long>(prepared), static_cast<unsigned long long>(liveOnly));
         return prepared == 0 ? 1 : 0;
     } catch (const std::exception& error) {

@@ -37,6 +37,11 @@ and does not yet provide full-speed gameplay or verified PS5-equivalent graphics
 - `core/shader/recompiler`: GPU-resolved resources, runtime shader addresses,
   shader translation, and persistent caches.
 - `agc_shader_replay` and `agc_graphics_library_prepare`: offline shader tools.
+- `tools/run_gt7_native.sh GAME_DIRECTORY` builds the runtime and prepares captured
+  native compute pipelines before launch. Captures must already be available in
+  the game directory; graphics variants and uncaptured workloads still prepare
+  at first use. `agc_graphics_library_prepare --native-compute REQUEST_DIRECTORY`
+  runs the compute preparation separately without launching the game.
 - The experimental GT7 native backend is the default on this branch.
   `APS5_EMULATED_GPU=1` selects the alternate emulated GPU path;
   `APS5_NATIVE_SKIP_DRAWS=1` selects CPU-only profiling.

@@ -457,7 +457,11 @@ struct NativeDevice::State {
         info.layout = made.layout;
         const auto started = std::chrono::steady_clock::now();
         std::fprintf(stderr, "[native] building compute pipeline: %zu SPIR-V words, %zu bindings\n", shader.spirv.size(), shader.bindings.size());
-        const auto result = vkCreateComputePipelines(vk, VK_NULL_HANDLE, 1, &info, nullptr, &made.pipeline);
+        VkResult result;
+        {
+            auto cacheLock = context.LockPipelineCacheForUse();
+            result = vkCreateComputePipelines(vk, context.pipelineCache, 1, &info, nullptr, &made.pipeline);
+        }
         std::fprintf(stderr, "[native] compute pipeline built in %.0f ms (%d)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), static_cast<int>(result));
         vkDestroyShaderModule(vk, module, nullptr);
         if (result != VK_SUCCESS) {
@@ -1380,6 +1384,11 @@ void NativeDevice::AfterBatch(std::function<void()> action) {
 bool NativeDevice::Pending() const {
     std::lock_guard lock(state->workMutex);
     return state->recording;
+}
+
+bool NativeDevice::PrebuildCompute(const ShaderRecompiler::RecompileResult& shader, std::string& failure) {
+    std::unique_lock lock(state->workMutex);
+    return state->pipelineFor(shader, shader.PipelineVariantId(), failure, lock) != nullptr;
 }
 
 ShaderRecompiler::SpirvTarget NativeDevice::ComputeTarget(std::uint32_t waveSize) const {

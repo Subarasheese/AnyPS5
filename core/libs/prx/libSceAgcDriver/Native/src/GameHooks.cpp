@@ -81,6 +81,7 @@ std::size_t StolenLength(const std::uint8_t* code) {
 }
 
 std::uint8_t* CheckedTarget(const char* name, std::uintptr_t ebootAddress, std::size_t& stolen) {
+    if (!GameCodeMapped(ebootAddress, 16u)) throw std::runtime_error(std::string("native hooks: target is outside the main executable code: ") + name);
     auto* target = reinterpret_cast<std::uint8_t*>(GameImageBase() + ebootAddress);
     stolen = StolenLength(target);
     if (stolen == 0) {
@@ -144,6 +145,23 @@ std::uintptr_t GameImageBase() {
         return found;
     }();
     return base;
+}
+
+bool GameCodeMapped(std::uintptr_t ebootAddress, std::size_t bytes) {
+    struct Probe { std::uintptr_t offset; std::size_t bytes; bool readable = false; } probe{ebootAddress, bytes};
+    dl_iterate_phdr([](dl_phdr_info* info, std::size_t, void* data) {
+        auto& probe = *static_cast<Probe*>(data);
+        for (std::size_t i = 0; i < info->dlpi_phnum; ++i) {
+            const auto& segment = info->dlpi_phdr[i];
+            if (segment.p_type != PT_LOAD || (segment.p_flags & (PF_R | PF_X)) != (PF_R | PF_X)) continue;
+            if (probe.offset >= segment.p_vaddr && probe.offset - segment.p_vaddr <= segment.p_memsz && segment.p_memsz - (probe.offset - segment.p_vaddr) >= probe.bytes) {
+                probe.readable = true;
+                break;
+            }
+        }
+        return 1;
+    }, &probe);
+    return probe.readable;
 }
 
 void* InstallGameHook(const char* name, std::uintptr_t ebootAddress, void* handler) {

@@ -106,6 +106,7 @@ void Report() {
 
 const bool installed = [] {
     if (!Enabled() || (std::getenv("APS5_NATIVE_AUDIT") == nullptr && !GpuNative())) return false;
+    if (!GameCodeMapped(0x27d120, 16u) || !GameCodeMapped(0x1638690, 16u)) return false;
     originalTextureInit = reinterpret_cast<TextureInit>(InstallGameHook("texture init", 0x27d120, reinterpret_cast<void*>(&TextureInitHook)));
     originalTargetInit = reinterpret_cast<TargetInit>(InstallGameHook("render target init", 0x1638690, reinterpret_cast<void*>(&TargetInitHook)));
     if (GpuNative()) return true;

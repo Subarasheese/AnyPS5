@@ -35,6 +35,7 @@ struct RecordedShader {
     std::shared_ptr<const std::vector<std::uint32_t>> code;
     std::shared_ptr<const std::vector<std::byte>> header;
     std::uint64_t headerAddress = 0;
+    std::shared_ptr<std::atomic<std::uint8_t>> positionVectorUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
 };
 
 struct Stats {
@@ -159,6 +160,7 @@ bool FindRecordedShader(std::uint64_t address, RecordedProgram& program) {
     program.code = it->second.code;
     program.header = it->second.header;
     program.headerAddress = it->second.headerAddress;
+    program.positionVectorUse = it->second.positionVectorUse;
     return true;
 }
 

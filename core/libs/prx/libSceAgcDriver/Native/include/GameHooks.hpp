@@ -10,6 +10,7 @@
 // runs the 6 displaced bytes and continues after them.
 
 #include <cstdint>
+#include <cstddef>
 
 namespace AgcDriver::Native {
 
@@ -20,6 +21,7 @@ void* InstallGameHook(const char* name, std::uintptr_t ebootAddress, void* handl
 void InstallCountingHook(const char* name, std::uintptr_t ebootAddress, std::uint64_t** counter);
 
 std::uintptr_t GameImageBase();
+bool GameCodeMapped(std::uintptr_t ebootAddress, std::size_t bytes);
 
 // Installs the GT7 graphics-context hooks (native backend start-up).
 void InstallGraphicsContextHooks();

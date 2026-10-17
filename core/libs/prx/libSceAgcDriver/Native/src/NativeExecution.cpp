@@ -21,6 +21,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
@@ -375,6 +376,18 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet) {
         try {
             if (!fragment) {
                 vertex = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, nullptr, program.stage == Stage::Mesh, 8u - program.firstUserSgpr);
+                const auto layout = readRegister(queue.context, 0x207) & Graphics::PositionExportLayoutBits;
+                if (layout != 0u) {
+                    auto& cache = *program.recorded.positionVectorUse;
+                    const bool cacheable = program.binary.codeAddress == program.recorded.codeAddress;
+                    auto use = cacheable ? cache.load(std::memory_order_acquire) : 0u;
+                    if (use == 0u) {
+                        use = PositionExportLayout(nullptr, 0, program.binary.code, layout) != 0u ? 2u : 1u;
+                        if (cacheable) cache.store(use, std::memory_order_release);
+                    }
+                    vertex->paClVsOutCntl = use == 2u ? layout : 0u;
+                }
+                vertex->paClVsOutCntl |= state.layerExports;
                 vertexKey = vertex;
                 for (std::uint32_t i = 0; i < vertexKey->resourcesNum; ++i) {
                     auto& fields = vertexKey->resources[i].fields;

@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include <cstdint>
+#include <atomic>
 
 namespace AgcDriver::Native {
 
@@ -43,6 +44,7 @@ struct RecordedProgram {
     std::shared_ptr<const std::vector<std::uint32_t>> code;
     std::shared_ptr<const std::vector<std::byte>> header;
     std::uint64_t headerAddress = 0;
+    std::shared_ptr<std::atomic<std::uint8_t>> positionVectorUse;
 };
 bool FindRecordedShader(std::uint64_t address, RecordedProgram& program);
 

@@ -6,6 +6,17 @@
 
 ### Experimental GT7 native backend
 
+- Native vertex translation now receives the live position/clip/cull layout and
+  layer-export bits. Auxiliary position-export use is memoized for registered
+  entry points. Visual correctness after restoring this state still needs an
+  in-game check.
+- Hook prologues are read only after checking that the main executable has a
+  readable executable segment covering the target, allowing standalone offline
+  tools to load the native backend without accessing unmapped game addresses.
+- Native compute creation uses the shared persistent Vulkan pipeline cache. The
+  offline library preparer can warm native compute requests with the actual
+  device target; coverage is limited to available captures and does not prepare
+  uncaptured graphics state or establish steady-state performance.
 - Native layered depth attachments now allocate and clear all decoded view layers,
   and sampled array views select a bounded layer range. Mismatched attachment
   layer counts are rejected. Sharing contents between overlapping independently

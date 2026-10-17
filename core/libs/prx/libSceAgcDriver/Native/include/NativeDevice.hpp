@@ -70,6 +70,7 @@ public:
         std::uint64_t indirectArguments = 0;   // DISPATCH_INDIRECT: the group counts' address in GT7's memory (read by the GPU)
     };
     bool Dispatch(const ComputeWork& work, std::string& failure);
+    bool PrebuildCompute(const ShaderRecompiler::RecompileResult& shader, std::string& failure);
     // DMA_DATA to/from the persistent device-local GDS; false for other DMA.
     bool DmaGds(std::span<const std::uint32_t> packet);
 
