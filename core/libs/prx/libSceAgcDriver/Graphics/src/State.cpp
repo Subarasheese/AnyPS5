@@ -98,7 +98,7 @@ VkConservativeRasterizationModeEXT decodeConservativeRasterization(const QueueSt
 // The register rules DecodeState and DrawRejection share (the precheck must reject exactly what
 // DecodeState would): the masks whose set bits are unsupported, and the depth-control verdict.
 // Render target index, viewport index and the misc export vector that carries them are accepted but
-// not routed: color targets are single-layer, so layered draws land in layer 0.
+// Routed through the vertex-stage input contract and layered attachment views.
 constexpr std::uint32_t LayerExports = (1u << 18u) | (1u << 19u) | (1u << 21u) | (1u << 24u);
 constexpr std::uint32_t DepthControlMask = ~0x007007f0u;
 // EXEC_ON_HIER_FAIL / EXEC_ON_NOOP / EXEC_IF_OVERLAPPED (bits 9, 10, 17) only force the pixel shader
@@ -215,7 +215,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     const bool stencilClear = (read(cx, 0x000) & 2u) != 0;
     const auto view = read(cx, 0x002);
     zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIP_LEVEL)");
-    zero(cx, 0x010, 0x000f1000u, "partially resident or mipmapped depth (DB_Z_INFO)");
+    zero(cx, 0x010, 0x000f0000u, "mipmapped depth (DB_Z_INFO MAXMIP)");
     zero(cx, 0x011, 0x00001000u, "partially resident stencil (DB_STENCIL_INFO)");
     const auto zFormat = read(cx, 0x010) & 3u;
     const bool stencil = (read(cx, 0x011) & 1u) != 0;
@@ -244,6 +244,26 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
         if (depth.stencilAddress != 0) depth.stencilAddress += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, 1u);
     }
     depth.format = zFormat == 1 ? (stencil ? VK_FORMAT_D16_UNORM_S8_UINT : VK_FORMAT_D16_UNORM) : (stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT);
+    // AMD gc_10_3_0_sh_mask.h: DB_Z_INFO.PARTIALLY_RESIDENT is bit
+    // 12, independently of MAXMIP in bits 16..19. Fully backed planes
+    // behave identically with this flag set; prove coverage before using
+    // an ordinary Vulkan depth attachment. Missing pages need sparse-depth
+    // handling rather than being silently rendered as resident.
+    if (zFormat != 0 && (read(cx, 0x010) & 0x1000u) != 0) {
+        const auto bytes = DepthSliceBytes(depth.extent, zFormat == 1 ? 2u : 4u) * depth.samples;
+        auto covered = depth.address;
+        for (const auto& [begin, end] : GuestMemory::CommittedRanges(depth.address, static_cast<std::size_t>(bytes))) {
+            if (begin > covered) break;
+            covered = std::max(covered, end);
+        }
+        if (covered - depth.address < bytes) {
+            char detail[256];
+            std::snprintf(detail, sizeof(detail), "AGC graphics: partially resident depth 0x%llx (%ux%u, %u samples) has a hole at 0x%llx; sparse depth attachments are unsupported",
+                static_cast<unsigned long long>(depth.address), depth.extent.width, depth.extent.height, depth.samples,
+                static_cast<unsigned long long>(covered));
+            throw std::runtime_error(detail);
+        }
+    }
     depth.clearDepth = readFloat(cx, 0x00b);
     depth.clearStencil = static_cast<std::uint8_t>(read(cx, 0x00a) & 0xffu);
     if (const auto htile = find(cx, 0x005); zFormat != 0 && htile != cx.end() && htile->second != 0 && (read(cx, 0x010) & (1u << 29u)) != 0) {
@@ -461,6 +481,7 @@ struct DecodedColorFormat {
     std::uint32_t elementBytes;
     std::uint8_t componentMapping = 0xe4u;
     ShaderRecompiler::ColorExportPacking packing = ShaderRecompiler::ColorExportPacking::None;
+    std::uint32_t guestFormat = 0;
 };
 
 // CB_COLOR_INFO FORMAT / NUMBER_TYPE / COMP_SWAP to a Vulkan attachment format. AMD formats list
@@ -473,7 +494,7 @@ DecodedColorFormat DecodeColorFormat(std::uint32_t format, std::uint32_t number,
     };
     const bool alternate = swap == 1;
     const auto single = [&](VkFormat vkFormat, std::uint32_t bytes) { return DecodedColorFormat{vkFormat, bytes, static_cast<std::uint8_t>((0xe4u & ~3u) | swap)}; };
-    if (swap > 1 && format != 1 && format != 2 && format != 4 && format != 10 && format != 12) return fail();
+    if (swap > 1 && format != 1 && format != 2 && format != 4 && format != 7 && format != 10 && format != 12) return fail();
     switch (format) {
         case 1:
             if (number == unorm) return single(VK_FORMAT_R8_UNORM, 1);
@@ -511,6 +532,12 @@ DecodedColorFormat DecodeColorFormat(std::uint32_t format, std::uint32_t number,
             if (swap != 0 || (number != floating && number != unorm)) return fail();
             if (number == unorm) return {VK_FORMAT_R32_UINT, 4, 0xe4u, ShaderRecompiler::ColorExportPacking::Unorm10_11_11};
             return {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4};
+        case 7:
+            // COLOR_11_11_10 stores 10/11/11 bits from low to high. For a
+            // three-channel STD_REV target those are B/G/R. Render through a
+            // logical R11G11B10 proxy and permute packed bits at the boundary.
+            if (number != floating || swap != 2) return fail();
+            return {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, 0xe4u, ShaderRecompiler::ColorExportPacking::None, 43};
         case 9:
             // COLOR_2_10_10_10 keeps red in the low bits, the Vulkan A2B10G10R10 packing.
             if (number != unorm) return fail();
@@ -615,8 +642,13 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         ShaderRecompiler::TessellationConfiguration tess{(config >> 8u) & 0x3fu, (config >> 14u) & 0x3fu, parameters & 3u, (parameters >> 2u) & 7u, (parameters >> 5u) & 7u};
         validate(tess.inputControlPoints != 0 && tess.inputControlPoints <= 32 && tess.outputControlPoints != 0 && tess.outputControlPoints <= 32, "invalid tessellation control-point counts");
         if ((parameters & ~0x000600ffu) != 0) Require(false, zeroMessage(0x2db, parameters, "VGT_TF_PARAM donut, factor detection, memory type or reserved state"));
-        validate(tess.domain == 1 && tess.partitioning == 2 && tess.outputTopology == 2, "only triangular, fractional-odd, clockwise tessellation is supported by the reference path");
-        Require(readFloat(queue.context, 0x287) <= 1.0f && readFloat(queue.context, 0x286) >= 63.0f, "tessellation level clamps inside the fractional-odd range [1, 63] are unsupported");
+        validate((tess.domain == 1 || tess.domain == 2) &&
+            (tess.partitioning == 0 || tess.partitioning == 2 || tess.partitioning == 3) &&
+            (tess.outputTopology == 2 || tess.outputTopology == 3),
+            "unsupported tessellation domain, partitioning or output topology");
+        const auto maximumFactor = tess.partitioning == 2 ? 63.0f : 64.0f;
+        Require(readFloat(queue.context, 0x287) <= 1.0f && readFloat(queue.context, 0x286) >= maximumFactor,
+            "tessellation level clamps inside the partitioning range are unsupported");
         result.tessellation = tess;
     } else {
         validate((value & ~0x0047ec30u) == 0, "unsupported geometry routing, fast launch or wave-ID state");
@@ -686,18 +718,16 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         case 9: result.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST; break;
         case 4: result.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
         case 5: result.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+        case 21:
+            Require(result.stages.path == ShaderPath::Vertex, "polygon rendering requires vertex routing");
+            result.polygon = true;
+            result.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+            break;
         case 6: result.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
         default: throw std::runtime_error("AGC graphics: unsupported primitive type " + std::to_string(primitive));
     }
     APS5_LOG_OUT_DEBUG("Topology=%u", static_cast<unsigned>(result.topology));
     result.primitiveRestart = read(queue.userConfig, 0x24b, RegisterBank::UserConfig) != 0 && !result.rectList && result.topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
-    if ((read(cx, 0x207) & LayerExports) != 0) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
-        }
-    }
     zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
     result.samples = decodeSamples(cx);
     decodeSampleLocations(cx, result);
@@ -785,7 +815,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     const auto exportFormat = result.hasColorTarget ? read(cx, 0x1c5) : 0u;
     APS5_LOG_OUT_DEBUG("Export format=%u", exportFormat);
     // SPI_SHADER_POS_FORMAT: POS0 must be a 4-component position; later vectors carry the misc/clip
-    // exports that PA_CL_VS_OUT_CNTL validation above already limits to ignored layer/viewport data.
+    // exports selected by PA_CL_VS_OUT_CNTL.
     Require((read(cx, 0x1c3) & 0xfu) == 4, "additional position exports are unsupported");
     for (std::uint32_t index = 0; index < exportCount; ++index) {
         const auto slot = exportSlots[index];
@@ -794,9 +824,16 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         const auto slotExport = (exportFormat >> (4u * index)) & 0xfu;
         if (slotExport == 0 || slotExport == 8 || slotExport > 9) throw std::runtime_error("AGC graphics: color export format " + std::to_string(slotExport) + " is unsupported");
         auto color = DecodeColorBuffer(cx, slot);
+        // SPI_SHADER_32_* carries untyped register bits. R32_UINT needs a uint
+        // output interface, even when the EXP translator uses float containers.
+        if (color.format == VK_FORMAT_R32_UINT && color.packing == ShaderRecompiler::ColorExportPacking::None && slotExport != 7u) {
+            Require(slotExport == 1u || slotExport == 2u || slotExport == 3u || slotExport == 9u,
+                    "compressed export into an R32_UINT target is unsupported");
+            color.packing = ShaderRecompiler::ColorExportPacking::RawUint32;
+        }
         if (slotExport == 7 && ((read(cx, 0x31c + slot * 0xfu) >> 8u) & 7u) != 4u) throw std::runtime_error("AGC graphics: color export format 7 (UINT16_ABGR) into a target that is not unsigned integer is unsupported");
         color.exportIndex = index;
-        color.uintExport = slotExport == 7;
+        color.uintExport = slotExport == 7 || color.packing == ShaderRecompiler::ColorExportPacking::RawUint32;
         if (color.samples > 1 && result.samples == 1 && result.colors.empty() && !result.depth && !result.alphaToCoverage && (read(cx, 0x292) & 1u) == 0) {
             result.samples = color.samples;
             result.customSampleLocations = true;
@@ -863,13 +900,13 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         APS5_LOG_OUT_DEBUG("Blend %u control=0x%x", slot, blend);
         Require((blend & 0x0000e000u) == 0, "reserved blend control bits");
         VkPipelineColorBlendAttachmentState state{};
-        const auto mapping = color.componentMapping;
+        const bool logicalOrder = ((blend >> 30u) & 1u) && (color.componentMapping == 0x1bu || color.componentMapping == 0x93u);
+        const auto mapping = logicalOrder ? 0xe4u : color.componentMapping;
         const auto exportedMask = (targetMask >> (4u * slot)) & 0xfu;
         for (std::uint32_t component = 0; component < 4; ++component) {
             if (((exportedMask >> ((mapping >> (2u * component)) & 3u)) & 1u) != 0) state.colorWriteMask |= 1u << component;
         }
         state.blendEnable = (blend >> 30u) & 1u;
-        if (state.blendEnable && (mapping == 0x1bu || mapping == 0x93u)) throw std::runtime_error("AGC graphics: blending into a color target with a reversed component order is not implemented");
         Require(!state.blendEnable || !color.uintExport, "blending into an unsigned integer target is unsupported");
         if (state.blendEnable) {
             Require((read(cx, 0x31c + slot * 0xfu) & 0x10000u) == 0, "blend bypass conflicts with enabled blending");
@@ -909,7 +946,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
                 if ((weighted(state.colorBlendOp) && (constantColor(state.srcColorBlendFactor) || constantColor(state.dstColorBlendFactor))) || (weighted(state.alphaBlendOp) && (constantColor(state.srcAlphaBlendFactor) || constantColor(state.dstAlphaBlendFactor)))) throw std::runtime_error("AGC graphics: blending into an 8_8 color target with the alternate component order with a constant color factor, which Vulkan applies to the second channel with the green blend constant instead of the alpha one, is not implemented");
             }
         }
-        if (color.packing != ShaderRecompiler::ColorExportPacking::None) {
+        if (color.packing == ShaderRecompiler::ColorExportPacking::Unorm10_11_11) {
             const auto slotExport = (exportFormat >> (4u * color.exportIndex)) & 0xfu;
             if (slotExport == 5 || slotExport == 6) throw std::runtime_error("AGC graphics: color export format " + std::to_string(slotExport) + " into a 10_11_11 unorm target is unsupported");
             Require(!state.blendEnable, "blending into a 10_11_11 unorm color target is unsupported");
@@ -965,7 +1002,7 @@ std::array<std::uint8_t, 8> ExportMappings(const State& state) {
     std::array<std::uint8_t, 8> mappings{};
     mappings.fill(0xe4u);
     for (const auto& color : state.colors) {
-        if (color.exportIndex < mappings.size()) mappings[color.exportIndex] = color.componentMapping;
+        if (color.exportIndex < mappings.size()) mappings[color.exportIndex] = UsesLogicalColorOrder(state, color) ? 0xe4u : color.componentMapping;
     }
     return mappings;
 }
@@ -1008,7 +1045,9 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto view = read(cx, 0x31b + stride);
     Require((view & ~0x3fffffffu) == 0, "reserved CB_COLOR_VIEW bits are set");
     const auto slice = view & 0x1fffu;
-    Require(slice == ((view >> 13u) & 0x1fffu), "color views of several array slices are unsupported");
+    const auto lastSlice = (view >> 13u) & 0x1fffu;
+    Require(lastSlice >= slice, "color view has a reversed slice range");
+    color.viewLayers = lastSlice - slice + 1u;
     const auto viewMip = (view >> 26u) & 0xfu;
     const auto attrib2 = read(cx, 0x3b0 + slot);
     const auto maxMip = attrib2 >> 28u;
@@ -1021,13 +1060,18 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     if (volume) {
         color.depth = (attrib3 & 0x1fffu) + 1u;
         Require(maxMip == 0 && (info & 0x10000000u) == 0, "mipmapped or DCC 3D color targets are unsupported");
+        Require(color.viewLayers == 1, "layered 3D color views need a volume attachment view");
         Require(slice < color.depth, "the color view slice is beyond the 3D surface");
         color.depthSlice = slice;
-    } else if ((attrib3 & 0x1fffu) != 0) {
-        Require(slice <= (attrib3 & 0x1fffu), "the color view slice is beyond the array surface");
-        color.arrayLastSlice = attrib3 & 0x1fffu;
+    } else if (lastSlice != 0 || (attrib3 & 0x1fffu) != 0) {
+        // A thin 2D array's slice pitch is independent of its layer count. GT7 uses
+        // SLICE_MAX=5 with MIP0_DEPTH=0 for cube-face rendering; retain the entire
+        // explicitly selected view rather than interpreting it as a one-layer surface.
+        // CachedStorageSurface validates the guest extent for the resulting array.
+        color.arrayLastSlice = std::max(lastSlice, attrib3 & 0x1fffu);
         color.arraySlice = slice;
     }
+    Require(color.viewLayers == 1 || color.samples == 1, "layered multisample targets need a resident array image");
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
     color.elementBytes = decoded.elementBytes;
     std::uint64_t mipOffset = 0;
@@ -1058,6 +1102,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     GuestMemory::CheckRange(reinterpret_cast<const void*>(color.address), color.bytes, colorLayout.Alignment(), true);
     color.format = decoded.format;
     color.componentMapping = decoded.componentMapping;
+    color.guestFormat = decoded.guestFormat;
     color.packing = decoded.packing;
     Require(color.packing == ShaderRecompiler::ColorExportPacking::None || (info & 0x10000000u) == 0, "DCC-compressed 10_11_11 unorm color targets are unsupported");
     Require(color.packing == ShaderRecompiler::ColorExportPacking::None || (info & 0x00040000u) == 0, "truncating (ROUND_MODE) 10_11_11 unorm color targets are unsupported");
@@ -1254,6 +1299,11 @@ std::string NullPixelProgramRejection(const QueueState& queue) {
 std::vector<RegisterRead>*& RegisterReadLog() {
     static thread_local std::vector<RegisterRead>* log = nullptr;
     return log;
+}
+
+bool UsesLogicalColorOrder(const State& state, const ColorTarget& color) {
+    return color.guestFormat == 43 || ((color.componentMapping == 0x1bu || color.componentMapping == 0x93u) &&
+           color.exportIndex < state.blends.size() && state.blends[color.exportIndex].blendEnable);
 }
 
 bool SplitsAlternateAlpha(const State& state) {

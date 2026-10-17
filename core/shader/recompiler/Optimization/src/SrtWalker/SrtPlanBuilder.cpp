@@ -35,7 +35,7 @@ void PlanBuilder::Run() {
     }
     for (auto& block : _program.Blocks()) {
         for (IrValue* inst : block->Instructions()) {
-            if (inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst)) {
+            if (!_program.Metadata().gpuResolvedResources && inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst)) {
                 Collect(inst, inst->Flags<MemoryFlags>().pc);
             }
         }
@@ -70,7 +70,7 @@ void PlanBuilder::Collect(IrValue* raw, std::uint32_t usePc) {
         return;
     }
     IrValue* offset = inst->Argument(1)->Resolve();
-    const auto foldable = offset->HasImmediate() && offset->Type() == IrType::U32 && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst);
+    const auto foldable = !_program.Metadata().gpuResolvedResources && offset->HasImmediate() && offset->Type() == IrType::U32 && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst);
     if (!foldable) {
         if (std::find(_program.Metadata().dynamicReads.begin(), _program.Metadata().dynamicReads.end(), value) == _program.Metadata().dynamicReads.end()) {
             _program.Metadata().dynamicReads.push_back(value);

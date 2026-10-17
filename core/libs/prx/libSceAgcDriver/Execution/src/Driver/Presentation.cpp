@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Native/include/NativeDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -5,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
+#include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -35,9 +37,12 @@ void Driver::AttachWindow(const PresentationWindow& window) {
         replacedDevices.push_back(device);
     }
     device = std::make_shared<VulkanDevice>(&window);
+    // The native renderer runs on this device.
+    if (Native::GpuNative()) Native::NativeDevice::Create(device.Load());
 }
 
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool opaque, void (*gpuReady)(void*), void* context) {
+    if (Native::GpuNative()) Native::NotePresent();
     if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");
@@ -70,7 +75,12 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("device_setup");
             std::uint32_t drawableWidth = 0;
             std::uint32_t drawableHeight = 0;
-            window.getDrawableSize(window.context, &drawableWidth, &drawableHeight);
+            if (window.drawableSizeKnown) {
+                drawableWidth = window.drawableWidth;
+                drawableHeight = window.drawableHeight;
+            } else {
+                window.getDrawableSize(window.context, &drawableWidth, &drawableHeight);
+            }
             presenting->Resize(drawableWidth, drawableHeight);
             timing.Mark("resize");
             presentable = presenting->Presentable();
@@ -87,10 +97,20 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("acquire_image");
         }
         if (presentable) {
+            // Native renderer: the display buffer is the image GT7 last rendered at its address
+            // (looked up before the GPU mutex: the native batch takes it inside its own lock).
+            VkImage nativeImage = VK_NULL_HANDLE;
+            VkExtent2D nativeExtent{};
+            VkFormat nativeFormat = VK_FORMAT_UNDEFINED;
+            const bool nativeFrame = Native::GpuNative() && buffer != nullptr && Native::NativeDevice::Get() != nullptr && Native::NativeDevice::Get()->DisplayImage(buffer->address, nativeImage, nativeExtent, nativeFormat);
+            static std::uint64_t nativePresents = 0;
+            if (Native::GpuNative() && nativePresents++ % 300 == 0) std::fprintf(stderr, "[native] present %llu: display buffer 0x%llx %ux%u format 0x%llx tiling %u: %s\n", static_cast<unsigned long long>(nativePresents), buffer != nullptr ? static_cast<unsigned long long>(buffer->address) : 0ull, buffer != nullptr ? buffer->width : 0u, buffer != nullptr ? buffer->height : 0u, buffer != nullptr ? static_cast<unsigned long long>(buffer->pixelFormat) : 0ull, buffer != nullptr ? buffer->tilingMode : 0u, nativeFrame ? "native image" : "no native image");
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
             std::lock_guard lock(GuestMemory::GpuMutex());
             timing.Mark("gpu_mutex_wait");
-            if (buffer != nullptr) {
+            if (Native::GpuNative()) {
+                submitted = nativeFrame ? presenting->PresentNativeImage(nativeImage, std::min(buffer->width, nativeExtent.width), std::min(buffer->height, nativeExtent.height)) : presenting->PresentClear(window.width, window.height, opaque);
+            } else if (buffer != nullptr) {
                 if (syncFlip) {
                     presenting->WaitIdle();
                     timing.Mark("device_idle_wait");

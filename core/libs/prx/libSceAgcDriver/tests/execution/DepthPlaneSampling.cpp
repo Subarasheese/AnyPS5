@@ -61,7 +61,7 @@ constexpr std::array<std::uint32_t, 3> LoadDims{1u, 3u, 5u};
 
 std::array<std::uint32_t, 11> LoadCode(std::uint32_t dim) {
     return {
-        0x7e020280,                        // v_mov_b32 v1, 0 (y)
+        0x7e02020d,                        // v_mov_b32 v1, s13 (y)
         0x7e04020c,                        // v_mov_b32 v2, s12 (slice or face)
         0xf0001100u | (dim << 3u),         // image_load v3, v[0:2], s[4:11] dmask:0x1 unorm, dim 2D / CUBE / 2D_ARRAY
         0x00010300,
@@ -220,7 +220,7 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
 
 // Loads row 0 of `slice` of the texture `shape` describes at `texels` into `output` (one dword per thread). With
 // `shaderImage2D` the shader declares a 2D image whatever the T#'s type is.
-void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& shape, std::uint32_t slice, std::span<std::uint32_t> output, bool shaderImage2D = false) {
+void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& shape, std::uint32_t slice, std::span<std::uint32_t> output, bool shaderImage2D = false, std::uint32_t row = 0) {
     const auto& code = shaderImage2D ? Load2D : shape.type == TypeCube ? LoadCube : shape.type == Type2DArray ? LoadArray : Load2D;
     std::vector<std::uint32_t> userData(16, 0u);
     const auto out = std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(output.data())), static_cast<std::uint32_t>((reinterpret_cast<std::uintptr_t>(output.data()) >> 32u) & 0xffffu), static_cast<std::uint32_t>(output.size_bytes()), 0x31016facu};
@@ -228,6 +228,7 @@ void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& sh
     std::copy(out.begin(), out.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     userData[12] = slice;
+    userData[13] = row;
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
@@ -266,6 +267,25 @@ void ArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std
     for (std::uint32_t slice = 0; slice < 3u; ++slice) {
         Load(device, base, shape, slice, output);
         Expect(output, Bits(expected[slice]), "D32 2D array slice " + std::to_string(slice));
+    }
+}
+
+// Narrow Z-tiled depth arrays have padded linear rows. Read several rows of
+// both the rendered slice and guest-backed slices to check pitch and stride.
+void PaddedArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    for (const auto height : {64u, 96u}) {
+        auto* base = block.At(height == 64u ? 0x120000u : 0x160000u);
+        DrawDepth(device, reinterpret_cast<std::uintptr_t>(base), {64, height}, VK_FORMAT_D32_SFLOAT, DrawnDepth);
+        FillSlice(base + SliceBytes, SliceBytes, Bits(0.5f), 4u);
+        FillSlice(base + 2u * SliceBytes, SliceBytes, Bits(0.75f), 4u);
+        const Shape shape{Format32Float, 64, height, Type2DArray, 2, Swizzle64KbZX};
+        const std::array<float, 3> expected{DrawnDepth, 0.5f, 0.75f};
+        for (std::uint32_t slice = 0; slice < expected.size(); ++slice) {
+            for (const auto row : {0u, 1u, height - 1u}) {
+                Load(device, base, shape, slice, output, false, row);
+                Expect(output, Bits(expected[slice]), "padded D32 array slice " + std::to_string(slice) + " row " + std::to_string(row));
+            }
+        }
     }
 }
 
@@ -332,12 +352,17 @@ void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<s
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         GuestBlock block;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const std::span<std::uint32_t> output(reinterpret_cast<std::uint32_t*>(block.At(OutputOffset)), Threads);
+        PaddedArrayCase(*device, block, output);
+        if (argc == 2 && std::string_view(argv[1]) == "--padded") {
+            std::puts("padded depth plane sampling tests passed");
+            return 0;
+        }
         ArrayCase(*device, block, output);
         CubeCase(*device, block, output);
         IntegerCase(*device, block, output);

@@ -483,7 +483,7 @@ void VideoOutDriver::vblankEnd(std::uint64_t tick) {
     }
 }
 
-void VideoOutDriver::processFlip(FlipRequest& req) {
+void VideoOutDriver::processFlip(FlipRequest& req, const AgcDriver::PresentationWindow& target) {
     AgcDriver::PerformanceContext timingContext(req.timing.get());
     AgcDriver::PerformanceTimer timing("VideoOut.Flip");
     {
@@ -518,9 +518,6 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             req.gpuComplete = true;
         }
     } else {
-        window.Ensure(req.width, req.height);
-        const auto extensions = windowExtensions(window.Handle());
-        const AgcDriver::PresentationWindow target{window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, req.width, req.height, req.timing};
         timing.Mark("window_prepare");
         const auto gpuReady = [](void* context) {
             auto& request = *static_cast<FlipRequest*>(context);
@@ -538,8 +535,6 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             AgcDriverPresentClear_nid_postfix(target, req.unregistered || req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, gpuReady, &req);
         }
         timing.Mark("present");
-        window.UpdateTitle();
-        timing.Mark("window_title");
     }
     std::lock_guard lock(req.cfg->mutex);
     timing.Mark("completion_mutex_wait");
@@ -593,13 +588,34 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         PadInput padInput;
         MouseInput mouseInput;
         KeyboardInput keyboardInput;
+        // SDL stays on this thread. Long GPU waits and shader preparation must
+        // not prevent event polling, resizing, input or the close button.
+        std::mutex workMutex;
+        std::condition_variable_any workChanged;
+        std::packaged_task<void()> work;
+        std::future<void> flipFinished;
+        const bool logPresentWait = std::getenv("APS5_LOG_PRESENT_WAIT") != nullptr;
+        auto flipStarted = std::chrono::steady_clock::now();
+        auto nextWaitReport = flipStarted;
+        std::jthread presenter([&](std::stop_token stopped) {
+            while (!stopped.stop_requested()) {
+                std::packaged_task<void()> task;
+                {
+                    std::unique_lock lock(workMutex);
+                    workChanged.wait(lock, stopped, [&] { return work.valid(); });
+                    if (!work.valid()) break;
+                    task = std::move(work);
+                }
+                task(); // exceptions are delivered to the window thread by the future
+            }
+        });
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
-                flipQueue->changed.WaitUntil(lock, TimedWait::DeadlineNanos(PRESENT_POLL_MICROS), [&] { return token.stop_requested() || flipQueue->failure || !flipQueue->requests.empty(); });
+                flipQueue->changed.WaitUntil(lock, TimedWait::DeadlineNanos(PRESENT_POLL_MICROS), [&] { return token.stop_requested() || flipQueue->failure || (!current && !flipQueue->requests.empty()); });
                 if (flipQueue->failure) std::rethrow_exception(flipQueue->failure);
                 if (token.stop_requested()) break;
-                if (!flipQueue->requests.empty()) {
+                if (!current && !flipQueue->requests.empty()) {
                     current = std::move(flipQueue->requests.front());
                     flipQueue->requests.pop_front();
                 }
@@ -621,9 +637,41 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
             updateDisplayRefreshRate();
             if (current) {
                 require(current->timing != nullptr, "missing presentation timing");
-                const auto dequeued = AgcDriver::FrameTiming::Clock::now();
-                current->timing->Add(current->timing->Get("VideoOut", "queue"), dequeued - current->queuedAt);
-                processFlip(*current);
+                if (!flipFinished.valid()) {
+                    const auto dequeued = AgcDriver::FrameTiming::Clock::now();
+                    current->timing->Add(current->timing->Get("VideoOut", "queue"), dequeued - current->queuedAt);
+                    flipStarted = std::chrono::steady_clock::now();
+                    nextWaitReport = flipStarted + std::chrono::seconds(10);
+                    window.Ensure(current->width, current->height);
+                    auto extensions = windowExtensions(window.Handle());
+                    auto* handle = window.Handle();
+                    std::uint32_t drawableWidth = 0, drawableHeight = 0;
+                    windowDrawableSize(handle, &drawableWidth, &drawableHeight);
+                    std::packaged_task<void()> task([this, request = current, handle, extensions = std::move(extensions), drawableWidth, drawableHeight] {
+                        AgcDriver::PresentationWindow target{handle, extensions, &createWindowSurface, &windowDrawableSize, request->width, request->height, request->timing};
+                        target.drawableSizeKnown = true;
+                        target.drawableWidth = drawableWidth;
+                        target.drawableHeight = drawableHeight;
+                        processFlip(*request, target);
+                    });
+                    flipFinished = task.get_future();
+                    {
+                        std::lock_guard lock(workMutex);
+                        require(!work.valid(), "presentation worker already has a queued flip");
+                        work = std::move(task);
+                    }
+                    workChanged.notify_one();
+                }
+                if (flipFinished.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (logPresentWait && now >= nextWaitReport) {
+                        std::fprintf(stderr, "[videoout] SDL event pump active; GPU presentation pending %.1f s\n", std::chrono::duration<double>(now - flipStarted).count());
+                        nextWaitReport = now + std::chrono::seconds(10);
+                    }
+                    continue;
+                }
+                flipFinished.get();
+                window.UpdateTitle();
                 const auto finished = AgcDriver::FrameTiming::Clock::now();
                 AgcDriver::FrameTiming::Clock::duration interval{};
                 {

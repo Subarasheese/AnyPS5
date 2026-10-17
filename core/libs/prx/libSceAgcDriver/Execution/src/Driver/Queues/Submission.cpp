@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
@@ -222,7 +223,8 @@ void Driver::executeRewindTail(const Submission& stalled) {
     }
     if (APS5_ENABLE_TIMING_LOG) tail.enqueuedAt = tail.dequeuedAt = tail.orderedAt = std::chrono::steady_clock::now();
     timing.Finish();
-    execute(tail);
+    if (Native::GpuNative()) executeNative(tail);
+    else execute(tail);
 }
 
 void Driver::Submit(const Packet* packet, std::uint32_t queue) {

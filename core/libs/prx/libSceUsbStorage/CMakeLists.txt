@@ -1,0 +1,3 @@
+add_library(libSceUsbStorage SHARED EXCLUDE_FROM_ALL Export.cpp)
+target_include_directories(libSceUsbStorage PRIVATE ${LIBS_INCLUDE_DIR})
+configure_windows_unwind(libSceUsbStorage)

@@ -44,6 +44,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         }
     }
     request.context.memory = memory;
+    captureRequest(request);
     if (traceCapSync()) traceCapture("draw-capture", program.binary.codeAddress, submission.queue, memory, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     if (profile) {
         ++captures;

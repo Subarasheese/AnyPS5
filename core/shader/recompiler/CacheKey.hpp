@@ -87,6 +87,15 @@ private:
         appendMesh(key, request);
         appendTessellation(key, request);
         append(key, request.target);
+        if (request.target.gpuResolvedResources) {
+            // These switches change emitted memory operations and diagnostics.
+            append(key, std::getenv("APS5_NATIVE_NO_DIRECT") != nullptr);
+            append(key, std::getenv("APS5_NATIVE_CHECK_DIRECT") != nullptr);
+            const auto* checkProgram = std::getenv("APS5_NATIVE_CHECK_DIRECT_PROGRAM");
+            const auto* checkPc = std::getenv("APS5_NATIVE_CHECK_DIRECT_PC");
+            append(key, checkProgram != nullptr ? std::strtoull(checkProgram, nullptr, 0) : 0ull);
+            append(key, checkPc != nullptr ? std::strtoull(checkPc, nullptr, 0) : ~0ull);
+        }
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
         append(key, RayTracingMiss());
@@ -189,6 +198,7 @@ private:
     }
 
     static void append(std::vector<std::uint64_t>& key, const ShaderVertexStageInfo& value) {
+        append(key, value.paClVsOutCntl);
         append(key, value.fetchAttribReg);
         append(key, value.fetchBufferReg);
         append(key, value.fetchEmbedded);
@@ -242,6 +252,11 @@ private:
         append(key, value.narrowSubgroupClock);
         append(key, value.float64DenormPreserve);
         append(key, value.registrationModules);
+        append(key, value.gpuResolvedResources);
+        // GPU-resolved heap pointers are supplied in runtime shader data.
+        // Process-specific VkDeviceAddresses must not invalidate offline caches.
+        append(key, value.gpuResolvedResources ? 0ull : value.nativeImageTable);
+        append(key, value.gpuResolvedResources ? 0ull : value.nativeSamplerTable);
         append(key, value.registrationWordLimit);
         append(key, value.vertexSubgroups);
     }

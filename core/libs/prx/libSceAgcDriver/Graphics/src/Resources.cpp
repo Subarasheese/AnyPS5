@@ -327,11 +327,18 @@ VkImageView RenderTarget::View() const {
 }
 
 CommandBatch::CommandBatch(const Context& context) : context(context) {
-    // Records into the device's one command pool and submits to its queue: device-lock work only.
+    // Temporary recording owns its pool; presentation can record concurrently.
     GuestMemory::AssertGpuLockHeld("CommandBatch");
     try {
+        if (context.queueFamilyIndex != VK_QUEUE_FAMILY_IGNORED) {
+            VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+            poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            poolInfo.queueFamilyIndex = context.queueFamilyIndex;
+            Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &poolInfo, nullptr, &ownedPool), "vkCreateCommandPool temporary batch");
+            this->context.pool = ownedPool;
+        }
         VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        allocation.commandPool = context.pool;
+        allocation.commandPool = this->context.pool;
         allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocation.commandBufferCount = 1;
         Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers");
@@ -360,6 +367,7 @@ void CommandBatch::release() noexcept {
     }
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
     if (fence) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+    if (ownedPool) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, ownedPool, nullptr);
 }
 
 VkCommandBuffer CommandBatch::Handle() const {

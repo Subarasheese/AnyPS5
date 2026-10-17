@@ -7,6 +7,9 @@
 #include <span>
 #include <string>
 #include <vector>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 namespace AgcDriver::Graphics {
 
@@ -74,7 +77,7 @@ PipelineCache::~PipelineCache() {
     context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, nullptr);
 }
 
-void PipelineCache::load(std::vector<std::byte>& initialData) {
+void PipelineCache::load(std::vector<std::byte>& initialData, bool quiet) {
     std::vector<std::byte> file;
     if (!ShaderRecompiler::ReadWholeFile(path, file)) return;
     const auto reject = [&](const char* why) {
@@ -99,14 +102,41 @@ void PipelineCache::load(std::vector<std::byte>& initialData) {
     std::memcpy(&vulkan, data.data(), sizeof(vulkan));
     if (vulkan.headerSize < sizeof(vulkan) || vulkan.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || vulkan.vendorID != properties.vendorID || vulkan.deviceID != properties.deviceID || std::memcmp(vulkan.uuid, properties.pipelineCacheUUID, VK_UUID_SIZE) != 0) return reject("made for another device or driver");
     initialData.assign(data.begin(), data.end());
-    savedBytes = initialData.size();
-    std::fprintf(stderr, "[pipeline-cache] loaded %.1f KiB from %s\n", static_cast<double>(initialData.size()) / 1024.0, path.string().c_str());
+    if (!quiet) {
+        savedBytes = initialData.size();
+        std::fprintf(stderr, "[pipeline-cache] loaded %.1f KiB from %s\n", static_cast<double>(initialData.size()) / 1024.0, path.string().c_str());
+    }
 }
 
 void PipelineCache::save(bool final) {
     const auto getData = context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     std::size_t size = 0;
     if (getData(context.device, cache, &size, nullptr) != VK_SUCCESS || size == 0 || size == savedBytes) return;
+    // Several Vulkan devices can compile different pipelines for the same game.
+    // Serialize the read/merge/replace operation so one device cannot discard
+    // another device's additions (including those from another process).
+    struct FileLock {
+        int fd;
+        ~FileLock() { if (fd >= 0) { flock(fd, LOCK_UN); close(fd); } }
+    } fileLock{open((path.string() + ".lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600)};
+    if (fileLock.fd < 0 || flock(fileLock.fd, LOCK_EX) != 0) {
+        std::fprintf(stderr, "[pipeline-cache] cannot lock %s\n", path.string().c_str());
+        return;
+    }
+    std::vector<std::byte> diskData;
+    load(diskData, true);
+    if (!diskData.empty()) {
+        VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        info.initialDataSize = diskData.size();
+        info.pInitialData = diskData.data();
+        VkPipelineCache diskCache = VK_NULL_HANDLE;
+        const auto created = context.Function<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(context.device, &info, nullptr, &diskCache);
+        if (created != VK_SUCCESS) return;
+        const auto merged = context.Function<PFN_vkMergePipelineCaches>("vkMergePipelineCaches")(context.device, cache, 1, &diskCache);
+        context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, diskCache, nullptr);
+        if (merged != VK_SUCCESS) return;
+        if (getData(context.device, cache, &size, nullptr) != VK_SUCCESS || size == 0) return;
+    }
     std::vector<std::byte> file(sizeof(FileHeader) + size);
     const auto result = getData(context.device, cache, &size, file.data() + sizeof(FileHeader));
     if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;

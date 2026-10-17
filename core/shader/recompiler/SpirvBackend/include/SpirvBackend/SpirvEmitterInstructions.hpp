@@ -68,6 +68,9 @@ std::uint32_t EmitMeshRestartStart(SpirvValueEmitContext& ctx, const IrValue& in
 std::uint32_t EmitGetTessellationAttribute(SpirvValueEmitContext& ctx, const IrValue& inst);
 void EmitSetTessellationAttribute(SpirvValueEmitContext& ctx, const IrValue& inst);
 std::uint32_t EmitGetUserData(SpirvEmitterState& state, ScalarReg reg);
+// GPU-resolved programs: translates every user-data pointer the program reads through, once, at the
+// point of the call (main's entry block).
+void EmitNativeBasePrologue(SpirvEmitterState& state);
 std::uint32_t EmitGetBuiltin(SpirvValueEmitContext& ctx, const IrValue* kind, const IrValue* index);
 std::uint32_t EmitUndefU1(SpirvEmitterState& state, const IrValue& inst);
 std::uint32_t EmitDppMoveU32(SpirvValueEmitContext& ctx, const IrValue& inst);

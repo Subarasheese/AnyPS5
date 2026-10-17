@@ -109,6 +109,7 @@ private:
     VkFence fence = VK_NULL_HANDLE;
     bool pending = false;
     bool submitted = false;
+    VkCommandPool ownedPool = VK_NULL_HANDLE;
 };
 
 }

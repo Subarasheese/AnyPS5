@@ -45,6 +45,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 const auto& vertex = *vertexInfos[i];
                 require(vertex.resourcesNum <= vertex.resources.size(), "vertex stage info resource count exceeds its table");
                 mix(vertex.resourcesNum);
+                mix(vertex.paClVsOutCntl);
                 mix(vertex.fetchAttribReg);
                 mix(vertex.fetchBufferReg);
                 mix(vertex.fetchEmbedded);

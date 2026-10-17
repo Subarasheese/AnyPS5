@@ -236,6 +236,7 @@ struct VulkanDevice::State {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    std::uint32_t queueFamily = 0;
     VkCommandPool pool = VK_NULL_HANDLE;
     void* window = nullptr;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -269,6 +270,7 @@ struct VulkanDevice::State {
     bool geometryShader = false;
     bool sampleRateShading = false;
     bool shaderClipDistance = false;
+    bool shaderViewportIndexLayer = false;
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
@@ -949,6 +951,20 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     int selectedRank = -1;
     const char* requestedName = std::getenv("ANYPS5_GPU");
     if (requestedName != nullptr && *requestedName == '\0') requestedName = nullptr;
+    const char* requestedUuid = std::getenv("ANYPS5_GPU_UUID");
+    if (requestedUuid != nullptr && *requestedUuid == '\0') requestedUuid = nullptr;
+    std::string uuidRequest;
+    if (requestedUuid != nullptr) {
+        std::string_view value(requestedUuid);
+        if (value.starts_with("GPU-")) value.remove_prefix(4);
+        for (const auto character : value) {
+            if (character == '-') continue;
+            require(std::isxdigit(static_cast<unsigned char>(character)) != 0,
+                    "Vulkan: ANYPS5_GPU_UUID contains a non-hexadecimal character");
+            uuidRequest.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
+        }
+        require(uuidRequest.size() == VK_UUID_SIZE * 2u, "Vulkan: ANYPS5_GPU_UUID must contain 16 bytes");
+    }
     const auto matchesRequest = [&](const char* deviceName) {
         const std::string_view name(deviceName);
         const std::string_view request(requestedName);
@@ -971,15 +987,24 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     };
     const std::array<const char*, 1> presentationExtensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     for (auto physical : devices) {
-        VkPhysicalDeviceProperties properties{};
-        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(physical, &properties);
-        APS5_LOG_OUT("Physical device candidate=%p name=%s api=0x%x type=%d", reinterpret_cast<void*>(physical), properties.deviceName, properties.apiVersion, static_cast<int>(properties.deviceType));
+        VkPhysicalDeviceIDProperties identity{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 candidate{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &identity};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &candidate);
+        const auto& properties = candidate.properties;
+        std::string uuid;
+        constexpr char hexadecimal[] = "0123456789abcdef";
+        for (const auto byte : identity.deviceUUID) {
+            uuid.push_back(hexadecimal[byte >> 4u]);
+            uuid.push_back(hexadecimal[byte & 15u]);
+        }
+        APS5_LOG_OUT("Physical device candidate=%p name=%s uuid=%s api=0x%x type=%d", reinterpret_cast<void*>(physical), properties.deviceName, uuid.c_str(), properties.apiVersion, static_cast<int>(properties.deviceType));
         if (!candidateNames.empty()) candidateNames += ", ";
-        candidateNames += properties.deviceName;
+        candidateNames += std::string(properties.deviceName) + " [" + uuid + "]";
         if (properties.apiVersion < VK_API_VERSION_1_1) {
             continue;
         }
         if (requestedName != nullptr && !matchesRequest(properties.deviceName)) continue;
+        if (requestedUuid != nullptr && uuidRequest != uuid) continue;
         const int rank = requestedName != nullptr ? 4 : rankDeviceType(properties.deviceType);
         if (rank <= selectedRank) {
             continue;
@@ -1013,6 +1038,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
                 break;
             }
         }
+    }
+    if (selected == VK_NULL_HANDLE && requestedUuid != nullptr) {
+        throw std::runtime_error(std::string("Vulkan: no usable device matching ANYPS5_GPU_UUID=") + requestedUuid + "; devices: " + candidateNames);
     }
     if (selected == VK_NULL_HANDLE && requestedName != nullptr) {
         throw std::runtime_error(std::string("Vulkan: no usable device whose name contains ANYPS5_GPU=\"") + requestedName + "\"; devices: " + candidateNames);
@@ -1166,6 +1194,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->capabilities.push_back(spv::CapabilityRoundingModeRTE);
         state->capabilities.push_back(spv::CapabilityDenormPreserve);
     }
+    if (hasExtension(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME)) {
+        deviceExtensions.push_back(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
+        state->shaderViewportIndexLayer = true;
+        state->capabilities.push_back(spv::CapabilityShaderViewportIndexLayerEXT);
+        state->spirvExtensions.push_back("SPV_EXT_shader_viewport_index_layer");
+    }
     deviceExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     deviceExtensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
     state->capabilities.push_back(4448);
@@ -1223,6 +1257,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->drawIndirectCount = hasExtension(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
     if (state->drawIndirectCount) deviceExtensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
     state->memoryBudget = hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    // The native renderer (Native/NativeDevice) binds its per-dispatch buffers as push descriptors.
+    if (hasExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) deviceExtensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     // Guest memory is host memory: importing it lets address-based shaders use it in place instead of
     // copying every registered allocation per draw.
     if (hasExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) && std::getenv("APS5_NO_HOST_IMPORT") == nullptr) {
@@ -1361,6 +1397,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     APS5_LOG_OUT("Vulkan features tessellationAvailable=%u mesh=%u depthClip=%u depthRangeUnrestricted=%u pipelineLibrary=%u", static_cast<unsigned>(state->tessellationShader), static_cast<unsigned>(state->meshShader), static_cast<unsigned>(state->depthClipControl), static_cast<unsigned>(state->depthRangeUnrestricted), static_cast<unsigned>(state->graphicsPipelineLibrary));
     require(available.samplerAnisotropy && available.textureCompressionBC, "device lacks sampler anisotropy or BC texture compression support required for texture sampling");
     enabled.samplerAnisotropy = VK_TRUE;
+    // Native renderer diagnostics (APS5_NATIVE_DRAW_STATS).
+    if (std::getenv("APS5_NATIVE_GPU") != nullptr) enabled.pipelineStatisticsQuery = available.pipelineStatisticsQuery;
     enabled.textureCompressionBC = VK_TRUE;
     // Guest shaders routinely read past descriptor ranges; robust access turns that into zeros
     // instead of a GPU fault that loses the device.
@@ -1392,6 +1430,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (enabled.shaderImageGatherExtended) state->capabilities.push_back(spv::CapabilityImageGatherExtended);
     enabled.shaderResourceMinLod = available.shaderResourceMinLod;
     if (enabled.shaderResourceMinLod) state->capabilities.push_back(spv::CapabilityMinLod);
+    enabled.independentBlend = available.independentBlend;
     enabled.sampleRateShading = available.sampleRateShading;
     enabled.geometryShader = available.geometryShader;
     state->geometryShader = enabled.geometryShader == VK_TRUE;
@@ -1409,12 +1448,16 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (enabled.shaderSampledImageArrayDynamicIndexing) state->capabilities.push_back(spv::CapabilitySampledImageArrayDynamicIndexing);
     if (enabled.shaderStorageImageArrayDynamicIndexing) state->capabilities.push_back(spv::CapabilityStorageImageArrayDynamicIndexing);
     VkPhysicalDeviceDescriptorIndexingFeaturesEXT descriptorIndexingFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+    bool nativeHeap = false;
     if (hasExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &descriptorIndexingFeatures};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
         state->descriptorIndexing = descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing == VK_TRUE && descriptorIndexingFeatures.shaderStorageImageArrayNonUniformIndexing == VK_TRUE;
         state->storageBufferUpdateAfterBind = descriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE;
-        state->descriptorBindingPartiallyBound = compileOnly && descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
+        // The native renderer's bindless image heap (Native/NativeImages) is partially bound and
+        // written while batches using it are recorded.
+        nativeHeap = std::getenv("APS5_NATIVE_GPU") != nullptr && descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE && descriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE && descriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind == VK_TRUE && descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending == VK_TRUE;
+        state->descriptorBindingPartiallyBound = (compileOnly || nativeHeap) && descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
         state->descriptorBindingVariableDescriptorCount = compileOnly && descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount == VK_TRUE;
         state->runtimeDescriptorArray = compileOnly && descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE;
         if (state->storageBufferUpdateAfterBind) {
@@ -1423,7 +1466,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     descriptorIndexingFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
-    if (state->descriptorIndexing || state->storageBufferUpdateAfterBind || state->descriptorBindingPartiallyBound || state->descriptorBindingVariableDescriptorCount || state->runtimeDescriptorArray) deviceExtensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+    if (state->descriptorIndexing || state->storageBufferUpdateAfterBind || state->descriptorBindingPartiallyBound || state->descriptorBindingVariableDescriptorCount || state->runtimeDescriptorArray || nativeHeap) deviceExtensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
     if (state->descriptorIndexing) {
         descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
         descriptorIndexingFeatures.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
@@ -1436,6 +1479,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     descriptorIndexingFeatures.descriptorBindingPartiallyBound = state->descriptorBindingPartiallyBound ? VK_TRUE : VK_FALSE;
     descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount = state->descriptorBindingVariableDescriptorCount ? VK_TRUE : VK_FALSE;
     descriptorIndexingFeatures.runtimeDescriptorArray = state->runtimeDescriptorArray ? VK_TRUE : VK_FALSE;
+    if (nativeHeap) {
+        descriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+        descriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
+        descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    }
     if (state->runtimeDescriptorArray) {
         state->capabilities.push_back(spv::CapabilityRuntimeDescriptorArray);
         if (!state->descriptorIndexing) state->spirvExtensions.push_back("SPV_EXT_descriptor_indexing");
@@ -1515,7 +1563,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         imageRobustnessFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &imageRobustnessFeatures;
     }
-    if (state->descriptorIndexing || state->storageBufferUpdateAfterBind || state->descriptorBindingPartiallyBound || state->descriptorBindingVariableDescriptorCount || state->runtimeDescriptorArray) {
+    if (state->descriptorIndexing || state->storageBufferUpdateAfterBind || state->descriptorBindingPartiallyBound || state->descriptorBindingVariableDescriptorCount || state->runtimeDescriptorArray || nativeHeap) {
         descriptorIndexingFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &descriptorIndexingFeatures;
     }
@@ -1620,6 +1668,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = family;
+    state->queueFamily = family;
     check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->pool), "vkCreateCommandPool");
     static const bool procTable = std::getenv("APS5_NO_PROC_TABLE") == nullptr;
     if (procTable) {
@@ -2665,7 +2714,20 @@ bool VulkanDevice::AcquireImage() {
     return true;
 }
 
-bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display, const std::shared_ptr<Graphics::StorageTexture>& resident, VkFilter residentFilter, bool dumpFrame, bool residentConvert, const VkClearColorValue* uniform) {
+bool VulkanDevice::PresentNativeImage(VkImage image, std::uint32_t width, std::uint32_t height) {
+    // APS5_DUMP_FRAMES applies as for display buffers (GPU readback of the blit's source).
+    auto& dumps = Dumps();
+    bool dumpFrame = false;
+    if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+        state->nextDumpIndex = dumps.dumped++;
+        dumpFrame = true;
+    }
+    return present(width, height, true, {}, nullptr, nullptr, VK_FILTER_LINEAR, dumpFrame, false, nullptr, image);
+}
+
+bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display, const std::shared_ptr<Graphics::StorageTexture>& resident, VkFilter residentFilter, bool dumpFrame, bool residentConvert, const VkClearColorValue* uniform, VkImage nativeImage) {
+    // The blit source: a resident storage image, or an image of the native renderer (in GENERAL).
+    const VkImage sourceImage = resident != nullptr ? resident->Image() : nativeImage;
     PerformanceTimer timing("Vulkan.Present");
     APS5_LOG_OUT_DEBUG("present begin width=%u height=%u opaque=%u pixels=%zu", width, height, static_cast<unsigned>(opaque), pixels.size());
     require(state->swapchain != VK_NULL_HANDLE, "device has no swapchain");
@@ -2679,10 +2741,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     const auto index = state->acquiredIndex;
     require(index < state->images.size() && index < state->rendered.size(), "acquired image index is out of range");
     auto& rendered = state->rendered[index];
-    const bool clearOnly = pixels.empty() && display == nullptr && uniform == nullptr;
+    const bool clearOnly = pixels.empty() && display == nullptr && uniform == nullptr && nativeImage == VK_NULL_HANDLE;
     require(!residentConvert || (resident != nullptr && display != nullptr), "a converted resident presentation needs its image and display buffer");
     require(uniform == nullptr || (pixels.empty() && display == nullptr && resident == nullptr), "a uniform presentation has no other source");
-    const bool direct = resident != nullptr && !residentConvert;
+    const bool direct = sourceImage != VK_NULL_HANDLE && !residentConvert;
     // The scaler's source image, the color transfer's staging and the upload buffer are single
     // objects an in-flight blit through them may still read: the paths using or re-creating them
     // wait for every slot first. The game path did so before taking the mutex
@@ -2749,7 +2811,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         require(state->scaler != nullptr, "presentation scaler is unavailable");
         state->scaler->EnsureSourceImage(width, height);
         VkImageMemoryBarrier residentBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        if (resident != nullptr) {
+        if (sourceImage != VK_NULL_HANDLE) {
             // The draws and dispatches that produced the image were submitted before this command
             // buffer; their writes become visible to the blit here. The layout stays GENERAL, the
             // one the storage image is tracked in.
@@ -2759,7 +2821,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             residentBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             residentBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             residentBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            residentBarrier.image = resident->Image();
+            residentBarrier.image = sourceImage;
             residentBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
             pipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &residentBarrier);
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
@@ -2788,7 +2850,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         letterboxBarrier.subresourceRange = barrier.subresourceRange;
         pipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &letterboxBarrier);
         Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
-        if (direct) PresentationScaler::RecordBlitFrom(graphicsContext(), commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, barrier.image, state->extent.width, state->extent.height);
+        if (direct) PresentationScaler::RecordBlitFrom(graphicsContext(), commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, barrier.image, state->extent.width, state->extent.height);
         else state->scaler->RecordBlit(commands, barrier.image, state->extent.width, state->extent.height);
         if (dumpFrame && direct) {
             const auto scale = DumpScale();
@@ -2797,9 +2859,9 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             slot.dumpScale = 1;
             if (!slot.dumpScaler) slot.dumpScaler = std::make_unique<PresentationScaler>(graphicsContext(), VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM);
             slot.dumpScaler->EnsureSourceImage(slot.dumpWidth, slot.dumpHeight);
-            slot.dumpScaler->RecordBlitInto(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, VK_FILTER_NEAREST, width, height);
+            slot.dumpScaler->RecordBlitInto(commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, VK_FILTER_NEAREST, width, height);
         }
-        if (resident != nullptr) {
+        if (sourceImage != VK_NULL_HANDLE) {
             // Later batches write the image again (the next frame into this buffer, a refresh): they
             // start after the blit has read it.
             residentBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -3130,6 +3192,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.geometryShader = state->geometryShader;
     context.sampleRateShading = state->sampleRateShading;
     context.shaderClipDistance = state->shaderClipDistance;
+    context.shaderViewportIndexLayer = state->shaderViewportIndexLayer;
     context.nullDescriptors = state->shaderProfile != nullptr && state->shaderProfile->NullDescriptors();
     context.bufferInt64Atomics = state->bufferInt64Atomics;
     context.placeholderImages = state->placeholderImages.get();
@@ -3140,6 +3203,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sampleLocationSampleCounts = state->sampleLocationSampleCounts;
     context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
     context.singlePassStorage = state->storageImageWithoutFormat;
+    context.queueFamilyIndex = state->queueFamily;
     return context;
 }
 
@@ -3607,6 +3671,10 @@ struct RecordedDispatch {
     bool refreshed = false;
     bool resourceKeyMatched = false;
 };
+
+PFN_vkVoidFunction VulkanDevice::NativeInstanceFunction(const char* name) const {
+    return state->InstanceFunction<PFN_vkVoidFunction>(name);
+}
 
 VkDevice VulkanDevice::Device() const {
     return state->device;

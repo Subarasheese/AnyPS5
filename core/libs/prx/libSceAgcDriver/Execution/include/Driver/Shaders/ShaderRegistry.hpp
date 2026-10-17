@@ -67,6 +67,7 @@ struct PreparedShaders : PreparedShaderState {
     std::condition_variable settled;
     std::exception_ptr failure;
     bool pending = false;
+    std::vector<std::vector<std::uint64_t>> pendingAbis;
 };
 
 struct RegisteredShaderState {

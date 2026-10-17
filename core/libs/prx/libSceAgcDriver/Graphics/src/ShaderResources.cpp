@@ -599,6 +599,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         static const bool rescan = std::getenv("APS5_NO_KEYS_RESCAN") == nullptr;
         if (rescan && source == nullptr) keys.reset();
     }
+    // Packed-float guest texels need the GPU representation conversion even
+    // when their memory cannot be host-imported. The ordinary snapshot image
+    // constructor cannot interpret those bits. StorageTexture also supports
+    // staged uploads and resolves overlapping producers before refreshing, so
+    // use that path regardless of the GPU-direct import optimization above.
+    if (resource.format == 43 && source == nullptr && !depthCompare) {
+        source = cachedStorageTexture(context, {}, resource, 0, guestBytes);
+        keys = scanKeys();
+        clearThroughKeys = false;
+    }
     // Pages of the surface written since they were last collected are stamped now, before any
     // UnchangedSince (here and on a cache hit) looks at them: the checks only compare stamped blocks,
     // so a write the game made since the last walk is invisible until a collect stamps its page. The

@@ -1,0 +1,3 @@
+add_library(libGt7MissingImports SHARED EXCLUDE_FROM_ALL Export.cpp)
+target_include_directories(libGt7MissingImports PRIVATE ${LIBS_INCLUDE_DIR})
+configure_windows_unwind(libGt7MissingImports)

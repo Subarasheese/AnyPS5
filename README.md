@@ -1,3 +1,45 @@
+# GT7 native Vulkan work in progress
+
+This branch contains experimental Gran Turismo 7 (PS5) bring-up and a native Vulkan
+backend for a relinked executable. It is unfinished, is not an official PC port,
+and does not yet provide full-speed gameplay or verified PS5-equivalent graphics.
+
+## Current progress (2026-10-17)
+
+- Native Vulkan renders the startup screens and parts of the title-screen UI.
+  The 3D background remains black, and some graphics are incomplete.
+- Recent title-screen runs completed 600 seconds without a failed GPU batch,
+  at approximately 4–5 FPS. These runs do not establish race compatibility.
+- Draws and dispatches wait for first-use shader and pipeline compilation rather
+  than being discarded while compilation is pending. Persistent shader caches
+  and offline replay/preparation tools support cache warm-up.
+- The backend consumes submitted AGC command state and executes translated RDNA
+  shaders as SPIR-V on Vulkan. It includes GPU descriptor lookup, imported guest
+  buffers, native images, device-local GDS, indirect dispatch, and resource hooks.
+  Memory aliasing/coherency and synchronization remain active development areas.
+- All 232 available captured compute requests now translate offline. Selected
+  previously failing modules pass SPIR-V validation. Captures are not included.
+  The latest device-local LDS scratch and sampler-capacity changes build but
+  have not yet been checked in-game.
+- Known issues include pixel shaders reaching the loop guard, missing 3D output,
+  shader expansion/performance, and incomplete graphics validation. No PS5
+  reference captures have been used to establish visual identity.
+
+## Development entry points
+
+- `core/libs/prx/libSceAgcDriver/Native`: native execution, device, images, and hooks.
+- `core/shader/recompiler`: GPU-resolved resources, runtime shader addresses,
+  shader translation, and persistent caches.
+- `agc_shader_replay` and `agc_graphics_library_prepare`: offline shader tools.
+- `APS5_NATIVE_GPU=1` enables the experimental native backend;
+  `APS5_NATIVE_STATS=1` and `APS5_NATIVE_GPU_TIMES=1` enable diagnostics.
+
+This branch includes implementation source and compatibility stubs only. It does
+not include game executables, firmware, proprietary libraries, shaders extracted
+from the game, assets, keys, runtime captures, or generated shader caches.
+
+---
+
 # About
 
 Tool for automatic executables porting to Linux and Windows.

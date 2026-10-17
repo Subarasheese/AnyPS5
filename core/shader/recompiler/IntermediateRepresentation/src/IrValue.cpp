@@ -30,6 +30,7 @@ std::uint32_t IrValue::ImmediateU32() const {
 
 void IrValue::AddArgument(IrValue* argument) {
     arguments.push_back(argument);
+    argumentUseSlots.push_back(argument != nullptr ? argument->operandUses.size() : 0);
     if (argument == nullptr) {
         return;
     }
@@ -42,20 +43,22 @@ void IrValue::ReplaceArgument(std::size_t index, IrValue* argument) {
         throw std::out_of_range("IrValue::ReplaceArgument index is out of range");
     }
     IrValue* previous = arguments[index];
+    if (previous == argument) return;
     if (previous != nullptr) {
-        const auto useIt = std::find(previous->uses.begin(), previous->uses.end(), this);
-        if (useIt != previous->uses.end()) {
-            previous->uses.erase(useIt);
+        const auto slot = argumentUseSlots[index];
+        const auto last = previous->operandUses.size() - 1;
+        if (slot != last) {
+            const auto moved = previous->operandUses[last];
+            previous->operandUses[slot] = moved;
+            previous->uses[slot] = moved.user;
+            moved.user->argumentUseSlots[moved.operand] = slot;
         }
-        const auto operandIt = std::find_if(previous->operandUses.begin(), previous->operandUses.end(), [this, index](const IrUse& use) {
-            return use.user == this && use.operand == index;
-        });
-        if (operandIt != previous->operandUses.end()) {
-            previous->operandUses.erase(operandIt);
-        }
+        previous->operandUses.pop_back();
+        previous->uses.pop_back();
     }
     arguments[index] = argument;
     if (argument != nullptr) {
+        argumentUseSlots[index] = argument->operandUses.size();
         argument->uses.push_back(this);
         argument->operandUses.push_back(IrUse{this, index});
     }
@@ -113,6 +116,16 @@ IrBlock* IrValue::PhiBlock(std::size_t index) const {
 
 const std::vector<IrUse>& IrValue::OperandUses() const {
     return operandUses;
+}
+
+bool IrValue::HasValidArgumentUse(std::size_t index) const {
+    if (index >= arguments.size() || index >= argumentUseSlots.size()) return false;
+    const auto* producer = arguments[index];
+    if (producer == nullptr) return false;
+    const auto slot = argumentUseSlots[index];
+    return slot < producer->operandUses.size() && slot < producer->uses.size() &&
+        producer->uses[slot] == this && producer->operandUses[slot].user == this &&
+        producer->operandUses[slot].operand == index;
 }
 
 std::uint64_t IrValue::ImmediateU64() const {
@@ -211,6 +224,7 @@ void IrValue::ReplaceUsesWith(IrValue* replacement, bool preserve) {
             ReplaceArgument(index, nullptr);
         }
         arguments.clear();
+        argumentUseSlots.clear();
         opcode = IrOpcode::Identity;
         AddArgument(replacement);
         return;

@@ -51,6 +51,7 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
     mix(state.renderExtent.width);
     mix(state.renderExtent.height);
     mix(state.samples);
+    for (const auto& color : state.colors) mix(color.componentMapping);
     mix(state.customSampleLocations);
     if (state.customSampleLocations) {
         for (const auto location : state.sampleLocations) mix(location);
@@ -82,7 +83,7 @@ GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
     surface.lastLevel = color.mipCount - 1;
     surface.tileMode = ColorTextureTileMode(color.tileMode);
     surface.dimension = color.depth > 1 ? TextureDimension::k3D : TextureDimension::k2D;
-    surface.format = GuestFormatFor(color.format, color.elementBytes);
+    surface.format = color.guestFormat ? color.guestFormat : GuestFormatFor(color.format, color.elementBytes);
     surface.dstSelX = 4;
     surface.dstSelY = 5;
     surface.dstSelZ = 6;
@@ -679,6 +680,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
     if (keyed) {
         add(state.stages.path);
         add(state.rectList);
+        add(state.polygon);
         add(state.topology);
         add(state.cullMode);
         add(state.blends.size());
@@ -737,7 +739,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
     }
     std::set<std::uint32_t> outputs;
     try {
-        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.shaderClipDistance);
+        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.shaderClipDistance, context.shaderViewportIndexLayer);
     } catch (const std::exception& error) {
         if (keyed) {
             std::lock_guard lock(validationMutex());
@@ -1571,7 +1573,7 @@ struct RecordedDraw {
     std::shared_ptr<Framebuffer> framebuffer;
     std::span<const VkImageView> targetViews;
     std::vector<std::shared_ptr<StorageTexture>> targets;
-    std::vector<std::shared_ptr<StorageTexture>> proxies;
+    std::vector<std::pair<std::shared_ptr<StorageTexture>, std::uint8_t>> proxies;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
     bool listed = false;
@@ -1758,8 +1760,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (continued) {
         record.pipeline->Continue(commands, state);
     } else {
-        for (const auto& proxy : record.proxies) {
-            proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
+        for (const auto& [proxy, mapping] : record.proxies) {
+            proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL, mapping);
             countBarrier(2);
         }
         if (start.barrier) {
@@ -1807,8 +1809,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     std::function<void(VkCommandBuffer)> storeProxies;
     if (!continued && !record.proxies.empty()) {
         storeProxies = [proxies = record.proxies](VkCommandBuffer passCommands) {
-            for (const auto& proxy : proxies) {
-                proxy->RecordAttachmentProxyStore(passCommands, VK_IMAGE_LAYOUT_GENERAL);
+            for (const auto& [proxy, mapping] : proxies) {
+                proxy->RecordAttachmentProxyStore(passCommands, VK_IMAGE_LAYOUT_GENERAL, mapping);
                 Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
             }
         };
@@ -1928,6 +1930,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto& color = binding.color;
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
         if (color.samples > 1) {
+            Require(!UsesLogicalColorOrder(state, color), "reversed channel multisample target requires a multisample proxy");
             binding.multisampled = true;
             timer.phase(PhaseSetup);
             targetViews.push_back(MultisampleTargetView(context, color));
@@ -1964,10 +1967,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
-            binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
-            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.arraySlice));
+            binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED || UsesLogicalColorOrder(state, color);
+            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView(color.guestFormat == 43 ? 0xf0u : color.componentMapping, color.format) : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.arraySlice, color.viewLayers));
             continue;
         }
+        Require(color.viewLayers == 1, "layered targets require a resident array image");
+        Require(!UsesLogicalColorOrder(state, color), "reversed channel target requires a resident attachment proxy");
         materializeCmaskClear(context, color, nullptr);
         Require(!color.mipTail || binding.gpuTiling, "rendering into a packed mip tail requires the GPU tiled fallback");
         Require(color.depth == 1, "rendering into a 3D color target needs the resident image of its surface");
@@ -2132,8 +2137,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     for (std::size_t index = 0; index < targets.size(); ++index) {
         if (!targets[index].proxied) continue;
         if (!masked.has_value()) masked = state;
-        masked->colors[index].format = AttachmentProxyFormat(context, state.colors[index].format);
-        masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
+        const auto proxyFormat = AttachmentProxyFormat(context, state.colors[index].format);
+        if (proxyFormat != VK_FORMAT_UNDEFINED) {
+            masked->colors[index].format = proxyFormat;
+            masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
+        }
     }
     const State& pipelineState = masked.has_value() ? *masked : state;
     static const bool verifySetLayouts = std::getenv("APS5_VERIFY_SET_LAYOUTS") != nullptr;
@@ -2166,7 +2174,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.targetViews = targetViews;
         record.targets = owners;
         for (const auto& binding : targets) {
-            if (binding.proxied) record.proxies.push_back(binding.resident);
+            if (binding.proxied) record.proxies.emplace_back(binding.resident, binding.color.guestFormat == 43 ? 0xf0u : binding.color.componentMapping);
         }
         record.indirect = args != nullptr ? &indirect : nullptr;
         record.listed = listed;
@@ -2267,7 +2275,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     }
     for (auto& binding : targets) {
         if (binding.proxied) {
-            binding.resident->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            binding.resident->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, binding.color.guestFormat == 43 ? 0xf0u : binding.color.componentMapping);
             countBarrier(2);
             continue;
         }
@@ -2316,7 +2324,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Render pass ended");
     for (auto& binding : targets) {
         if (binding.proxied) {
-            binding.resident->RecordAttachmentProxyStore(commands, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            binding.resident->RecordAttachmentProxyStore(commands, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, binding.color.guestFormat == 43 ? 0xf0u : binding.color.componentMapping);
             countBarrier(2);
             continue;
         }

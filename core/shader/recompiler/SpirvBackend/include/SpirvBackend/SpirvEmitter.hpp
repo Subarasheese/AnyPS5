@@ -23,6 +23,8 @@ struct SpirvTargetOptions {
     bool float64DenormPreserve = false;
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
+    std::uint64_t nativeImageTable = 0;
+    std::uint64_t nativeSamplerTable = 0;
 };
 
 class SpirvEmitter {

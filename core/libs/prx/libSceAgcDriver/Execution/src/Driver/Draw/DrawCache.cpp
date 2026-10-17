@@ -41,7 +41,11 @@ std::size_t Driver::drawCacheEntries() {
     static const std::size_t entries = [] {
         const char* text = std::getenv("APS5_DRAW_CACHE_ENTRIES");
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{4096};
+        // Retain entries across rotating frame allocations. GT7 exhausted
+        // 4096 entries and evicted hundreds of thousands during startup,
+        // repeatedly rebuilding captures and decoded state. Validation is
+        // still performed at every hit; the environment override is retained.
+        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{16384};
     }();
     return entries;
 }

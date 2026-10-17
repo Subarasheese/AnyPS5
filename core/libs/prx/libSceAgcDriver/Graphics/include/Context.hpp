@@ -161,6 +161,7 @@ struct Context {
     bool geometryShader = false;
     bool sampleRateShading = false;
     bool shaderClipDistance = false;
+    bool shaderViewportIndexLayer = false;
     bool nullDescriptors = false;
     bool bufferInt64Atomics = false;
     const PlaceholderImages* placeholderImages = nullptr;
@@ -219,6 +220,7 @@ struct Context {
         }
         return type;
     }
+    std::uint32_t queueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 };
 
 inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {

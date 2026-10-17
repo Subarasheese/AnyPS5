@@ -1,3 +1,4 @@
+#include <array>
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
@@ -79,7 +80,7 @@ DescriptorRole RoleFor(DescriptorBindingKind kind) {
 DescriptorImageShape ImageShapeForResource(const ImageResource& image) {
     const RdnaImageDimensionInfo& info = RdnaImageDimensionInfoFor(image.dimension);
     if (info.multisampled != 0u) {
-        fail("DescriptorBindingBuilder::Populate multisampled image resources have no descriptor image shape");
+        return info.arrayed != 0u ? DescriptorImageShape::Image2DMultisampleArray : DescriptorImageShape::Image2DMultisample;
     }
     if (info.spirvDimension == spv::Dim1D) {
         return info.arrayed != 0u ? DescriptorImageShape::Image1DArray : DescriptorImageShape::Image1D;
@@ -142,6 +143,19 @@ std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32
 
 constexpr std::uint32_t ForceUnnormalizedBit = 1u << 15u;
 
+// Whether an implicit-LOD sample through this S# reads the base level and nothing else: the LOD the hardware
+// computes only chooses the mip level and the magnify/minify filter. With no mip filter (or a 0..0 LOD range),
+// no bias, no minimum LOD and one filter for both directions, that choice is fixed, so the sample equals an
+// explicit LOD 0 one. The host sampler of an unnormalized descriptor is forced to level 0 (GuestSamplerResource.cpp).
+bool ImplicitLodAtBaseLevel(const std::array<std::uint32_t, 4>& words) {
+    const std::uint32_t minLod = words[1] & 0xfffu, maxLod = (words[1] >> 12u) & 0xfffu;
+    const std::uint32_t bias = words[2] & 0x3fffu, magFilter = (words[2] >> 20u) & 3u, minFilter = (words[2] >> 22u) & 3u;
+    const std::uint32_t mipFilter = (words[2] >> 26u) & 3u;
+    const bool baseLevelOnly = mipFilter == 0u || (minLod == 0u && maxLod == 0u);
+    const bool anisotropic = magFilter >= 2u || minFilter >= 2u;
+    return baseLevelOnly && minLod == 0u && bias == 0u && magFilter == minFilter && !anisotropic;
+}
+
 [[noreturn]] void failUnnormalized(const char* reason) {
     fail(std::string("DescriptorBindingBuilder::Populate unnormalized guest sampler ") + reason + ", which is not implemented");
 }
@@ -174,7 +188,12 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
             }
             continue;
         }
-        const std::uint32_t unsupported = sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset | SamplerUseNonZeroLod);
+        std::uint32_t allowed = SamplerUseExplicitLod | SamplerUseOffset | SamplerUseNonZeroLod;
+        std::array<std::uint32_t, 4> samplerWords{};
+        std::copy_n(snapshot.samplers[r].dwords.begin(), 4, samplerWords.begin());
+        const bool implicitAtBase = ImplicitLodAtBaseLevel(samplerWords);
+        if (implicitAtBase) allowed |= SamplerUseImplicitLod;
+        const std::uint32_t unsupported = sampler.uses & ~allowed;
         if (unsupported != 0u) {
             failUnnormalized(UnnormalizedUseReason(unsupported));
         }
@@ -191,6 +210,17 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
                 failUnnormalized(reason);
             }
             if (image.constantSwizzle) continue;
+            if (image.dimension == RdnaImageDimension::Dim3D) {
+                const auto xyFilter = (samplerWords[2] >> 22u) & 3u;
+                const auto zFilter = (samplerWords[2] >> 24u) & 3u;
+                // gfx10 SQ_TEX_Z_FILTER: POINT=1, LINEAR=2. Vulkan's filter
+                // applies to all three spatial axes, so require the same filter.
+                if (zFilter != xyFilter + 1u) {
+                    char detail[160];
+                    std::snprintf(detail, sizeof(detail), "3D unnormalized sampler uses unmatched XY/Z filters (S# %08x %08x %08x %08x)", samplerWords[0], samplerWords[1], samplerWords[2], samplerWords[3]);
+                    failUnnormalized(detail);
+                }
+            }
             proof.images[pair.image] = true;
         }
         proof.samplers[r] = true;
@@ -201,7 +231,11 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
             if (!exact) break;
             if (pair.image != resource) continue;
             const auto& words = snapshot.samplers.at(pair.sampler).dwords;
-            exact = proof.samplers[pair.sampler] && info.samplers.at(pair.sampler).uses == SamplerUseExplicitLod && (words[1] & 0xfffu) == 0u && (words[2] & 0x3fffu) == 0u;
+            const auto uses = info.samplers.at(pair.sampler).uses;
+            std::array<std::uint32_t, 4> samplerWords{};
+            std::copy_n(words.begin(), 4, samplerWords.begin());
+            const bool atBase = uses == SamplerUseExplicitLod || (uses == SamplerUseImplicitLod && ImplicitLodAtBaseLevel(samplerWords));
+            exact = proof.samplers[pair.sampler] && atBase && (words[1] & 0xfffu) == 0u && (words[2] & 0x3fffu) == 0u;
         }
         proof.imagesAtBaseLevel[resource] = exact;
     }
@@ -252,12 +286,13 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
     allocation.specialization = std::move(plan.specialization);
 }
 
-DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet) const {
+DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet, bool nativeHeap) const {
     if (stage == IrShaderStage::Pixel && exportMappings.size() != 8u) fail("fragment runtime export mappings are missing");
     if (info.images.size() > ShaderInfo::MaxImages) fail("runtime image count exceeds the static capacity");
     DescriptorBindingPlan plan;
     const auto unnormalized = ProveUnnormalized(info, snapshot);
     for (std::uint32_t index = 0; index < info.samplers.size(); ++index) {
+        plan.specialization.push_back({PipelineSpecialization::UnnormalizedBaseLod + index, unnormalized.samplers[index] ? 1u : 0u});
         if (FoldsTexelOffsets(info.samplers[index])) plan.specialization.push_back({PipelineSpecialization::FoldOffsetBase + index, unnormalized.samplers[index] ? 1u : 0u});
     }
     std::vector<std::uint32_t> compareStates(info.images.size());
@@ -381,8 +416,11 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if ((imageHeap || samplerHeap) && compact.resources.empty()) continue;
         PreparedDescriptorBinding entry{};
         auto& physical = entry.descriptor;
-        physical.descriptorSet = fragmentDescriptorSet && stage == IrShaderStage::Pixel ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet;
-        physical.binding = NativeBinding(stage, compact.kind);
+        // GPU-resolved programs (SpirvTarget::gpuResolvedResources) find images and samplers in the
+        // native renderer's global heap, one set for every stage at the compute numbering.
+        const bool heapBinding = nativeHeap && (imageHeap || samplerHeap);
+        physical.descriptorSet = heapBinding ? RuntimeAbi::NativeHeap::Set : fragmentDescriptorSet && stage == IrShaderStage::Pixel ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet;
+        physical.binding = NativeBinding(heapBinding ? IrShaderStage::Compute : stage, compact.kind);
         physical.count = compact.resources.empty() ? 1u : static_cast<std::uint32_t>(compact.resources.size());
         physical.kind = PhysicalKindFor(compact.kind);
         physical.role = RoleFor(compact.kind);
@@ -460,6 +498,10 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         plan.runtimeState.assign(layout.runtimeStateDwords, 0u);
         for (std::uint32_t target = 0; target < exportMappings.size(); ++target) plan.runtimeState.at(RuntimeAbi::StateExportMappings + target / 4u) |= static_cast<std::uint32_t>(exportMappings[target]) << (target % 4u * 8u);
     }
+    // Native shaders resolve each S# independently in the global heap. The
+    // legacy 32-bit CPU image/sampler association mask is neither used nor
+    // large enough for the native heap's paired sampler descriptors.
+    if (nativeHeap) return plan;
     std::vector<std::uint32_t> samplerMasks(info.samplers.size());
     for (const auto& binding : plan.bindings) {
         if (binding.descriptor.role != DescriptorRole::GuestSamplers) continue;

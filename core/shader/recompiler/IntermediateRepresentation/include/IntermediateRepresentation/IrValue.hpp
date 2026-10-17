@@ -71,6 +71,7 @@ public:
     [[nodiscard]] IrValue* Argument(std::size_t index) const;
     [[nodiscard]] IrBlock* PhiBlock(std::size_t index) const;
     [[nodiscard]] const std::vector<IrUse>& OperandUses() const;
+    [[nodiscard]] bool HasValidArgumentUse(std::size_t index) const;
     [[nodiscard]] std::uint64_t ImmediateU64() const;
     [[nodiscard]] std::uint16_t ImmediateF16Bits() const;
     [[nodiscard]] float ImmediateF32() const;
@@ -102,6 +103,8 @@ private:
     std::vector<IrUse> operandUses;
     bool hasImmediate;
     std::vector<IrValue*> arguments;
+    // Each operand records its slot in its producer's parallel use lists.
+    std::vector<std::size_t> argumentUseSlots;
     std::vector<IrValue*> uses;
     IrBlock* parent;
 };

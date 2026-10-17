@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
@@ -237,8 +238,13 @@ void Driver::execute(const Submission& submission) {
                 gateOpened() = false;
                 timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
             }
+            const auto dispatchStart = Native::ProfilesDispatches() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
             else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            if (Native::ProfilesDispatches()) {
+                const auto program = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
+                Native::ProfileDispatch(program, submission.queue, opcode == 0x16, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dispatchStart).count());
+            }
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);
         } else if (opcode == 0x3c || opcode == 0x93) {
@@ -258,6 +264,10 @@ void Driver::execute(const Submission& submission) {
                     next += nextCount;
                 }
             }
+        } else if (drawPacket && Native::SkipsDraws()) {
+            // Native backend: graphics is rendered by the native renderer, not replayed here.
+            Native::CountSkippedDraw();
+            finishDrawPacket(false);
         } else if (drawPacket) {
             landPendingWaits(submission.queue);
             bool drawn = false;

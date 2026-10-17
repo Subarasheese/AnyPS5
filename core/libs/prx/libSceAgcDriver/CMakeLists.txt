@@ -57,6 +57,13 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcChannelOrderHeader ${agcTextureDetileGeneratedDir}/ChannelOrder_spv.h)
+add_custom_command(OUTPUT "${agcChannelOrderHeader}"
+ COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+ COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcTextureDetileGeneratedDir}/ChannelOrder.spv" "${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/ChannelOrder.comp"
+ COMMAND ${CMAKE_COMMAND} -DINPUT=${agcTextureDetileGeneratedDir}/ChannelOrder.spv -DOUTPUT=${agcChannelOrderHeader} -DSYMBOL=CHANNEL_ORDER_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+ DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/ChannelOrder.comp" glslang-standalone VERBATIM)
+
 set(agcMeshArgumentsShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MeshArguments.comp)
 set(agcMeshArgumentsShaderSpv ${agcTextureDetileGeneratedDir}/MeshArguments.spv)
 set(agcMeshArgumentsShaderHeader ${agcTextureDetileGeneratedDir}/MeshArguments_spv.h)
@@ -137,6 +144,12 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/EntryPoints.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/NativeBackend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/NativeExecution.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/GameHooks.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/ResourceAudit.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/NativeDevice.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/NativeImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferFill.cpp
@@ -201,6 +214,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureTiling.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ChannelOrder.cpp
+        ${agcChannelOrderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
@@ -1443,6 +1458,20 @@ set_target_properties(agc_shader_replay PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_replay)
 
 add_executable(agc_compute_pipeline_replay EXCLUDE_FROM_ALL tools/ComputePipelineReplay.cpp)
+add_executable(agc_graphics_library_prepare EXCLUDE_FROM_ALL tools/GraphicsLibraryPrepare.cpp)
+target_include_directories(agc_graphics_library_prepare PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/IntermediateRepresentation/include
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/RdnaDecoder/include
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/ControlFlow/include
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/Optimization/include
+        ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
+        ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR}
+)
+target_link_libraries(agc_graphics_library_prepare PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_graphics_library_prepare PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_graphics_library_prepare)
 target_include_directories(agc_compute_pipeline_replay PRIVATE
         ${LIBS_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler

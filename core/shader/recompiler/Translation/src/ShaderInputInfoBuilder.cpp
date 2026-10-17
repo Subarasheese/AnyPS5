@@ -162,6 +162,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         vertexStorage = ShaderVertexInputInfo{};
         vertexStorage.logicalStage = _toIrShaderStage(stage);
         vertexStorage.hostSubgroupSize = hostSubgroupSize;
+        vertexStorage.paClVsOutCntl = vertex.paClVsOutCntl;
         vertexStorage.fetchEmbedded = vertex.fetchEmbedded;
         vertexStorage.fetchExternal = false;
         vertexStorage.fetchAttribReg = static_cast<int>(vertex.fetchAttribReg);
@@ -179,7 +180,10 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         if (stage == ShaderStageKind::Local || stage == ShaderStageKind::TessellationControl || stage == ShaderStageKind::TessellationEvaluation) {
             if (tessellation == nullptr) throw std::runtime_error("ShaderInputInfoBuilder: tessellation configuration is missing");
             if (tessellation->inputControlPoints == 0u || tessellation->inputControlPoints > 32u || tessellation->outputControlPoints == 0u || tessellation->outputControlPoints > 32u) throw std::runtime_error("ShaderInputInfoBuilder: invalid tessellation control-point counts");
-            if (tessellation->domain != 1u || tessellation->partitioning != 2u || tessellation->outputTopology != 2u) throw std::runtime_error("ShaderInputInfoBuilder: unsupported tessellation configuration");
+            if ((tessellation->domain != 1u && tessellation->domain != 2u) ||
+                (tessellation->partitioning != 0u && tessellation->partitioning != 2u && tessellation->partitioning != 3u) ||
+                (tessellation->outputTopology != 2u && tessellation->outputTopology != 3u))
+                throw std::runtime_error("ShaderInputInfoBuilder: unsupported tessellation configuration");
             auto& target = vertexStorage.tess;
             target.inputControlPoints = tessellation->inputControlPoints;
             target.outputControlPoints = tessellation->outputControlPoints;

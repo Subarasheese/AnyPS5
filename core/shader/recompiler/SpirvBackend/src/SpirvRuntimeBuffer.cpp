@@ -1,3 +1,4 @@
+#include <span>
 #include "SpirvBackend/SpirvRuntimeBuffer.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
@@ -253,10 +254,28 @@ std::array<std::uint32_t, 4> storeValues(SpirvEmitterState& state, std::uint32_t
     return result;
 }
 
-std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, const SpirvBufferFormatInfo& info, std::uint32_t components, bool store, std::uint32_t data) {
+// `variants` (with `runtimeFormat`, the descriptor's format field): formats sharing `info`'s memory
+// layout whose numeric kind is chosen at run time; the layout's addressing and memory access are
+// emitted once and only the per-component conversion is selected by format.
+std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, const SpirvBufferFormatInfo& info, std::uint32_t components, bool store, std::uint32_t data, std::span<const SpirvBufferFormatInfo> variants = {}, std::uint32_t runtimeFormat = 0u) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     const auto u32 = TypeU32(state);
+    // The value `convert(variant)` of the descriptor's format (or of `info` without variants).
+    const auto byFormat = [&](auto&& convert) {
+        if (variants.empty()) return convert(info);
+        auto value = convert(variants[0]);
+        for (std::size_t index = 1; index < variants.size(); ++index) value = Select(state, u32, equal(state, runtimeFormat, ConstantU32(state, static_cast<std::uint32_t>(variants[index].format))), convert(variants[index]), value);
+        return value;
+    };
+    const auto formatIs = [&](auto&& predicate) {
+        if (variants.empty()) return ConstantBool(state, predicate(info));
+        auto result = ConstantBool(state, false);
+        for (const auto& variant : variants) {
+            if (predicate(variant)) result = Binary(state, spv::OpLogicalOr, TypeBool(state), result, equal(state, runtimeFormat, ConstantU32(state, static_cast<std::uint32_t>(variant.format))));
+        }
+        return result;
+    };
     std::array<std::uint32_t, 4> values{};
     std::array<std::uint32_t, 4> selectors{};
     std::array<std::uint32_t, 4> selected{};
@@ -283,7 +302,7 @@ std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instructi
         EmitIfCondition(state, inBounds, [&] {
             auto packed = ConstantU32(state, 0u);
             for (std::uint32_t component = 0; component < info.componentCount; ++component) {
-                const auto encoded = component >= components ? ConstantU32(state, 0u) : memory.d16 ? EmitD16StoreComponent(state, info, component, values[component]) : EmitFormatStoreComponent(state, info, component, values[component]);
+                const auto encoded = component >= components ? ConstantU32(state, 0u) : byFormat([&](const SpirvBufferFormatInfo& variant) { return memory.d16 ? EmitD16StoreComponent(state, variant, component, values[component]) : EmitFormatStoreComponent(state, variant, component, values[component]); });
                 if (info.packedBitfield) {
                     packed = EmitOrU32(state, packed, Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, encoded, (1u << info.componentBits[component]) - 1u), ConstantU32(state, info.componentBitOffset[component])));
                 } else {
@@ -299,18 +318,25 @@ std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instructi
             const auto bits = info.componentBits[component];
             auto raw = readBuffer(context, instruction, addresses[component].guest, info.packedBitfield ? 32u : bits);
             if (bits != 32u) {
-                const auto signedType = IsSignedFormatComponent(info.type);
-                const auto type = signedType ? TypeI32(state) : u32;
-                const auto input = signedType ? Unary(state, spv::OpBitcast, type, raw) : raw;
-                raw = state.module.AllocateId();
-                state.module.AddFunction(signedType ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract, type, raw, input, ConstantU32(state, info.packedBitfield ? info.componentBitOffset[component] : 0u), ConstantU32(state, bits));
-                if (signedType) raw = Unary(state, spv::OpBitcast, u32, raw);
+                const auto offset = ConstantU32(state, info.packedBitfield ? info.componentBitOffset[component] : 0u);
+                const auto extract = [&](bool signedType) {
+                    const auto type = signedType ? TypeI32(state) : u32;
+                    const auto input = signedType ? Unary(state, spv::OpBitcast, type, raw) : raw;
+                    auto value = state.module.AllocateId();
+                    state.module.AddFunction(signedType ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract, type, value, input, offset, ConstantU32(state, bits));
+                    return signedType ? Unary(state, spv::OpBitcast, u32, value) : value;
+                };
+                const auto isSigned = formatIs([](const SpirvBufferFormatInfo& variant) { return IsSignedFormatComponent(variant.type); });
+                raw = Select(state, u32, isSigned, extract(true), extract(false));
             }
-            return memory.d16 ? EmitD16FormatComponent(state, info, component, raw) : NormalizeFormatComponent(state, info, component, raw);
+            const auto source = raw;
+            return byFormat([&](const SpirvBufferFormatInfo& variant) { return memory.d16 ? EmitD16FormatComponent(state, variant, component, source) : NormalizeFormatComponent(state, variant, component, source); });
         });
     }
-    const bool integer = info.type == SpirvFormatComponentType::Uint || info.type == SpirvFormatComponentType::Sint;
-    const auto one = ConstantU32(state, integer ? 1u : memory.d16 ? 0x3c00u : 0x3f800000u);
+    const auto one = byFormat([&](const SpirvBufferFormatInfo& variant) {
+        const bool integer = variant.type == SpirvFormatComponentType::Uint || variant.type == SpirvFormatComponentType::Sint;
+        return ConstantU32(state, integer ? 1u : memory.d16 ? 0x3c00u : 0x3f800000u);
+    });
     std::array<std::uint32_t, 4> outputs{};
     for (std::uint32_t output = 0; output < components; ++output) {
         auto value = values[0];
@@ -358,20 +384,34 @@ std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instru
     const auto merge = state.module.AllocateId();
     const auto invalid = state.module.AllocateId();
     constexpr std::uint32_t count = static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float);
-    std::array<std::uint32_t, count> labels{};
+    // Formats with one memory layout share a case: their addressing and memory accesses are
+    // emitted once, the numeric conversion selected by the format inside (see formatted).
+    std::vector<std::vector<SpirvBufferFormatInfo>> layouts;
+    const auto sameLayout = [](const SpirvBufferFormatInfo& a, const SpirvBufferFormatInfo& b) {
+        return a.componentCount == b.componentCount && a.byteSize == b.byteSize && a.packedBitfield == b.packedBitfield && std::equal(std::begin(a.componentBits), std::end(a.componentBits), std::begin(b.componentBits)) && std::equal(std::begin(a.componentBitOffset), std::end(a.componentBitOffset), std::begin(b.componentBitOffset));
+    };
+    for (std::uint32_t index = 1; index <= count; ++index) {
+        const auto info = GetFormatInfo(static_cast<IrBufferFormat>(index));
+        if (info.type == SpirvFormatComponentType::Unknown) continue;
+        auto found = std::find_if(layouts.begin(), layouts.end(), [&](const auto& layout) { return sameLayout(layout.front(), info); });
+        if (found == layouts.end()) layouts.push_back({info});
+        else found->push_back(info);
+    }
+    std::vector<std::uint32_t> labels(layouts.size());
     std::vector<std::uint32_t> branch{spv::OpSwitch, format, invalid};
-    for (std::uint32_t index = 0; index < count; ++index) {
-        labels[index] = state.module.AllocateId();
-        branch.insert(branch.end(), {index + 1u, labels[index]});
+    for (std::size_t layout = 0; layout < layouts.size(); ++layout) {
+        labels[layout] = state.module.AllocateId();
+        for (const auto& variant : layouts[layout]) branch.insert(branch.end(), {static_cast<std::uint32_t>(variant.format), labels[layout]});
     }
     const auto type = store || components == 1u ? TypeU32(state) : TypeU32Composite(state, components);
     const auto result = state.module.AllocateId();
     std::vector<std::uint32_t> phi{spv::OpPhi, type, result};
     state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
     state.module.AddFunction(branch);
-    for (std::uint32_t index = 0; index < count; ++index) {
-        EmitLabel(state, labels[index]);
-        const auto value = formatted(context, instruction, resource, GetFormatInfo(static_cast<IrBufferFormat>(index + 1u)), components, store, data);
+    for (std::size_t layout = 0; layout < layouts.size(); ++layout) {
+        EmitLabel(state, labels[layout]);
+        const auto& variants = layouts[layout];
+        const auto value = variants.size() == 1u ? formatted(context, instruction, resource, variants.front(), components, store, data) : formatted(context, instruction, resource, variants.front(), components, store, data, variants, format);
         const auto exit = state.module.AllocateId();
         state.module.AddFunction(spv::OpBranch, exit);
         EmitLabel(state, exit);
@@ -630,7 +670,7 @@ std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrVa
                     const auto pointer = state.module.AllocateId();
                     state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, scalar), pointer, physical);
                     const auto result = operation(pointer);
-                    state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.bdaNoteWriteFunction, access.guest);
+                    if (!state.program.Metadata().gpuResolvedResources) state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.bdaNoteWriteFunction, access.guest);
                     return result;
                 });
             });

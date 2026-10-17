@@ -16,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include "prx/libSceVideoOut/include/BufferReuseTracker.hpp"
@@ -227,7 +228,7 @@ private:
     void vblankLoop(std::stop_token token);
     void vblankEnd(std::uint64_t tick);
     void updateDisplayRefreshRate();
-    void processFlip(FlipRequest& req);
+    void processFlip(FlipRequest& req, const AgcDriver::PresentationWindow& target);
     void triggerEvents(VideoOutConfig& cfg, int eventKind, void* triggerData);
 
     std::mutex mutex;

@@ -251,6 +251,8 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.narrowSubgroupClock = target.narrowSubgroupClock;
     state.float64DenormPreserve = target.float64DenormPreserve;
     state.registrationModules = target.registrationModules;
+    state.nativeImageTable = target.nativeImageTable;
+    state.nativeSamplerTable = target.nativeSamplerTable;
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
     state.hostSubgroupSize = target.subgroupSize;
     if (HostSubgroupSingleLane(state)) {
@@ -273,8 +275,14 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     }
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
+    // The native renderer never lets a program spin the GPU into a timeout (a loop bound read from
+    // data a skipped or still-building producer has not written yet): loops end after 2^14 trips.
+    else if (program.Metadata().gpuResolvedResources) state.loopGuardLimit = 1u << 14u;
     // Stopped invocations would leave the wave LDS barriers incomplete.
-    state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
+    // GPU-resolved programs (the native renderer) never stop an invocation on a faulting read (it
+    // reads zero): a stopped invocation would leave the wave-uniform conditions, ballots over the
+    // whole subgroup, waiting for it forever.
+    state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh && !program.Metadata().gpuResolvedResources;
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);

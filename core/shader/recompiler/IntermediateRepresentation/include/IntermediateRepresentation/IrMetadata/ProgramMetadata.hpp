@@ -20,6 +20,9 @@ struct IrProgramMetadata {
     std::uint32_t pixelLinearInputs = 0;
     std::uint32_t pixelPerspectiveInputs = 0;
     bool barycentricEmulation = false;
+    // SpirvTarget::gpuResolvedResources: no SRT read is folded into the CPU-flattened table and
+    // every buffer takes its V# at run time (the shader resolves its resources on the GPU).
+    bool gpuResolvedResources = false;
     bool invalidatesCaches = false;
     std::vector<IrValue*> dynamicReads;
     bool shaderInfoComplete = false;

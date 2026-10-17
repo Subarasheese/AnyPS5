@@ -3,6 +3,9 @@
 #include <array>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstdio>
+#include <chrono>
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <thread>
@@ -40,6 +43,7 @@ struct DeviceLibraries {
     PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
     PFN_vkDestroyShaderModule destroyModule = nullptr;
     std::vector<VkShaderModule> modules;
+    std::map<std::uint64_t, VkShaderModule> shaderModules;
     std::map<Key, VkPipelineLayout> layouts;
     std::array<std::map<Key, VkPipeline>, 4> parts;
     PipelineLibraryCounters counters;
@@ -102,11 +106,44 @@ std::span<const VkDynamicState> PipelineLibraryDynamicStates() {
     return dynamicStates;
 }
 
+VkShaderModule CachedGraphicsShaderModule(const Context& context, std::uint64_t variant,
+                                         std::span<const std::uint32_t> spirv) {
+    Require(variant != 0, "cached shader module needs a stable variant identity");
+    auto& store = Libraries();
+    std::unique_lock lock(store.mutex);
+    auto& device = store.devices[context.device];
+    if (const auto found = device.shaderModules.find(variant); found != device.shaderModules.end())
+        return found->second;
+    const auto destroy = context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+    device.destroyModule = destroy;
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = spirv.size_bytes();
+    info.pCode = spirv.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    // Driver compilation and validation can be expensive. Other preparation
+    // workers can use the library store while this module is being created.
+    lock.unlock();
+    Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(
+        context.device, &info, nullptr, &module), "vkCreateShaderModule cached graphics");
+    lock.lock();
+    try {
+        const auto [entry, inserted] = device.shaderModules.emplace(variant, module);
+        if (!inserted) destroy(context.device, module, nullptr);
+        return entry->second;
+    } catch (...) {
+        destroy(context.device, module, nullptr);
+        throw;
+    }
+}
+
 VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::shared_ptr<OptimizedPipeline>* optimized, bool partsOnly, std::span<VkShaderModule> modules) {
     Require(info.renderPass == VK_NULL_HANDLE && info.pDynamicState != nullptr, "pipeline library parts need dynamic rendering and the library dynamic states");
     const bool split = (layout.flags & VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT) != 0;
     Require(!split || (layout.setLayoutCount == 2u && layout.pSetLayouts != nullptr && ((keys.preRasterizationSets | keys.fragmentSets) & ~3u) == 0u), "split pipeline library layout requires two descriptor set slots and a valid mask");
     auto& store = Libraries();
+    static std::atomic<unsigned long long> nextTrace{0};
+    const bool trace = std::getenv("APS5_TRACE_PIPELINE_CREATE") != nullptr;
+    const auto traceId = trace ? nextTrace.fetch_add(1) : 0;
     std::unique_lock lock(store.mutex);
     auto& device = store.devices[context.device];
     if (device.destroyPipeline == nullptr) {
@@ -196,9 +233,21 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             break;
         }
         VkPipeline handle = VK_NULL_HANDLE;
-        if (partsOnly) lock.unlock();
+        const auto started = std::chrono::steady_clock::now();
+        if (trace) {
+            std::fprintf(stderr, "[pipeline-create] id=%llu part=%zu begin prebuild=%u", traceId, part, partsOnly);
+            for (std::uint32_t stage = 0; stage < create.stageCount; ++stage)
+                std::fprintf(stderr, " module=%p", reinterpret_cast<void*>(create.pStages[stage].module));
+            std::fprintf(stderr, "\n");
+        }
+        // Draw-time builds can take seconds too. Keep the cache protected
+        // during lookup and insertion, but let preparation workers proceed
+        // while the Vulkan driver compiles. The lookup below handles races.
+        lock.unlock();
         const auto created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
-        if (partsOnly) lock.lock();
+        lock.lock();
+        if (trace) std::fprintf(stderr, "[pipeline-create] id=%llu part=%zu end ms=%.1f result=%d\n", traceId, part,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), created);
         Check(created, "vkCreateGraphicsPipelines library");
         if (const auto raced = cache.find(key); raced != cache.end()) {
             device.destroyPipeline(context.device, handle, nullptr);
@@ -226,7 +275,11 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &linked};
     create.layout = info.layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    const auto linkStarted = std::chrono::steady_clock::now();
+    if (trace) std::fprintf(stderr, "[pipeline-create] id=%llu link begin\n", traceId);
     Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline), "vkCreateGraphicsPipelines link");
+    if (trace) std::fprintf(stderr, "[pipeline-create] id=%llu link end ms=%.1f\n", traceId,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - linkStarted).count());
     ++device.counters.linked;
     if (optimize && optimized != nullptr) {
         auto slot = std::make_shared<OptimizedPipeline>();
@@ -280,6 +333,7 @@ void ClearPipelineLibraries(VkDevice device) {
     }
     for (const auto& [key, handle] : libraries.layouts) libraries.destroyLayout(device, handle, nullptr);
     for (const auto module : libraries.modules) libraries.destroyModule(device, module, nullptr);
+    for (const auto& [variant, module] : libraries.shaderModules) libraries.destroyModule(device, module, nullptr);
     store.devices.erase(found);
 }
 

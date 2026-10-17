@@ -92,8 +92,6 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     if (forceUnormCoords) {
         Require(xyMagFilter == xyMinFilter, "guest sampler descriptor uses unnormalized coordinates with different minification and magnification filters, which is not implemented");
         Require(!isAnisoFilter(xyMagFilter), "guest sampler descriptor uses unnormalized coordinates with anisotropic filtering, which is not implemented");
-        Require(clampX == 2u || clampX == 6u, "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampX) + " on X; only clamp-to-last-texel and clamp-to-border are implemented");
-        Require(clampY == 2u || clampY == 6u, "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampY) + " on Y; only clamp-to-last-texel and clamp-to-border are implemented");
         Require(!truncCoord, "guest sampler descriptor uses unnormalized coordinates with TRUNC_COORD, which is not implemented");
         Require(!mcCoordTrunc, "guest sampler descriptor uses unnormalized coordinates with MC_COORD_TRUNC, which is not implemented");
     } else {
@@ -163,7 +161,9 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     result.forceDegamma = forceSrgb;
     result.nonSeamlessCube = disableCubeWrap;
     if (forceUnormCoords) {
-        result.unnormalizedCoordinates = true;
+        // Pixel coordinates are normalized in the specialized shader. This also
+        // supports repeat/mirror addressing, unavailable on Vulkan unnormalized samplers.
+        result.unnormalizedCoordinates = false;
         result.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         result.minLod = 0.0f;
         result.maxLod = 0.0f;

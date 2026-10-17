@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <stdexcept>
+#include <cstdlib>
 
 namespace ShaderRecompiler {
 
@@ -46,7 +47,23 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
     state.module.AddFunction(spv::OpFunctionParameter, u32, bytes);
     state.module.AddFunction(spv::OpFunctionParameter, u32, instruction);
     EmitLabel(state, state.module.AllocateId());
-    const auto pointer = BdaWord(state, state.faultBufferVariable, ConstantU32(state, 0u));
+    auto recordWord = ConstantU32(state, 0u);
+    if (state.program.Metadata().gpuResolvedResources) {
+        auto diagnostic = Binary(state, spv::OpIEqual, TypeBool(state), reason, ConstantU32(state, static_cast<std::uint32_t>(BdaAbi::FaultReason::DirectLoadMismatch)));
+        // A selected shader's loop-limit report must also survive an earlier
+        // ordinary access fault. A mismatch executes before its return-time
+        // loop report and keeps first claim on this diagnostic slot.
+        static const std::uint64_t checkedProgram = [] {
+            const auto* value = std::getenv("APS5_NATIVE_CHECK_DIRECT_PROGRAM");
+            return value != nullptr ? std::strtoull(value, nullptr, 0) : 0ull;
+        }();
+        if (checkedProgram != 0u && checkedProgram == state.program.Resources().shaderHash) {
+            const auto loopLimit = Binary(state, spv::OpIEqual, TypeBool(state), reason, ConstantU32(state, static_cast<std::uint32_t>(BdaAbi::FaultReason::LoopLimit)));
+            diagnostic = Binary(state, spv::OpLogicalOr, TypeBool(state), diagnostic, loopLimit);
+        }
+        recordWord = Select(state, TypeU32(state), diagnostic, ConstantU32(state, BdaAbi::NativeDiagnosticWord), recordWord);
+    }
+    const auto pointer = BdaWord(state, state.faultBufferVariable, recordWord);
     const auto previous = state.module.AllocateId();
     const auto scope = ConstantU32(state, spv::ScopeDevice);
     const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
@@ -54,7 +71,7 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
     const auto won = Binary(state, spv::OpIEqual, TypeBool(state), previous, ConstantU32(state, 0u));
     EmitIfCondition(state, won, [&] {
         const auto store = [&](std::uint32_t index, std::uint32_t value) {
-            state.module.AddFunction(spv::OpStore, BdaWord(state, state.faultBufferVariable, ConstantU32(state, index)), value);
+            state.module.AddFunction(spv::OpStore, BdaWord(state, state.faultBufferVariable, Binary(state, spv::OpIAdd, TypeU32(state), recordWord, ConstantU32(state, index))), value);
         };
         store(1, reason);
         store(2, words ? address : Unary(state, spv::OpUConvert, TypeU32(state), address));

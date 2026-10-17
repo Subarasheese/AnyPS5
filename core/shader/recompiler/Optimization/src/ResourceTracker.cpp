@@ -194,7 +194,11 @@ private:
         for (std::uint32_t i = 0; i < width; i++) {
             descriptor.dwords[i] = handle.Argument(i)->Resolve();
         }
-        if (sampleAdjust) {
+        // With derivative adjustment disabled, dword 3 bits 12..29 are
+        // reserved in the gfx10 sampler SRD. Do not require their shader-local
+        // ballot expressions to be evaluated on the host. Border fields survive.
+        const bool adjustmentDisabled = sampler && (possibleU32Bits(descriptor.dwords[2]) & 0x80000000u) == 0u;
+        if (sampleAdjust || adjustmentDisabled) {
             descriptor.dwords[3] = canonicalizeSampleAdjustDword3(descriptor.dwords[3]);
         }
         const IrValue* dword0 = descriptor.dwords[0]->Resolve();
@@ -206,6 +210,9 @@ private:
     IrValue* canonicalizeSampleAdjustDword3(IrValue* value) {
         for (;;) {
             value = value->Resolve();
+            if ((possibleU32Bits(value) & ~samplerDword3ReservedMask) == 0u) {
+                return &m_builder.Constant(0u);
+            }
             if (value->Opcode() != IrOpcode::BitwiseOr32) {
                 return value;
             }
@@ -1156,6 +1163,12 @@ private:
         DescriptorSource descriptor;
         MakeSource(*handle, width, sampler, sampleAdjust, descriptor);
         std::uint32_t badDword = 0;
+        // GPU-resolved programs read their T#/S# at run time: the words need not be values the CPU
+        // could evaluate from a capture.
+        if (m_program.Metadata().gpuResolvedResources) {
+            source = InternSource(descriptor);
+            return;
+        }
         if (expected == IrOpcode::GetImageResource) {
             for (; badDword < descriptor.dwordCount; badDword++) {
                 const IrValue* value2 = descriptor.dwords[badDword]->Resolve();
@@ -1181,7 +1194,7 @@ private:
         std::uint32_t badDword = 0;
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
         const auto access = BufferAccessOf(inst.Opcode());
-        if (ValidateSource(descriptor, badDword)) {
+        if (!m_program.Metadata().gpuResolvedResources && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");
@@ -1281,6 +1294,7 @@ private:
         }
         image.atomic64 = atomic64;
         image.firstUsePc = std::min(image.firstUsePc, pc);
+        image.dimensionsOnly = image.dimensionsOnly && op == IrOpcode::ImageQueryDimensions;
         image.read = image.read || !write || atomic;
         image.written = image.written || write;
         image.atomic = image.atomic || atomic;

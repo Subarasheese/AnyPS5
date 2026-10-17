@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
@@ -52,6 +53,7 @@ TextureDimension resolveDimension(std::uint32_t raw) {
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words) {
     Require(words.size() == 8, "guest texture descriptor must contain 8 dwords");
+    if (static const bool audit = Native::Audits(); audit) Native::NoteSampledTexture(words.data());
 
     const auto base40 = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1]) << 32u)) & 0xffffffffffull;
     auto baseAddress = base40 << 8u;
@@ -231,6 +233,9 @@ bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, Texture
         case ShaderRecompiler::DescriptorImageShape::ImageCube: return dimension == TextureDimension::kCube;
         case ShaderRecompiler::DescriptorImageShape::Image3D: return dimension == TextureDimension::k3D;
         case ShaderRecompiler::DescriptorImageShape::Image1DArray: return dimension == TextureDimension::k1DArray;
+        case ShaderRecompiler::DescriptorImageShape::Image2DMultisample:
+        case ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray:
+            throw std::runtime_error("AGC graphics: a multisample shader view requires a multisample guest texture");
     }
     throw std::runtime_error("AGC graphics: MatchesGuestDimension encountered an unknown descriptor image shape");
 }

@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Native/include/NativeDevice.hpp"
+#include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -66,6 +68,10 @@ Driver::Driver() {
         throw;
     }
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& ranges, std::uint64_t generation) {
+        if (Native::GpuNative()) {
+            Native::NoteGpuMappingsChanged();
+            return;
+        }
         try {
             const auto current = Driver::Get().device.Load();
             if (current == nullptr || current->ImportGuestMemory(ranges, generation, false)) return;

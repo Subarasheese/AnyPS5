@@ -1475,18 +1475,84 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
 
     }
     const auto emitSample = [&](std::uint32_t coord, std::uint32_t mask, const std::vector<std::uint32_t>& arguments) {
-        const auto sampled = MakeSampledImage(state, mem.resource, mem.sampler, access.slot);
-        const auto sample = state.module.AllocateId();
-        std::vector<std::uint32_t> words = {opcode, resultType, sample, sampled, coord};
-        if (setup.dref) {
-            words.push_back(drefValue);
+        if (!access.image.cube && (access.image.dimension == RdnaImageDimension::Dim1D || access.image.dimension == RdnaImageDimension::Dim2D || access.image.dimension == RdnaImageDimension::Dim3D)) {
+            // GPU-resolved: the S# itself says whether coordinates are in texels (FORCE_UNNORMALIZED).
+            const auto selector = state.gpuSamplerWord0 != 0u ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), state.gpuSamplerWord0, ConstantU32(state, 0x8000u)) : state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::UnnormalizedBaseLod + mem.sampler, 0u);
+            const auto pixelCoordinates = Binary(state, spv::OpINotEqual, TypeBool(state), selector, ConstantU32(state, 0u));
+            const auto originalCoord = coord;
+            const auto normalizeLabel = state.module.AllocateId(), ordinaryLabel = state.module.AllocateId(), normalizeMerge = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelectionMerge, normalizeMerge, spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, pixelCoordinates, normalizeLabel, ordinaryLabel);
+            EmitLabel(state, normalizeLabel);
+            state.module.EmitCapability(spv::CapabilityImageQuery);
+            const auto image = LoadSampledImageDescriptor(state, mem.resource, access.slot);
+            const auto size = state.module.AllocateId();
+            state.module.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, access.image.dimension), size, image, ConstantU32(state, 0u));
+            const auto count = setup.dimensionInfo.spatialComponents;
+            std::array<std::uint32_t, 3> coordinates{};
+            for (std::uint32_t component = 0; component < count; ++component) {
+                auto length = size, value = coord;
+                if (count != 1u) {
+                    length = state.module.AllocateId(); value = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), length, size, component);
+                    state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coord, component);
+                }
+                const auto normalized = Binary(state, spv::OpFDiv, TypeF32(state), value, Unary(state, spv::OpConvertUToF, TypeF32(state), length));
+                coordinates[component] = normalized;
+            }
+            if (count == 1u) coord = coordinates[0];
+            else {
+                coord = state.module.AllocateId();
+                if (count == 2u) state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), coord, coordinates[0], coordinates[1]);
+                else state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), coord, coordinates[0], coordinates[1], coordinates[2]);
+            }
+            const auto normalizedCoord = coord, normalizeEnd = state.currentLabel;
+            state.module.AddFunction(spv::OpBranch, normalizeMerge);
+            EmitLabel(state, ordinaryLabel);
+            const auto ordinaryEnd = state.currentLabel;
+            state.module.AddFunction(spv::OpBranch, normalizeMerge);
+            EmitLabel(state, normalizeMerge);
+            coord = state.module.AllocateId();
+            state.module.AddFunction(spv::OpPhi, count == 1u ? TypeF32(state) : TypeF32Vector(state, count), coord, normalizedCoord, normalizeEnd, originalCoord, ordinaryEnd);
         }
-        if (mask != 0u) {
-            words.push_back(mask);
-            words.insert(words.end(), arguments.begin(), arguments.end());
-        }
-        state.module.AddFunction(words);
-        return sample;
+        const auto instruction = [&](bool base) {
+            // OpSampledImage and its consumer must be in the same basic block.
+            const auto sampled = MakeSampledImage(state, mem.resource, mem.sampler, access.slot);
+            const auto sample = state.module.AllocateId();
+            std::vector<std::uint32_t> words = {base ? static_cast<std::uint32_t>(spv::OpImageSampleExplicitLod) : opcode, resultType, sample, sampled, coord};
+            if (setup.dref) words.push_back(drefValue);
+            if (base) {
+                // The binding proof rejects bias, derivatives and comparison for this path.
+                // Preserve an optional texel offset after the Lod operand.
+                const auto offsets = mask & (spv::ImageOperandsConstOffsetMask | spv::ImageOperandsOffsetMask);
+                words.push_back(spv::ImageOperandsLodMask | offsets);
+                words.push_back(ZeroF32(state));
+                if (offsets) words.push_back(arguments.back());
+            } else if (mask != 0u) {
+                words.push_back(mask);
+                words.insert(words.end(), arguments.begin(), arguments.end());
+            }
+            state.module.AddFunction(words);
+            return sample;
+        };
+        if (explicitLod || setup.dref) return instruction(false);
+        // This is a preparation-time constant, not a runtime branch: SpecializeSpirv
+        // removes the unused sample instruction before Vulkan receives the module.
+        const auto selector = state.gpuSamplerWord0 != 0u ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), state.gpuSamplerWord0, ConstantU32(state, 0x8000u)) : state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::UnnormalizedBaseLod + mem.sampler, 0u);
+        const auto atBase = Binary(state, spv::OpINotEqual, TypeBool(state), selector, ConstantU32(state, 0u));
+        const auto baseLabel = state.module.AllocateId(), implicitLabel = state.module.AllocateId(), merge = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, atBase, baseLabel, implicitLabel);
+        EmitLabel(state, baseLabel);
+        const auto baseSample = instruction(true), baseEnd = state.currentLabel;
+        state.module.AddFunction(spv::OpBranch, merge);
+        EmitLabel(state, implicitLabel);
+        const auto implicitSample = instruction(false), implicitEnd = state.currentLabel;
+        state.module.AddFunction(spv::OpBranch, merge);
+        EmitLabel(state, merge);
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, resultType, result, baseSample, baseEnd, implicitSample, implicitEnd);
+        return result;
     };
     std::uint32_t sample = 0;
     if (!foldOffset) {
@@ -1624,6 +1690,32 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto& memory = ctx.Memory(inst);
     const auto& base = ImageResourceOf(state, memory);
     const auto modes = ResourceMaterializer::RuntimeImageModes(base);
+    if (state.program.Metadata().gpuResolvedResources) {
+        // The image (and sampler) of this access from its own descriptor words, through the global
+        // tables; the primary runtime mode.
+        const auto* handle = inst.Argument(0)->Resolve();
+        if (handle->Opcode() != IrOpcode::GetImageResource || handle->ArgumentCount() < 8u) ctx.Fail(inst, "has no eight-dword T# for a GPU-resolved image");
+        std::array<std::uint32_t, 8> words{};
+        for (std::uint32_t index = 0; index < 8u; ++index) words[index] = ctx.Arg(*handle, index);
+        state.gpuImageWords = words;
+        state.gpuImageEntry = EmitNativeImageLookup(state, words);
+        if (ImageOpcodeInfoOf(inst.Opcode()).needsSampler && inst.ArgumentCount() >= 2u) {
+            const auto* sampler = inst.Argument(1)->Resolve();
+            if (sampler->Opcode() != IrOpcode::GetSamplerResource || sampler->ArgumentCount() < 4u) ctx.Fail(inst, "has no four-dword S# for a GPU-resolved sampler");
+            const std::array<std::uint32_t, 4> samplerWords{ctx.Arg(*sampler, 0u), ctx.Arg(*sampler, 1u), ctx.Arg(*sampler, 2u), ctx.Arg(*sampler, 3u)};
+            state.gpuSamplerIndex = EmitNativeSamplerLookup(state, samplerWords);
+            state.gpuSamplerWord0 = samplerWords[0];
+        }
+        state.runtimeImageMetadata = ConstantU32(state, memory.resource);
+        state.runtimeImage = &modes.front();
+        EmitImageMode(ctx, inst, modes.front());
+        state.runtimeImage = nullptr;
+        state.runtimeImageMetadata = 0u;
+        state.gpuImageEntry = 0u;
+        state.gpuSamplerIndex = 0u;
+        state.gpuSamplerWord0 = 0u;
+        return;
+    }
     state.runtimeImageMetadata = ConstantU32(state, memory.resource);
     const auto table = TableSlot(ctx, inst, memory, base);
     if (table.slot != 0u) {

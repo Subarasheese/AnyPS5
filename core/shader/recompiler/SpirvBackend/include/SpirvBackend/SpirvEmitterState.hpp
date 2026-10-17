@@ -93,6 +93,21 @@ struct SpirvEmitterState {
     bool float64DenormPreserve = false;
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
+    // GPU-resolved images (gpuResolvedResources): the global tables' device addresses, the lookup
+    // functions, and the current image access's table entry (u32 id, slot + 1; 0: miss) and words.
+    std::uint64_t nativeImageTable = 0;
+    std::uint64_t nativeSamplerTable = 0;
+    std::uint32_t nativeImageLookupFunction = 0;
+    std::uint32_t nativeSamplerLookupFunction = 0;
+    std::vector<std::uint32_t> nonUniformIds;   // ids already decorated NonUniform
+    std::uint32_t gpuImageEntry = 0;
+    std::uint32_t gpuSamplerIndex = 0;
+    std::uint32_t gpuSamplerWord0 = 0;
+    // GPU-resolved programs: user-data pointers translated once in main's entry block, keyed by
+    // low | high << 16 user registers: {device address of the pointer, bytes readable from it}.
+    std::vector<std::pair<std::uint32_t, std::array<std::uint32_t, 2>>> nativeBases;
+    std::array<std::uint32_t, 4> nativePageCache{};   // native page-table lookups: cached page, device address, valid begin, valid word   // GPU-resolved access: the S#'s first word (FORCE_UNNORMALIZED is bit 15)
+    std::array<std::uint32_t, 8> gpuImageWords{};
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     // The target's SPIR-V version and what the device accepts, for capabilities an emitter adds

@@ -15,6 +15,9 @@ static constexpr int ERROR_NETWORK = static_cast<int>(0x80435001);
 static std::atomic<int> g_nextHandle{1};
 static std::mutex g_poolsMutex;
 static std::map<int, uint64_t> g_pools;
+struct Connection { int context; int socket; };
+static std::map<int, Connection> g_connections;
+static std::atomic<int> g_nextConnection{1};
 
 namespace {
 
@@ -94,12 +97,16 @@ int APS5_VABI sceSslInit_nid_postfix(uint64_t pool_size) {
 int APS5_VABI sceSslTerm_nid_postfix(int ssl_ctx_id) {
     std::lock_guard lock(g_poolsMutex);
     g_pools.erase(ssl_ctx_id);
+    std::erase_if(g_connections, [=](const auto& entry) { return entry.second.context == ssl_ctx_id; });
     return 0;
 }
 
-int APS5_VABI sceSslClose() {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceSslClose(int context, int connection) {
+    std::lock_guard lock(g_poolsMutex);
+    const auto found = g_connections.find(connection);
+    // A failed offline handshake has no session to shut down; keep the handle
+    // until DeleteConnection, as the game closes and then deletes separately.
+    return found != g_connections.end() && found->second.context == context ? 0 : ERROR_INVALID_ID;
 }
 
 int APS5_VABI sceSslGetSerialNumber() {
@@ -159,34 +166,46 @@ int APS5_VABI sceSslGetSubjectName(void) {
     return 0;
 }
 
-int APS5_VABI sceSslCreateConnection(void) {
-    NotImplemented_nid_no_patch(__func__);
+// Preserve the runtime's existing offline-network policy: creation/configuration are
+// local operations; handshake and I/O report failure, never pretend TLS succeeded.
+int APS5_VABI sceSslCreateConnection(int context, int socket) {
+    std::lock_guard lock(g_poolsMutex);
+    if (!g_pools.contains(context)) return ERROR_INVALID_ID;
+    if (socket < 0) return ERROR_INVALID_ARG;
+    const int id = g_nextConnection.fetch_add(1, std::memory_order_relaxed);
+    g_connections.emplace(id, Connection{context, socket});
+    return id;
+}
+
+int APS5_VABI sceSslDeleteConnection(int context, int connection) {
+    std::lock_guard lock(g_poolsMutex);
+    const auto found = g_connections.find(connection);
+    if (found == g_connections.end() || found->second.context != context) return ERROR_INVALID_ID;
+    g_connections.erase(found);
     return 0;
 }
 
-int APS5_VABI sceSslDeleteConnection(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSslEnableVerifyOption(int context, int connection, uint64_t option) {
+    (void)option;
+    std::lock_guard lock(g_poolsMutex);
+    const auto found = g_connections.find(connection);
+    return found != g_connections.end() && found->second.context == context ? 0 : ERROR_INVALID_ID;
 }
 
-int APS5_VABI sceSslEnableVerifyOption(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSslConnect(int context, int connection) {
+    std::lock_guard lock(g_poolsMutex);
+    const auto found = g_connections.find(connection);
+    return found != g_connections.end() && found->second.context == context ? ERROR_NETWORK : ERROR_INVALID_ID;
 }
 
-int APS5_VABI sceSslConnect(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSslRead(int context, int connection, void* buffer, int size) {
+    if (!buffer || size < 0) return ERROR_INVALID_ARG;
+    return sceSslConnect(context, connection);
 }
 
-int APS5_VABI sceSslRead(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceSslWrite(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSslWrite(int context, int connection, const void* buffer, int size) {
+    if (!buffer || size < 0) return ERROR_INVALID_ARG;
+    return sceSslConnect(context, connection);
 }
 
 }

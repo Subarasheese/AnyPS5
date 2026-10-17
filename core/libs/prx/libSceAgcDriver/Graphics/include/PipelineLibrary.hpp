@@ -27,6 +27,11 @@ struct PipelineLibraryKeys {
 
 std::span<const VkDynamicState> PipelineLibraryDynamicStates();
 
+// Borrow a module until ClearPipelineLibraries. Variant IDs name immutable
+// materialized SPIR-V; zero is reserved for modules with no stable identity.
+VkShaderModule CachedGraphicsShaderModule(const Context& context, std::uint64_t variant,
+                                         std::span<const std::uint32_t> spirv);
+
 struct OptimizedPipeline {
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyPipeline destroy = nullptr;

@@ -73,6 +73,9 @@ struct IrResourcePlan {
     // Detail::ComputePureFlatSlots): a driver may reuse a capture whose words differ only there.
     std::vector<std::uint8_t> pureFlatSlots;
     bool requiresSpecializationMemory = false;
+    // SpirvTarget::gpuResolvedResources: the program reads its descriptors itself, so a snapshot is
+    // its user data alone (no CPU evaluation of resource-table reads).
+    bool gpuResolved = false;
     bool srtPlanComplete = false;
     bool resourceTrackingComplete = false;
     ShaderInfo info;

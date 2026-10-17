@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ChannelOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -238,6 +239,7 @@ std::uint64_t SampledTextureMemory() {
 }
 
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
+    Require(descriptor.format != 43, "packed float sampling requires its GPU storage surface");
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -535,6 +537,20 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
 }
 
 bool Texture::RefreshDepthCopy() {
+    if (packedFloatView) {
+        if (copiedOnce && storageSource->Version() == copiedVersion) return false;
+        auto* recorder = Recorder::Active();
+        std::unique_ptr<CommandBatch> batch;
+        const auto commands = recorder ? recorder->Commands() : (batch = std::make_unique<CommandBatch>(context), batch->Handle());
+        storageSource->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL, 0xf0u);
+        const VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &ready, 0, nullptr, 0, nullptr);
+        if (recorder) recorder->Keep(storageSource);
+        else batch->SubmitAndWait();
+        copiedOnce = true;
+        copiedVersion = storageSource->Version();
+        return true;
+    }
     if (perUseCopy != PerUseCopy::RefreshedOnReuse || storageSource == nullptr) return false;
     if (copiedOnce && storageSource->Version() == copiedVersion) return false;
     std::uint64_t linearBytes = 0;
@@ -635,8 +651,15 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         if (descriptor.dimension == TextureDimension::kCube) {
             Require(viewLayerCount % 6u == 0, "guest cube texture view does not contain a multiple of 6 array slices");
         }
+        VkImageViewUsageCreateInfo sampledUsage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        sampledUsage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        viewInfo.image = source->Image();
+        viewInfo.pNext = &sampledUsage;
+        if (descriptor.format == 43) {
+            packedFloatView = true;
+            perUseCopy = PerUseCopy::RefreshedOnReuse;
+            viewInfo.image = source->PackedFloatSampleImage();
+        } else viewInfo.image = source->Image();
         viewInfo.viewType = ViewTypeFor(descriptor.dimension, viewLayerCount);
         viewInfo.format = vkFormat;
         viewFormat = vkFormat;
@@ -648,6 +671,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
         createFirstLayerView(descriptor, viewInfo);
         prepareBaseLevelView(descriptor, viewInfo);
+        if (packedFloatView) RefreshDepthCopy();
         if (profile) {
             auto& totals = Profile();
             totals.view += timer.lap();
@@ -660,7 +684,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
     }
 }
 
-Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType) : context(context) {
+Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer, std::uint32_t layerCount) : context(context) {
     layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = depthImage;
@@ -668,7 +692,7 @@ Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthForma
     viewInfo.format = depthFormat;
     viewFormat = depthFormat;
     viewInfo.components = components;
-    viewInfo.subresourceRange = {aspect, 0, 1, 0, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : VK_REMAINING_ARRAY_LAYERS};
+    viewInfo.subresourceRange = {aspect, 0, 1, baseLayer, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : layerCount};
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
     if (viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) return;
@@ -1333,43 +1357,59 @@ VkImageView StorageTexture::elementLayerView(std::uint32_t level, std::uint32_t 
     return created;
 }
 
-VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layer) {
+VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layer, std::uint32_t layers) {
     Require(attachable, "storage image cannot be a color attachment");
     Require(mip < descriptor.mipCount, "attachment mip exceeds the storage image");
     const bool volume = descriptor.dimension == TextureDimension::k3D;
     Require(depthSlice == 0 || (volume && mip == 0 && depthSlice <= descriptor.depthOrLastArray), "attachment slice is outside the storage image");
     Require(layer == 0 || (!volume && descriptor.dimension == TextureDimension::k2DArray && descriptor.baseArray + layer <= descriptor.depthOrLastArray), "attachment layer is outside the storage image");
-    const auto found = attachmentViews.find({format, mip, depthSlice, layer});
+    Require(layers != 0 && (layers == 1 || (!volume && descriptor.dimension == TextureDimension::k2DArray && descriptor.baseArray + layer + layers - 1u <= descriptor.depthOrLastArray)), "attachment layer range is outside the storage image");
+    const auto found = attachmentViews.find({format, mip, depthSlice, layer, layers});
     if (found != attachmentViews.end()) return found->second;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.pNext = &usage;
     viewInfo.image = image;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = format;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, volume ? depthSlice : descriptor.baseArray + layer, 1u};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, volume ? depthSlice : descriptor.baseArray + layer, layers};
     VkImageView created = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView attachment");
-    attachmentViews.emplace(std::tuple{format, mip, depthSlice, layer}, created);
+    attachmentViews.emplace(std::tuple{format, mip, depthSlice, layer, layers}, created);
     return created;
 }
 
-VkImageView StorageTexture::AttachmentProxyView() {
-    if (proxyView != VK_NULL_HANDLE) return proxyView;
-    Require(storageFormat == VK_FORMAT_R8_UNORM && descriptor.dimension == TextureDimension::k2D && descriptor.mipCount == 1 && geometry.imageLayers == 1, "an RGBA8_SRGB attachment proxy is only modeled for a single-mip 2D R8 surface");
+VkImage StorageTexture::PackedFloatSampleImage() {
+    AttachmentProxyView(0xf0u, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    return proxyImage;
+}
+
+VkImageView StorageTexture::AttachmentProxyView(std::uint8_t mapping, VkFormat format) {
+    const bool reordered = mapping == 0x1bu || mapping == 0x93u || mapping == 0xf0u;
+    if (proxyView != VK_NULL_HANDLE) {
+        Require(reordered == (channelOrder != nullptr) && (!reordered || format == proxyViewFormat), "attachment proxy representation changed");
+        return proxyView;
+    }
+    Require((mapping == 0xf0u && (descriptor.dimension == TextureDimension::k2D || descriptor.dimension == TextureDimension::k2DArray || descriptor.dimension == TextureDimension::kCube || descriptor.dimension == TextureDimension::k3D)) || (descriptor.dimension == TextureDimension::k2D && descriptor.mipCount == 1 && geometry.imageLayers == 1), "attachment proxy requires a packed-float surface or a single-mip 2D surface");
+    if (reordered) {
+        const bool rgba8 = format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_R8G8B8A8_SNORM || format == VK_FORMAT_R8G8B8A8_UINT || format == VK_FORMAT_R8G8B8A8_SINT;
+        const bool rgba16 = format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R16G16B16A16_UNORM || format == VK_FORMAT_R16G16B16A16_SNORM || format == VK_FORMAT_R16G16B16A16_UINT || format == VK_FORMAT_R16G16B16A16_SINT;
+        const bool rgba32 = format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32G32B32A32_UINT || format == VK_FORMAT_R32G32B32A32_SINT;
+        Require(rgba8 || rgba16 || rgba32 || (mapping == 0xf0u && BytesPerElement(descriptor.format) == 4 && !IsBlockCompressed(descriptor.format) && format == VK_FORMAT_B10G11R11_UFLOAT_PACK32), "unsupported attachment proxy channel packing");
+    } else Require(storageFormat == VK_FORMAT_R8_UNORM, "RGBA8_SRGB proxy requires R8 storage");
     try {
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-        imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-        imageInfo.extent = {descriptor.width, descriptor.height, 1};
-        imageInfo.mipLevels = 1;
-        imageInfo.arrayLayers = 1;
+        imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u);
+        imageInfo.imageType = ImageTypeFor(descriptor.dimension);
+        imageInfo.format = mapping == 0xf0u ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : reordered ? storageFormat : VK_FORMAT_R8G8B8A8_UNORM;
+        imageInfo.extent = {descriptor.width, descriptor.height, geometry.imageDepth};
+        imageInfo.mipLevels = descriptor.mipCount;
+        imageInfo.arrayLayers = geometry.imageLayers;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &proxyImage), "vkCreateImage attachment proxy");
@@ -1382,12 +1422,15 @@ VkImageView StorageTexture::AttachmentProxyView() {
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, proxyImage, proxyMemory, 0), "vkBindImageMemory attachment proxy");
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = proxyImage;
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+        viewInfo.viewType = descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : geometry.imageLayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = reordered ? format : VK_FORMAT_R8G8B8A8_SRGB;
         viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, geometry.imageLayers};
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &proxyView), "vkCreateImageView attachment proxy");
+        proxyViewFormat = viewInfo.format;
+        if (reordered) channelOrder = std::make_unique<ChannelOrder>(context, descriptor.width, descriptor.height, BytesPerElement(descriptor.format), geometry.imageDepth);
     } catch (...) {
+        if (proxyView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, proxyView, nullptr);
         if (proxyImage) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, proxyImage, nullptr);
         if (proxyMemory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, proxyMemory, nullptr);
         proxyImage = VK_NULL_HANDLE;
@@ -1409,7 +1452,7 @@ void blitWhole(const Context& context, VkCommandBuffer commands, VkImage source,
     context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, source, VK_IMAGE_LAYOUT_GENERAL, destination, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
 }
 
-VkImageMemoryBarrier proxyBarrier(VkImage image, VkAccessFlags source, VkAccessFlags destination, VkImageLayout from, VkImageLayout to) {
+VkImageMemoryBarrier proxyBarrier(VkImage image, VkAccessFlags source, VkAccessFlags destination, VkImageLayout from, VkImageLayout to, std::uint32_t levels = 1, std::uint32_t layers = 1) {
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.srcAccessMask = source;
     barrier.dstAccessMask = destination;
@@ -1418,29 +1461,49 @@ VkImageMemoryBarrier proxyBarrier(VkImage image, VkAccessFlags source, VkAccessF
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers};
     return barrier;
 }
 
 }
 
-void StorageTexture::RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImageLayout attachmentLayout) const {
+void StorageTexture::RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImageLayout attachmentLayout, std::uint8_t mapping) const {
     Require(proxyView != VK_NULL_HANDLE, "the storage image has no attachment proxy");
     const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
     const VkMemoryBarrier written{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
-    const auto discard = proxyBarrier(proxyImage, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    const auto discard = proxyBarrier(proxyImage, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, descriptor.mipCount, geometry.imageLayers);
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &written, 0, nullptr, 1, &discard);
-    blitWhole(context, commands, image, proxyImage, descriptor.width, descriptor.height);
-    const auto attach = proxyBarrier(proxyImage, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, attachmentLayout);
+    if (channelOrder) {
+        for (std::uint32_t mip = 0; mip < descriptor.mipCount; ++mip) {
+            if (descriptor.dimension == TextureDimension::k3D) {
+                channelOrder->Copy(commands, image, proxyImage, mapping, false, mip, 0, std::max(geometry.imageDepth >> mip, 1u));
+            } else {
+                for (std::uint32_t layer = 0; layer < geometry.imageLayers; ++layer)
+                    channelOrder->Copy(commands, image, proxyImage, mapping, false, mip, layer);
+            }
+        }
+    }
+    else blitWhole(context, commands, image, proxyImage, descriptor.width, descriptor.height);
+    const auto attach = proxyBarrier(proxyImage, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, attachmentLayout, descriptor.mipCount, geometry.imageLayers);
     barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &attach);
 }
 
-void StorageTexture::RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout) const {
+void StorageTexture::RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout, std::uint8_t mapping) const {
     Require(proxyView != VK_NULL_HANDLE, "the storage image has no attachment proxy");
     const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
-    const auto detach = proxyBarrier(proxyImage, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, attachmentLayout, VK_IMAGE_LAYOUT_GENERAL);
+    const auto detach = proxyBarrier(proxyImage, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, attachmentLayout, VK_IMAGE_LAYOUT_GENERAL, descriptor.mipCount, geometry.imageLayers);
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &detach);
-    blitWhole(context, commands, proxyImage, image, descriptor.width, descriptor.height);
+    if (channelOrder) {
+        for (std::uint32_t mip = 0; mip < descriptor.mipCount; ++mip) {
+            if (descriptor.dimension == TextureDimension::k3D) {
+                channelOrder->Copy(commands, proxyImage, image, mapping, true, mip, 0, std::max(geometry.imageDepth >> mip, 1u));
+            } else {
+                for (std::uint32_t layer = 0; layer < geometry.imageLayers; ++layer)
+                    channelOrder->Copy(commands, proxyImage, image, mapping, true, mip, layer);
+            }
+        }
+    }
+    else blitWhole(context, commands, proxyImage, image, descriptor.width, descriptor.height);
     const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
     barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &stored, 0, nullptr, 0, nullptr);
 }

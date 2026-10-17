@@ -129,6 +129,7 @@ std::uint32_t SrgbDecodeFormats(PFN_vkGetPhysicalDeviceFormatProperties formatPr
 }
 
 VkFormat SampledTextureFormat(const Context& context, std::uint32_t guestFormat) {
+    if (guestFormat == 43) return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     const auto format = static_cast<ShaderRecompiler::IrBufferFormat>(guestFormat);
     if ((context.srgbDecodeFormats & ShaderRecompiler::SrgbDecodeBit(format)) == 0u) return ResolveTextureFormat(guestFormat);
     return ResolveTextureFormat(static_cast<std::uint32_t>(ShaderRecompiler::SrgbUnormFormat(format)));
@@ -162,6 +163,7 @@ VkComponentSwizzle TextureComponentChannel(std::uint32_t guestFormat, VkComponen
     constexpr std::array<VkComponentSwizzle, 4> argb{VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B};
     switch (guestFormat) {
         case 133: return bgrb[index];
+        case 43: return bgra[index];
         case 134: return bgra[index];
         case 136: return argb[index];
         default: return component;

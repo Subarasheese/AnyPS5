@@ -6,6 +6,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Recompiler.hpp"
+#include "ShaderDiskCache.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -17,6 +18,8 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <set>
+#include <cstdlib>
 
 namespace {
 
@@ -48,6 +51,16 @@ bool g_code = false;
 
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
+    // APS5_GPU_RESOLVED=1: the native renderer's mode (SpirvTarget::gpuResolvedResources).
+    static const bool gpuResolved = std::getenv("APS5_GPU_RESOLVED") != nullptr;
+    if (gpuResolved) {
+        request.request.target.gpuResolvedResources = true;
+        request.request.target.registrationModules = true;
+        request.request.target.nativeImageTable = 1u;
+        request.request.target.nativeSamplerTable = 1u;
+        // As the native renderer translates: FP32 denormals left to the host GPU (NativeFloatMode).
+        if (request.request.context.floatMode && std::getenv("APS5_NATIVE_EXACT_DENORMALS") == nullptr) request.request.context.floatMode->floatMode |= 0x30u;
+    }
     std::printf("%s: %zu code words, %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
     if (request.request.context.compute.has_value()) {
         const auto& compute = *request.request.context.compute;
@@ -106,14 +119,6 @@ bool Replay(const char* path) {
             return false;
         }
     }
-    try {
-        auto program = ShaderRecompiler::PrepareResourceProgram(request.request);
-        constexpr ShaderRecompiler::ResourceMaterializer materializer;
-        static_cast<void>(materializer.ExtractPlan(program));
-    } catch (const std::exception& error) {
-        std::printf("  resource analysis failed: %s\n", FirstLine(error.what()).c_str());
-        return false;
-    }
     if (g_prepare) {
         try {
             const auto handle = ShaderRecompiler::PrepareShader(request.request);
@@ -125,9 +130,19 @@ bool Replay(const char* path) {
         }
     }
     try {
+        auto program = ShaderRecompiler::PrepareResourceProgram(request.request);
+        constexpr ShaderRecompiler::ResourceMaterializer materializer;
+        static_cast<void>(materializer.ExtractPlan(program));
+    } catch (const std::exception& error) {
+        std::printf("  resource analysis failed: %s\n", FirstLine(error.what()).c_str());
+        return false;
+    }
+    try {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
         const auto result = ShaderRecompiler::Recompile(request.request);
-        std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
+        std::size_t roles[8] = {};
+        for (const auto& binding : result.bindings) roles[std::min<std::size_t>(static_cast<std::size_t>(binding.role), 7)] += binding.count;
+        std::printf("  recompiled: %zu SPIR-V words; bindings: buffers %zu images %zu samplers %zu gds %zu bda %zu fault %zu srt %zu data %zu\n", result.spirv.size(), roles[0], roles[1], roles[2], roles[3], roles[4], roles[5], roles[6], roles[7]);
         if (g_spirv) {
             std::string name(path);
             name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
@@ -162,6 +177,46 @@ bool Replay(const char* path) {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 4 && std::string_view(argv[1]) == "--deduplicate-list") {
+        // Use the compiler's complete artifact key, including the code bytes,
+        // layout, target, and switches. Resource snapshots can differ without
+        // requiring another base shader artifact; hashes alone are not proof.
+        if (const auto* lane = std::getenv("APS5_SINGLE_LANE"); lane && *lane) {
+            std::fprintf(stderr, "deduplication requires APS5_SINGLE_LANE to be unset\n");
+            return 2;
+        }
+        std::ifstream input(argv[2]);
+        std::ofstream output(argv[3]);
+        if (!input || !output) return 2;
+        std::set<std::vector<std::byte>> keys;
+        std::uint64_t count = 0;
+        for (std::string path; std::getline(input, path);) {
+            if (path.empty()) continue;
+            try {
+                auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path.c_str()));
+                const auto& r = request.request;
+                const bool vertex = r.shader.stage == ShaderRecompiler::ShaderStage::Vertex ||
+                    r.shader.stage == ShaderRecompiler::ShaderStage::Local;
+                const auto subgroup = vertex && !r.target.vertexSubgroups ? 1u : r.target.subgroupSize;
+                std::vector<std::byte> key;
+                ShaderRecompiler::ShaderDiskCache::BuildKey(r, subgroup, key);
+                if (keys.insert(std::move(key)).second) output << path << '\n';
+                if (++count % 10000u == 0) {
+                    std::printf("Deduplicated %llu requests into %zu artifact keys\n",
+                        static_cast<unsigned long long>(count), keys.size());
+                    std::fflush(stdout);
+                }
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "%s: %s\n", path.c_str(), FirstLine(error.what()).c_str());
+                return 1;
+            }
+        }
+        output.flush();
+        if (!input.eof() || !output) return 1;
+        std::printf("Deduplicated %llu requests into %zu artifact keys\n",
+            static_cast<unsigned long long>(count), keys.size());
+        return 0;
+    }
     if (argc < 2) {
         std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--code] [--maintenance8] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
@@ -207,5 +262,11 @@ int main(int argc, char** argv) {
             ++failures;
         }
     }
+    ShaderRecompiler::ShaderDiskCache::Flush();
+    const auto cache = ShaderRecompiler::ShaderDiskCache::Totals();
+    std::printf("Shader cache: %llu hits, %llu misses, %llu writes, %llu load failures, %llu write failures; replay failures %d\n",
+        static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.misses),
+        static_cast<unsigned long long>(cache.writes), static_cast<unsigned long long>(cache.loadFailures),
+        static_cast<unsigned long long>(cache.writeFailures), failures);
     return failures == 0 ? 0 : 1;
 }

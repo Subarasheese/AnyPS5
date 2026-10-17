@@ -1,3 +1,5 @@
+#include "BdaAbi.hpp"
+#include "RuntimeAbi.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvRuntimeBuffer.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
@@ -202,8 +204,129 @@ std::uint32_t GuestAddress(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     return AddBdaImmediate(ctx, inst, address, immediate);
 }
 
+// The user registers of a GetAddressResource whose words both come straight from user data, as
+// low | high << 16; ~0u otherwise.
+std::uint32_t UserDataBaseKey(const IrValue* handle) {
+    if (handle == nullptr || handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u) return ~0u;
+    const auto* low = handle->Argument(0)->Resolve();
+    const auto* high = handle->Argument(1)->Resolve();
+    if (low->Opcode() != IrOpcode::GetUserData || high->Opcode() != IrOpcode::GetUserData) return ~0u;
+    return static_cast<std::uint32_t>(low->Argument(0)->Register().index) | static_cast<std::uint32_t>(high->Argument(0)->Register().index) << 16u;
+}
+
+void emitNativeBasePrologue(SpirvEmitterState& state) {
+    namespace Table = RuntimeAbi::NativePageTable;
+    if (state.bdaPagetableVariable == 0u) return;
+    std::vector<std::uint32_t> keys;
+    for (const auto& block : state.program.Blocks()) {
+        for (const auto* value : block->Instructions()) {
+            const auto opcode = value->Opcode();
+            if (opcode != IrOpcode::LoadAddressU32 || value->ArgumentCount() == 0u) continue;
+            const auto key = UserDataBaseKey(value->Argument(0)->Resolve());
+            if (key != ~0u && std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+        }
+    }
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    for (const auto key : keys) {
+        const auto base = DeviceAddressFromWords(state, EmitGetUserData(state, static_cast<ScalarReg>(key & 0xffffu)), EmitGetUserData(state, static_cast<ScalarReg>(key >> 16u)));
+        // RuntimeAbi::NativePageTable, every index clamped so each load stays inside the table.
+        const auto magic = binary(spv::OpIEqual, boolean, BdaLoadWord(state, constant(0u)), constant(Table::Magic));
+        const auto level1Count = BdaLoadWord(state, constant(1u));
+        const auto region64 = binary(spv::OpShiftRightLogical, u64, base, ConstantDeviceAddress(state, Table::BlockShift));
+        const auto inLevel1 = binary(spv::OpLogicalAnd, boolean, magic, binary(spv::OpULessThan, boolean, region64, Unary(state, spv::OpUConvert, u64, level1Count)));
+        const auto region = Select(state, u32, inLevel1, Unary(state, spv::OpUConvert, u32, region64), constant(0u));
+        const auto block = BdaLoadWord(state, binary(spv::OpIAdd, u32, constant(Table::HeaderWords), region));
+        const auto mapped = binary(spv::OpLogicalAnd, boolean, inLevel1, binary(spv::OpINotEqual, boolean, block, constant(0u)));
+        const auto blockIndex = Select(state, u32, mapped, binary(spv::OpISub, u32, block, constant(1u)), constant(0u));
+        const auto low = Unary(state, spv::OpUConvert, u32, base);
+        const auto page = binary(spv::OpBitwiseAnd, u32, binary(spv::OpShiftRightLogical, u32, low, constant(Table::PageShift)), constant(Table::PagesPerBlock - 1u));
+        const auto level2 = binary(spv::OpBitwiseAnd, u32, binary(spv::OpIAdd, u32, constant(Table::HeaderWords + 3u), level1Count), constant(~3u));
+        const auto entry = Select(state, u32, mapped, binary(spv::OpIAdd, u32, level2, binary(spv::OpIMul, u32, binary(spv::OpIAdd, u32, binary(spv::OpIMul, u32, blockIndex, constant(Table::PagesPerBlock)), page), constant(4u))), constant(0u));
+        const auto device = BdaLoadAddress(state, entry);
+        const auto validBegin = BdaLoadWord(state, binary(spv::OpIAdd, u32, entry, constant(2u)));
+        const auto validWord = BdaLoadWord(state, binary(spv::OpIAdd, u32, entry, constant(3u)));
+        const auto offset = binary(spv::OpBitwiseAnd, u32, low, constant((1u << Table::PageShift) - 1u));
+        const auto validBytes = binary(spv::OpBitwiseAnd, u32, validWord, constant(Table::BytesMask));
+        const auto readable = binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, validWord, constant(BdaAbi::Read << Table::PermissionShift)), constant(0u));
+        auto usable = binary(spv::OpLogicalAnd, boolean, mapped, binary(spv::OpINotEqual, boolean, device, ConstantDeviceAddress(state, 0u)));
+        usable = binary(spv::OpLogicalAnd, boolean, usable, binary(spv::OpLogicalAnd, boolean, readable, binary(spv::OpUGreaterThanEqual, boolean, offset, validBegin)));
+        usable = binary(spv::OpLogicalAnd, boolean, usable, binary(spv::OpULessThan, boolean, offset, validBytes));
+        const auto extent = Select(state, u64, usable, Unary(state, spv::OpUConvert, u64, binary(spv::OpISub, u32, validBytes, offset)), ConstantDeviceAddress(state, 0u));
+        const auto deviceBase = binary(spv::OpIAdd, u64, device, Unary(state, spv::OpUConvert, u64, offset));
+        state.nativeBases.push_back({key, {deviceBase, extent}});
+    }
+}
+
 std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t bits) {
-    return EmitValueOrZeroIfCondition(ctx.state, ActiveArgument(ctx, inst), [&]() {
+    auto& state = ctx.state;
+    // GPU-resolved programs reading through a user-data pointer translated in the prologue: a
+    // direct load when the dword lies in the pointer's mapped extent, the table lookup otherwise.
+    static const bool noDirect = std::getenv("APS5_NATIVE_NO_DIRECT") != nullptr;
+    if (!noDirect && bits == 32u && mem.kind == ResourceKind::ScalarAddress && !mem.addressIsFull && !state.nativeBases.empty()) {
+        const auto key = UserDataBaseKey(inst.Argument(0) != nullptr ? inst.Argument(0)->Resolve() : nullptr);
+        const auto found = std::find_if(state.nativeBases.begin(), state.nativeBases.end(), [&](const auto& entry) { return entry.first == key; });
+        if (found != state.nativeBases.end()) {
+            return EmitValueOrZeroIfCondition(state, ActiveArgument(ctx, inst), [&]() {
+                const auto u32 = TypeU32(state);
+                const auto u64 = TypeScalarU64(state);
+                const auto low = Binary(state, spv::OpBitwiseAnd, u32, ctx.Arg(inst, 1), ConstantU32(state, ~3u));
+                const auto offset = Binary(state, spv::OpIAdd, u64, Unary(state, spv::OpUConvert, u64, low), ConstantDeviceAddress(state, static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(mem.offset & ~3u)))));
+                // Subtraction after an explicit offset bound avoids offset+4 wrapping
+                // (notably an immediate -4). Unaligned bases use the byte-safe reader.
+                const auto offsetInRange = Binary(state, spv::OpULessThanEqual, TypeBool(state), offset, found->second[1]);
+                const auto available = Binary(state, spv::OpISub, u64, found->second[1], offset);
+                const auto hasDword = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), available, ConstantDeviceAddress(state, 4u));
+                const auto physical = Binary(state, spv::OpIAdd, u64, found->second[0], offset);
+                const auto aligned = Binary(state, spv::OpIEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, u64, physical, ConstantDeviceAddress(state, 3u)), ConstantDeviceAddress(state, 0u));
+                const auto inside = AndCondition(state, AndCondition(state, offsetInRange, hasDword), aligned);
+                const auto direct = state.module.AllocateId(), slow = state.module.AllocateId(), merge = state.module.AllocateId();
+                state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+                state.module.AddFunction(spv::OpBranchConditional, inside, direct, slow);
+                EmitLabel(state, direct);
+                const auto pointer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, Binary(state, spv::OpIAdd, u64, found->second[0], offset));
+                const auto directValue = state.module.AllocateId();
+                if (mem.coherent) {
+                    state.module.AddFunction(spv::OpAtomicLoad, u32, directValue, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone));
+                } else {
+                    state.module.AddFunction(spv::OpLoad, u32, directValue, pointer, spv::MemoryAccessAlignedMask, 4u);
+                }
+                state.module.AddFunction(spv::OpBranch, merge);
+                EmitLabel(state, slow);
+                const auto slowValue = EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits);
+                const auto slowEnd = state.currentLabel;
+                state.module.AddFunction(spv::OpBranch, merge);
+                EmitLabel(state, merge);
+                const auto value = state.module.AllocateId();
+                state.module.AddFunction(spv::OpPhi, u32, value, directValue, direct, slowValue, slowEnd);
+                // Debug aid: APS5_NATIVE_CHECK_DIRECT=1 also reads through the table and reports a
+                // differing direct read as a fault {guest address, direct value, table value}.
+                static const bool check = std::getenv("APS5_NATIVE_CHECK_DIRECT") != nullptr;
+                static const std::uint64_t checkProgram = [] {
+                    const auto* value = std::getenv("APS5_NATIVE_CHECK_DIRECT_PROGRAM");
+                    return value != nullptr ? std::strtoull(value, nullptr, 0) : 0ull;
+                }();
+                static const std::uint32_t checkPc = [] {
+                    const auto* value = std::getenv("APS5_NATIVE_CHECK_DIRECT_PC");
+                    return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0)) : ~0u;
+                }();
+                if (check && (checkProgram == 0u || checkProgram == state.program.Resources().shaderHash)
+                    && (checkPc == ~0u || checkPc == inst.Flags<MemoryFlags>().pc) && state.faultBufferVariable != 0u) {
+                    const auto guest = GuestAddress(ctx, inst, mem);
+                    const auto reference = EmitBdaRead(ctx, inst, guest, bits);
+                    EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), reference, value), [&] {
+                        RecordBdaFaultWords(state, Unary(state, spv::OpUConvert, u32, guest), Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64, guest, ConstantDeviceAddress(state, 32u))), value, reference, BdaAbi::FaultReason::DirectLoadMismatch);
+                    });
+                }
+                return value;
+            });
+        }
+    }
+    return EmitValueOrZeroIfCondition(state, ActiveArgument(ctx, inst), [&]() {
         return EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits);
     });
 }
@@ -1950,6 +2073,10 @@ std::uint32_t EmitBufferAtomicInc64(SpirvValueEmitContext& ctx, const IrValue& i
 std::uint32_t EmitBufferAtomicDec64(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto limit = ScalarU64Argument(ctx, inst, 2u);
     return BufferAtomic64Update(ctx, inst, [&](std::uint32_t old) { return AtomicFloatBits{ctx.state, true}.decrement(old, limit); });
+}
+
+void EmitNativeBasePrologue(SpirvEmitterState& state) {
+    emitNativeBasePrologue(state);
 }
 
 }

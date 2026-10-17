@@ -1072,6 +1072,15 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 }
 
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+    // Vulkan command pools require external synchronization even when different
+    // command buffers are recorded. Presentation uses the device's original pool.
+    if (context.queueFamilyIndex != VK_QUEUE_FAMILY_IGNORED) {
+        VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        info.queueFamilyIndex = context.queueFamilyIndex;
+        Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &info, nullptr, &ownedCommandPool), "vkCreateCommandPool recorder");
+        this->context.pool = ownedCommandPool;
+    }
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1177,6 +1186,7 @@ Recorder::~Recorder() {
     // Sync() above waited for every batch, so no submission still signals the timeline.
     if (timeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, timeline, nullptr);
     timeline = VK_NULL_HANDLE;
+    if (ownedCommandPool) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, ownedCommandPool, nullptr);
 }
 
 std::optional<std::chrono::steady_clock::time_point> Recorder::PendingLabelSince() {

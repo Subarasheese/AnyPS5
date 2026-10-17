@@ -113,6 +113,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
         }
         next.runtimeStateDwords = (attributes + RuntimeAbi::VertexSelectorsPerDword - 1u) / RuntimeAbi::VertexSelectorsPerDword;
     }
+    if (program.Metadata().gpuResolvedResources) next.runtimeStateDwords += RuntimeAbi::NativeHeap::InvocationAddressDwords;
     const auto pushSize = layout.pushConstantSizeBytes / 4u;
     next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
 
@@ -156,13 +157,15 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     }
     for (std::uint32_t i = 0; i < imageGroups.size(); i++) {
         if (!imageGroups[i].empty()) {
-            if (imageGroups[i].size() > RuntimeAbi::HeapCapacity(static_cast<DescriptorBindingKind>(FirstImageBinding + i))) fail("shader image heap capacity exceeded");
+            const auto capacity = program.Metadata().gpuResolvedResources ? RuntimeAbi::NativeHeap::ImageCapacity : RuntimeAbi::HeapCapacity(static_cast<DescriptorBindingKind>(FirstImageBinding + i));
+            if (imageGroups[i].size() > capacity) fail("shader image heap capacity exceeded");
             addBinding(next, static_cast<DescriptorBindingKind>(FirstImageBinding + i), std::move(imageGroups[i]));
         }
     }
 
     if (!info.samplers.empty()) {
-        if (info.samplers.size() > RuntimeAbi::SamplerHeapCapacity / 2u) fail("shader sampler pairs exceed runtime heap capacity");
+        const auto capacity = program.Metadata().gpuResolvedResources ? RuntimeAbi::NativeHeap::SamplerCapacity : RuntimeAbi::SamplerHeapCapacity;
+        if (info.samplers.size() > capacity / 2u) fail("shader sampler pairs exceed runtime heap capacity");
         std::vector<std::uint32_t> resources(info.samplers.size() * 2u);
         for (std::uint32_t i = 0; i < resources.size(); i++) {
             resources[i] = i / 2u;

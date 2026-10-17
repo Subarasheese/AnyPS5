@@ -28,7 +28,7 @@ struct Range {
 };
 
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
-enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor };
+enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, DirectLoadMismatch };
 
 struct Fault {
     FaultState state;
@@ -57,6 +57,11 @@ inline constexpr std::uint32_t WrittenCountWord = WrittenOverflowWord + 1;
 inline constexpr std::uint32_t WrittenSlotsWord = WrittenCountWord + 1;
 inline constexpr std::uint32_t WrittenListWord = WrittenSlotsWord + 2 * WrittenPageSlots;
 inline constexpr std::size_t FaultBufferBytes = (WrittenListWord + WrittenPageSlots) * sizeof(std::uint32_t);
+// Native-only trailing diagnostic record. Keep the existing fault and written-
+// page ABI offsets intact so ordinary access faults cannot hide a direct-load
+// mismatch. Native descriptors expose the additional record; other modes do not.
+inline constexpr std::uint32_t NativeDiagnosticWord = FaultBufferBytes / sizeof(std::uint32_t);
+inline constexpr std::size_t NativeFaultBufferBytes = FaultBufferBytes + sizeof(Fault);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
 static_assert(WrittenChunkPages == 32);
 

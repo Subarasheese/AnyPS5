@@ -145,6 +145,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
+        Graphics::NoteRegisterRead(Graphics::RegisterBank::Context, 0x207);
+        const auto outputControl = queue.context.find(0x207);
+        vertexInfos[i]->paClVsOutCntl = outputControl == queue.context.end() ? 0u : outputControl->second;
     };
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);

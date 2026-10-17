@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvBda.hpp"
+#include "RuntimeAbi.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <bit>
@@ -18,7 +19,58 @@ void ReturnBdaZeroIf(SpirvEmitterState& state, std::uint32_t condition) {
 }
 
 // (u64 address, u32 bytes, u32 instruction) -> u64 device address of the range holding all the bytes,
+// GPU-resolved programs (the native renderer): RuntimeAbi::NativePageTable, a direct two-level
+// table instead of the binary search over ranges.
+std::uint32_t DefineNativePageLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission) {
+    namespace Table = RuntimeAbi::NativePageTable;
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, name);
+    state.module.AddFunction(spv::OpFunction, u64, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
+    const auto address = state.module.AllocateId();
+    const auto bytes = state.module.AllocateId();
+    const auto instruction = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, u64, address);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, bytes);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, instruction);
+    EmitLabel(state, state.module.AllocateId());
+    const auto fail = [&](std::uint32_t condition, BdaAbi::FaultReason reason) {
+        if (recordFaults) ReturnBdaFailureIf(state, condition, address, bytes, instruction, reason);
+        else ReturnBdaZeroIf(state, condition);
+    };
+    const auto low = Unary(state, spv::OpUConvert, u32, address);
+    fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(Table::Magic)), BdaAbi::FaultReason::InvalidTable);
+    const auto level1Count = BdaLoadWord(state, constant(1));
+    const auto region = Unary(state, spv::OpUConvert, u32, binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, Table::BlockShift)));
+    const auto above = binary(spv::OpUGreaterThanEqual, boolean, binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, Table::BlockShift)), Unary(state, spv::OpUConvert, u64, level1Count));
+    fail(above, BdaAbi::FaultReason::Unmapped);
+    const auto block = BdaLoadWord(state, binary(spv::OpIAdd, u32, constant(Table::HeaderWords), region));
+    fail(binary(spv::OpIEqual, boolean, block, constant(0)), BdaAbi::FaultReason::Unmapped);
+    const auto page = binary(spv::OpBitwiseAnd, u32, binary(spv::OpShiftRightLogical, u32, low, constant(Table::PageShift)), constant(Table::PagesPerBlock - 1u));
+    const auto level2 = binary(spv::OpIAdd, u32, binary(spv::OpBitwiseAnd, u32, binary(spv::OpIAdd, u32, constant(Table::HeaderWords + 3u), level1Count), constant(~3u)), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, block, constant(1u)), constant(Table::PagesPerBlock * 4u)));
+    const auto entry = binary(spv::OpIAdd, u32, level2, binary(spv::OpIMul, u32, page, constant(4u)));
+    const auto device = BdaLoadAddress(state, entry);
+    fail(binary(spv::OpIEqual, boolean, device, BdaConstant(state, 0)), BdaAbi::FaultReason::Unmapped);
+    const auto validBegin = BdaLoadWord(state, binary(spv::OpIAdd, u32, entry, constant(2u)));
+    const auto validWord = BdaLoadWord(state, binary(spv::OpIAdd, u32, entry, constant(3u)));
+    const auto offset = binary(spv::OpBitwiseAnd, u32, low, constant((1u << Table::PageShift) - 1u));
+    fail(binary(spv::OpULessThan, boolean, offset, validBegin), BdaAbi::FaultReason::Unmapped);
+    const auto validBytes = binary(spv::OpBitwiseAnd, u32, validWord, constant(Table::BytesMask));
+    const auto end = binary(spv::OpIAdd, u64, Unary(state, spv::OpUConvert, u64, offset), Unary(state, spv::OpUConvert, u64, bytes));
+    fail(binary(spv::OpUGreaterThan, boolean, end, Unary(state, spv::OpUConvert, u64, validBytes)), BdaAbi::FaultReason::Unmapped);
+    const auto permissions = binary(spv::OpShiftRightLogical, u32, validWord, constant(Table::PermissionShift));
+    fail(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permissions, constant(permission)), constant(permission)), BdaAbi::FaultReason::Permission);
+    state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, device, Unary(state, spv::OpUConvert, u64, offset)));
+    state.module.AddFunction(spv::OpFunctionEnd);
+    return function;
+}
+
 std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read) {
+    if (state.program.Metadata().gpuResolvedResources) return DefineNativePageLookup(state, name, recordFaults, permission);
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);

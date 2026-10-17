@@ -4,10 +4,15 @@
 #include "SpirvBackend/SpirvEmitterState.hpp"
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include <cstdint>
+#include <span>
 
 namespace ShaderRecompiler {
 
 std::uint32_t RuntimeImageDword(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t member);
+// GPU-resolved resources: the global table entry id (slot + 1, 0: miss) of an access's T#, and the
+// heap index of its S#'s sampler (RuntimeAbi::NativeHeap).
+std::uint32_t EmitNativeImageLookup(SpirvEmitterState& state, std::span<const std::uint32_t, 8> words);
+std::uint32_t EmitNativeSamplerLookup(SpirvEmitterState& state, std::span<const std::uint32_t, 4> words);
 std::uint32_t ResourceForDescriptor(const SpirvEmitterState& state, DescriptorBindingKind kind, std::uint32_t resource);
 std::uint32_t DescriptorElementPointer(SpirvEmitterState& state, std::uint32_t resultPtrType, std::uint32_t variableId, std::uint32_t arrayIndex, DescriptorBindingKind kind, std::uint32_t resource, const char* variableName);
 std::uint32_t ImageScalarType(SpirvEmitterState& state, IrTextureNumericClass numericClass);

@@ -520,11 +520,13 @@ std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& ins
             throw std::runtime_error("tessellation factor index must be immediate");
         }
         const auto index = inst.Argument(1)->ImmediateU32() / 4u;
-        const bool outer = index < 3u;
-        if (index >= 4u) {
+        const auto outerCount = state.inputInfo.vertex->tess.domain == 1u ? 3u : 4u;
+        const auto innerCount = state.inputInfo.vertex->tess.domain == 1u ? 1u : 2u;
+        const bool outer = index < outerCount;
+        if (index >= outerCount + innerCount) {
             throw std::runtime_error("tessellation factor index out of range");
         }
-        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)), pointer, outer ? variable : state.tessInnerVariable, ConstantU32(state, outer ? index : index - 3u));
+        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)), pointer, outer ? variable : state.tessInnerVariable, ConstantU32(state, outer ? index : index - outerCount));
         return pointer;
     }
     auto address = ctx.Arg(inst, 1);
@@ -622,16 +624,19 @@ void DefineTessellationInterfaces(SpirvEmitterState& state) {
 
 void DefineTessellationExecutionModes(SpirvEmitterState& state) {
     const auto& tess = state.inputInfo.vertex->tess;
-    if (tess.domain != 1u || tess.partitioning != 2u || tess.outputTopology != 2u) {
+    if ((tess.domain != 1u && tess.domain != 2u) ||
+        (tess.partitioning != 0u && tess.partitioning != 2u && tess.partitioning != 3u) ||
+        (tess.outputTopology != 2u && tess.outputTopology != 3u)) {
         throw std::runtime_error("unsupported tessellation domain, partitioning, or output topology");
     }
     state.module.EmitCapability(spv::CapabilityTessellation);
     if (state.program.Resources().stage == IrShaderStage::TessellationControl) {
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeOutputVertices, tess.outputControlPoints);
     } else {
-        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeTriangles);
-        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeSpacingFractionalOdd);
-        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeVertexOrderCw);
+        state.module.AddExecutionMode(state.mainFunc, tess.domain == 1u ? spv::ExecutionModeTriangles : spv::ExecutionModeQuads);
+        state.module.AddExecutionMode(state.mainFunc, tess.partitioning == 0u ? spv::ExecutionModeSpacingEqual :
+            tess.partitioning == 2u ? spv::ExecutionModeSpacingFractionalOdd : spv::ExecutionModeSpacingFractionalEven);
+        state.module.AddExecutionMode(state.mainFunc, tess.outputTopology == 2u ? spv::ExecutionModeVertexOrderCw : spv::ExecutionModeVertexOrderCcw);
     }
 }
 
@@ -1068,6 +1073,7 @@ void EmitProgram(SpirvEmitterState& state) {
     if (state.pixelValidMaskVariable != 0u) {
         state.module.AddFunction(spv::OpStore, state.pixelValidMaskVariable, ConstantU32(state, 1u));
     }
+    if (state.program.Metadata().gpuResolvedResources) EmitNativeBasePrologue(state);
     if (AlphaToCoverage(state)) StoreCoverage(state, ConstantI32(state, -1));
     if (OrderedPixelShader(state)) {
         state.module.AddFunction(spv::OpBeginInvocationInterlockEXT);
@@ -1219,14 +1225,15 @@ void EmitSetTessellationAttribute(SpirvValueEmitContext& ctx, const IrValue& ins
         auto value = ctx.Arg(inst, 2);
         if (inst.Argument(0)->ImmediateU32() == static_cast<std::uint32_t>(TessellationAttribute::Factor)) {
             auto& state = ctx.state;
-            const bool outer = inst.Argument(1)->HasImmediate() && inst.Argument(1)->ImmediateU32() / 4u < 3u;
+            const auto& tess = state.inputInfo.vertex->tess;
+            const bool outer = inst.Argument(1)->HasImmediate() && inst.Argument(1)->ImmediateU32() / 4u < (tess.domain == 1u ? 3u : 4u);
             const auto floating = state.module.AllocateId();
             state.module.AddFunction(spv::OpBitcast, TypeF32(state), floating, value);
             const auto lower = ConstantF32Value(state, outer ? 0.0f : 1.0f);
             const auto inside = state.module.AllocateId();
             state.module.AddFunction(spv::OpFOrdGreaterThan, TypeBool(state), inside, floating, lower);
             const auto clamped = state.module.AllocateId();
-            state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FMin, floating, ConstantF32Value(state, 63.0f));
+            state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FMin, floating, ConstantF32Value(state, tess.partitioning == 2u ? 63.0f : 64.0f));
             value = state.module.AllocateId();
             state.module.AddFunction(spv::OpSelect, TypeF32(state), value, inside, clamped, outer ? floating : lower);
         }
@@ -1364,7 +1371,19 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
 }
 
 std::uint32_t EmitGetShaderBase(SpirvValueEmitContext& ctx) {
-    return ConstantU64(ctx.state, 0u);
+    auto& state = ctx.state;
+    if (!state.program.Metadata().gpuResolvedResources) return ConstantU64(state, 0u);
+    // Native S_GETPC is also used to address inline constant tables. A zero
+    // base turns those into unmapped low addresses. Supply the current program
+    // address at dispatch time, preserving address-independent cached code.
+    const auto words = state.program.Metadata().bindings.ShaderDataDwords();
+    if (words < RuntimeAbi::NativeHeap::InvocationAddressDwords) throw std::runtime_error("native shader data lacks program address");
+    const auto first = words - RuntimeAbi::NativeHeap::ProgramAddressDwords;
+    const auto low = EmitShaderDataDwordLoad(state, first);
+    const auto high = EmitShaderDataDwordLoad(state, first + 1u);
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, TypeU64(state), result, low, high);
+    return result;
 }
 
 namespace {

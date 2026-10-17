@@ -64,9 +64,9 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 200, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 232, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 112, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 320, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 352, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 568, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -316,6 +316,9 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.vertexOffsetConflict);
     writer.Value(result.instanceOffsetConflict);
     writer.Value(result.hostSubgroupSize);
+    writer.Values(std::span<const std::uint32_t>(result.shaderDataUserRegisters));
+    writer.Value(result.pushDataStartDword);
+    writer.Value(result.dispatchThreadLimitDword);
     writer.Values(std::span<const std::uint32_t>(result.parameterExports));
     writer.List(result.fragmentParameters, [](Writer& out, const FragmentParameter& parameter) {
         out.Value(parameter.location);
@@ -360,6 +363,9 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.vertexOffsetConflict);
     reader.Value(result.instanceOffsetConflict);
     reader.Value(result.hostSubgroupSize);
+    reader.Values(result.shaderDataUserRegisters);
+    reader.Value(result.pushDataStartDword);
+    reader.Value(result.dispatchThreadLimitDword);
     reader.Values(result.parameterExports);
     reader.List(result.fragmentParameters, 10, [](Reader& in, FragmentParameter& parameter) {
         in.Value(parameter.location);
@@ -496,6 +502,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.constantSwizzleCompatible);
         out.Value(image.flatVolumeCompatible);
         out.Value(image.flatLineCompatible);
+        out.Value(image.dimensionsOnly);
         out.Value(image.foldTexelOffsetsOnly);
         out.Value(image.byElements);
         out.Value(image.byComponents);
@@ -604,6 +611,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.constantSwizzleCompatible);
         in.Value(image.flatVolumeCompatible);
         in.Value(image.flatLineCompatible);
+        in.Value(image.dimensionsOnly);
         in.Value(image.foldTexelOffsetsOnly);
         in.Value(image.byElements);
         in.Value(image.byComponents);
@@ -673,6 +681,7 @@ void decodeAllocation(Reader& reader, CompiledBindingLayout& allocation) {
 }
 
 constexpr std::string_view NeutralSwitches[] = {
+    "APS5_TRACE_PIPELINE_CREATE",
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",

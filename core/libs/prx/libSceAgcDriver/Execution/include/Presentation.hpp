@@ -21,6 +21,10 @@ struct PresentationWindow {
     std::uint32_t width;
     std::uint32_t height;
     std::shared_ptr<FrameTiming> timing;
+    // A drawable size captured by the SDL owner thread before queued presentation.
+    bool drawableSizeKnown = false;
+    std::uint32_t drawableWidth = 0;
+    std::uint32_t drawableHeight = 0;
 };
 
 }

@@ -210,6 +210,8 @@ public:
     bool PresentClear(std::uint32_t width, std::uint32_t height, bool opaque);
     void PresentPixels(std::uint32_t width, std::uint32_t height, std::span<const std::byte> pixels);
     bool PresentDisplayBuffer(const DisplayBuffer& buffer);
+    // Native renderer: blits `image` (GENERAL layout, written by work already submitted) as the frame.
+    bool PresentNativeImage(VkImage image, std::uint32_t width, std::uint32_t height);
     double FinishPresent();
     void QueuePresent();
     // At the flip packet (under the mutex): the recorder's submissions so far and, under
@@ -303,6 +305,10 @@ public:
     IndirectDrawSupport DrawIndirectSupport() const;
     void EnqueueDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders);
+    // Native renderer (Native/src/NativeDevice.cpp): the device's graphics context and an instance
+    // function of its Vulkan instance.
+    Graphics::Context NativeContext() const { return graphicsContext(); }
+    PFN_vkVoidFunction NativeInstanceFunction(const char* name) const;
 
 private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
@@ -322,7 +328,7 @@ private:
     // The tail of a dispatch's device call from the open batch's command buffer to the completion
     // registration: keeps, the template data refresh, barriers, bind, push, dispatch, marks.
     void recordDispatch(RecordedDispatch& record);
-    bool present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display = nullptr, const std::shared_ptr<Graphics::StorageTexture>& resident = nullptr, VkFilter residentFilter = VK_FILTER_LINEAR, bool dumpFrame = false, bool residentConvert = false, const VkClearColorValue* uniform = nullptr);
+    bool present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display = nullptr, const std::shared_ptr<Graphics::StorageTexture>& resident = nullptr, VkFilter residentFilter = VK_FILTER_LINEAR, bool dumpFrame = false, bool residentConvert = false, const VkClearColorValue* uniform = nullptr, VkImage nativeImage = VK_NULL_HANDLE);
     struct State;
     std::unique_ptr<State> state;
     std::uint64_t serial;

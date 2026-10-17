@@ -182,10 +182,14 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
                                                  : "MIMG BY2/BY4 requires a direct, identity-swizzled 2D image whose elements fill one dword: R8, R16 or RG8 for BY2, R8 for BY4");
         }
     }
-    decoded.conversionFormat = RemapTextureFormat(format) != format ? format : IrBufferFormat::Invalid;
+    const bool nativePackedFloat = !storage && format == IrBufferFormat::Format10_11_11Float;
+    const auto packedFloatType = rawImageType(descriptor);
+    if (nativePackedFloat && ((packedFloatType != ImageType::Color2D && packedFloatType != ImageType::Color2DArray && packedFloatType != ImageType::Cube && packedFloatType != ImageType::Color3D) || base.packed || base.atomic))
+        throw std::runtime_error("native packed float sampling requires a non-packed 2D, array, cube or 3D image");
+    decoded.conversionFormat = nativePackedFloat ? IrBufferFormat::Invalid : RemapTextureFormat(format) != format ? format : IrBufferFormat::Invalid;
     if (format == IrBufferFormat::Format11_11_10UNorm || format == IrBufferFormat::Format10_11_11Float) {
         const bool floating = format == IrBufferFormat::Format10_11_11Float;
-        if (!base.srgbDecodeCompatible) throw std::runtime_error(floating ? "samples or gathers a converted float image, or queries its LOD, which is not implemented" : "sampling, gathering or querying LOD of a converted unorm image is not implemented");
+        if (!nativePackedFloat && !base.srgbDecodeCompatible) throw std::runtime_error(floating ? "samples or gathers a converted float image, or queries its LOD, which is not implemented" : "sampling, gathering or querying LOD of a converted unorm image is not implemented");
         if (!base.depthBitsCompatible) throw std::runtime_error(floating ? "reads or writes a converted float image with 16-bit data, which is not implemented" : "reads or writes a converted unorm image with 16-bit data, which is not implemented");
         for (std::uint32_t component = 0; component < 4u; ++component) {
             if (((descriptorImageSwizzle(descriptor) >> (component * 3u)) & 7u) == 7u) throw std::runtime_error("selects a channel the converted image format does not have");
@@ -201,7 +205,7 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
     const bool wideSint = format == IrBufferFormat::Format32SInt || format == IrBufferFormat::Format32_32SInt || format == IrBufferFormat::Format32_32_32_32SInt;
     const bool narrowSint = format == IrBufferFormat::Format16SInt || format == IrBufferFormat::Format8_8SInt || format == IrBufferFormat::Format16_16SInt || format == IrBufferFormat::Format8_8_8_8SInt || format == IrBufferFormat::Format16_16_16_16SInt;
     const bool rawSintStorage = storage && (wideSint || (narrowSint && !base.packed)) && base.written && !base.read && !base.atomic;
-    decoded.numericClass = base.atomic ? IrTextureNumericClass::Uint : SampledTextureNumericClass(format);
+    decoded.numericClass = nativePackedFloat ? IrTextureNumericClass::Float : base.atomic ? IrTextureNumericClass::Uint : SampledTextureNumericClass(format);
     if (!storage && !base.depthCompare && IsDepthBitsTexture(descriptor.dwords[1], descriptor.dwords[3])) {
         decoded.depthBits = true;
         if (!base.depthBitsCompatible) throw std::runtime_error("runtime image reads depth bits as unsupported 16-bit results");
@@ -643,6 +647,25 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
         mode.shaderSwizzle = ShaderImageIdentitySwizzle;
         if (conversion == IrBufferFormat::Format11_11_10UNorm || conversion == IrBufferFormat::Format10_11_11Float) mode.shaderSwizzle = 0x2acu;
         modes.push_back(mode);
+        // GET_RESINFO supplies a mip ID, not spatial coordinates. Its result
+        // shape follows the live descriptor even when the instruction DIM is 1D.
+        // Never allow these variants for a resource that is also sampled/loaded.
+        if (image.dimensionsOnly && !storage && !depth &&
+            conversion == IrBufferFormat::Invalid && packed == IrBufferFormat::Invalid) {
+            for (const auto dimension : {RdnaImageDimension::Dim1D, RdnaImageDimension::Dim1DArray,
+                                        RdnaImageDimension::Dim2D, RdnaImageDimension::Dim2DArray,
+                                        RdnaImageDimension::Dim3D}) {
+                if (dimension != mode.dimension) {
+                    auto query = mode;
+                    query.dimension = dimension;
+                    modes.push_back(query);
+                }
+            }
+            auto cubeQuery = mode;
+            cubeQuery.dimension = RdnaImageDimension::Dim2DArray;
+            cubeQuery.cube = true;
+            modes.push_back(cubeQuery);
+        }
         if (image.dimension == RdnaImageDimension::Dim2D && image.fmaskCompatible && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u) {
             auto volume = mode;
             volume.dimension = RdnaImageDimension::Dim3D;
@@ -674,6 +697,18 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             auto plain = mode;
             plain.dimension = image.dimension == RdnaImageDimension::Dim1DArray ? RdnaImageDimension::Dim1D : image.dimension == RdnaImageDimension::Dim2DArray ? RdnaImageDimension::Dim2D : RdnaImageDimension::Dim2DMsaa;
             modes.push_back(plain);
+        }
+        // The live T# controls whether an image load has samples. A multisample
+        // instruction can also address a single-sample 2D descriptor (GT7 uses
+        // this for fallback textures); emit an ordinary image fetch in that mode.
+        if (image.dimension == RdnaImageDimension::Dim2DMsaa || image.dimension == RdnaImageDimension::Dim2DMsaaArray) {
+            auto single = mode;
+            single.dimension = image.dimension == RdnaImageDimension::Dim2DMsaaArray ? RdnaImageDimension::Dim2DArray : RdnaImageDimension::Dim2D;
+            modes.push_back(single);
+            if (image.dimension == RdnaImageDimension::Dim2DMsaaArray) {
+                single.dimension = RdnaImageDimension::Dim2D;
+                modes.push_back(single);
+            }
         }
         if (image.dimension == RdnaImageDimension::Dim2DArray) {
             mode.cube = true;
@@ -777,7 +812,7 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
 const char* ResourceMaterializer::UnnormalizedSampleMismatch(const ImageResource& image) {
     if (image.indirectRoot != ImageResource::NoIndirectImage) return "samples an image selected at run time";
     if (image.constantSwizzle) return nullptr;
-    if ((image.dimension != RdnaImageDimension::Dim1D && image.dimension != RdnaImageDimension::Dim2D) || image.cube) return "samples a 1D-array, 2D-array, 3D, cube or multisampled image";
+    if ((image.dimension != RdnaImageDimension::Dim1D && image.dimension != RdnaImageDimension::Dim2D && image.dimension != RdnaImageDimension::Dim3D) || image.cube) return "samples a 1D-array, 2D-array, cube or multisampled image";
     if (image.depthCompare) return "is used with depth comparison";
     if (image.conversionFormat != IrBufferFormat::Invalid || image.packed) return "samples an image that needs a format conversion or packed access";
     return nullptr;
@@ -818,7 +853,11 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
         }
         if (mode.numericClass == decoded.numericClass && mode.dimension == decoded.dimension && mode.conversionFormat == decoded.conversionFormat && mode.packedFormat == decoded.packedFormat && mode.cube == decoded.cube && mode.depthBits == decoded.depthBits && mode.depthUnorm16 == decoded.depthUnorm16 && mode.srgbDecode == decoded.srgbDecode) return index;
     }
-    if (image.dimension == RdnaImageDimension::Dim1D && decoded.dimension != RdnaImageDimension::Dim1D) throw std::runtime_error("image address has too few coordinate components");
+    if (image.dimension == RdnaImageDimension::Dim1D && decoded.dimension != RdnaImageDimension::Dim1D) {
+        char detail[320];
+        std::snprintf(detail, sizeof(detail), "image address has too few coordinate components: pc=%x descriptor dimension=%u class=%u format=%u cube=%u read=%u write=%u (T# %08x %08x %08x %08x %08x %08x %08x %08x)", image.firstUsePc, static_cast<unsigned>(decoded.dimension), static_cast<unsigned>(decoded.numericClass), static_cast<unsigned>(format), decoded.cube, image.read, image.written, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]);
+        throw std::runtime_error(detail);
+    }
     if (image.foldTexelOffsetsOnly) throw std::runtime_error("image sample with a texel offset that is not a constant takes only images an unnormalized S# can sample without VK_KHR_maintenance8 and shaderImageGatherExtended");
     const auto describe = [](IrTextureNumericClass numeric, RdnaImageDimension dimension, IrBufferFormat conversion, IrBufferFormat packed, bool cube, bool depthBits, bool depthUnorm16, bool srgb) {
         return "{class " + std::to_string(static_cast<int>(numeric)) + ", dim " + std::to_string(static_cast<int>(dimension)) + ", conversion " + std::to_string(static_cast<int>(conversion)) + ", packed " + std::to_string(static_cast<int>(packed)) + ", cube " + std::to_string(cube) + ", depthBits " + std::to_string(depthBits) + ", unorm16 " + std::to_string(depthUnorm16) + ", srgb " + std::to_string(srgb) + "}";
@@ -972,6 +1011,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     plan.shaderHash = source.shaderHash;
     plan.userDataBase = source.userDataBase;
     plan.userDataCount = source.userDataCount;
+    plan.gpuResolved = program.Metadata().gpuResolvedResources;
     plan.srgbDecodeFormats = source.srgbDecodeFormats;
     plan.memoryInfo = source.memoryInfo;
     plan.descriptorSources = source.descriptorSources;
@@ -1012,6 +1052,21 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     const IrResourcePlan& plan = program;
     if (!plan.resourceTrackingComplete) {
         throw std::runtime_error("ResourceMaterializer::Materialize requires a completed resource plan");
+    }
+    if (plan.gpuResolved) {
+        if (runtime.userData.size() < plan.userDataCount) throw std::runtime_error("runtime user data is smaller than the shader user data count");
+        ResourceSnapshot userOnly;
+        userOnly.userData.assign(runtime.userData.begin(), runtime.userData.begin() + plan.userDataCount);
+        // Placeholders where CPU-resolved programs keep their descriptors.
+        DescriptorValue buffer, image, sampler;
+        buffer.dwordCount = 4u;
+        image.dwordCount = 8u;
+        sampler.dwordCount = 4u;
+        userOnly.buffers.assign(plan.info.buffers.size(), buffer);
+        userOnly.images.assign(plan.info.images.size(), image);
+        userOnly.samplers.assign(plan.info.samplers.size(), sampler);
+        snapshot = std::move(userOnly);
+        return;
     }
     if (plan.requiresSpecializationMemory && runtime.readMemory == nullptr) {
         throw std::runtime_error("ResourceMaterializer::Materialize requires runtime memory access for indirect images");

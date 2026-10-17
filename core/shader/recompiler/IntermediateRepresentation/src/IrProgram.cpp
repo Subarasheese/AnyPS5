@@ -638,11 +638,7 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
                 if (arg->Parent() != nullptr && !instructionPositions.contains(arg)) {
                     fail("value IR argument has a foreign definition");
                 }
-                const auto& uses = arg->OperandUses();
-                const auto use = std::find_if(uses.begin(), uses.end(), [&](const IrUse& candidate) {
-                    return candidate.user == inst && candidate.operand == argIndex;
-                });
-                if (use == uses.end()) {
+                if (!inst->HasValidArgumentUse(argIndex)) {
                     fail(std::string(IrOpcodeName(inst->Opcode())) + " argument " + std::to_string(argIndex) + " is absent from " + std::string(IrOpcodeName(arg->Opcode())) + " reverse uses");
                 }
             }

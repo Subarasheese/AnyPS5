@@ -139,7 +139,8 @@ void CheckBindings(const IrProgram& program, const CompiledBindingLayout& bindin
 
 void EmitBaseHeader(SpirvModule& module, const IrProgram& program) {
     module.EmitCapability(spv::CapabilityShader);
-    const bool physical = program.Info().usesDma || program.Resources().stage == IrShaderStage::Mesh;
+    const bool gpuTables = program.Metadata().gpuResolvedResources && (!program.Info().images.empty() || !program.Info().samplers.empty());
+    const bool physical = program.Info().usesDma || program.Resources().stage == IrShaderStage::Mesh || gpuTables;
     if (physical) {
         module.EmitCapability(spv::CapabilityInt64);
         module.EmitCapability(spv::CapabilityPhysicalStorageBufferAddresses);
@@ -391,15 +392,18 @@ void DefineDescriptors(SpirvEmitterState& state) {
         state.module.AddName(state.pushConstantVariable, "vsharp");
     }
     for (const IrDescriptorBinding& binding : layout.descriptors) {
+        // GPU-resolved programs bind images and samplers from the global heaps (RuntimeAbi::NativeHeap).
+        const bool nativeHeap = state.program.Metadata().gpuResolvedResources && (binding.kind == DescriptorBindingKind::Samplers || ImageBindingResourceClass(binding.kind) != ImageResourceClass::None);
         const auto Define = [&](std::uint32_t type, const char* name, std::uint32_t storage = spv::StorageClassStorageBuffer) {
             const auto variable = state.module.DefineGlobalVariable(TypePointer(state, storage, type), storage);
             state.module.AddName(variable, name);
-            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, state.fragmentDescriptorSet && stage == IrShaderStage::Pixel ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet);
-            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, NativeBinding(stage, binding.kind));
+            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, nativeHeap ? RuntimeAbi::NativeHeap::Set : state.fragmentDescriptorSet && stage == IrShaderStage::Pixel ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet);
+            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, NativeBinding(nativeHeap ? IrShaderStage::Compute : stage, binding.kind));
             return variable;
         };
         const auto ArrayType = [&](std::uint32_t type) {
             const bool heap = binding.kind == DescriptorBindingKind::Samplers || ImageBindingResourceClass(binding.kind) != ImageResourceClass::None;
+            if (nativeHeap) return state.module.Type(spv::OpTypeArray, type, ConstantU32(state, binding.kind == DescriptorBindingKind::Samplers ? RuntimeAbi::NativeHeap::SamplerCapacity : RuntimeAbi::NativeHeap::ImageCapacity));
             const auto count = static_cast<std::uint32_t>(binding.resources.size());
             const auto length = heap && !state.registrationModules ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::HeapCountBase + static_cast<std::uint32_t>(binding.kind), count) : ConstantU32(state, count);
             return state.module.Type(spv::OpTypeArray, type, length);

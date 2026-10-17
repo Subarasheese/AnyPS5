@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
 #include "prx/libc/include/general/LogMacros.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -35,6 +36,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
     std::exception_ptr failure;
     std::string dump;
     try {
+        Driver::captureRequest(request);
         auto handle = ShaderRecompiler::PrepareShader(request, preparation);
         return handle;
     } catch (...) {
@@ -141,7 +143,7 @@ bool RawGraphicsDrawn() {
 namespace {
 
 void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
-    prepared.settled.wait(lock, [&] { return !prepared.pending; });
+    prepared.settled.wait(lock, [&] { return !prepared.pending && prepared.pendingAbis.empty(); });
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
 }
 
@@ -196,6 +198,7 @@ struct ShaderPreparationTransaction::State {
     static thread_local State* active;
     std::unique_lock<std::mutex> lock{writers, std::defer_lock};
     std::map<PreparedShaders*, Change> changes;
+    std::vector<std::function<void()>> afterCommit;
     bool failed = false;
 
     void Hold() {
@@ -249,6 +252,11 @@ void ShaderPreparationTransaction::Hold() {
     root->Hold();
 }
 
+void ShaderPreparationTransaction::AfterCommit(std::function<void()> action) {
+    require(!committed, "shader preparation transaction is already committed");
+    root->afterCommit.push_back(std::move(action));
+}
+
 void ShaderPreparationTransaction::Commit() {
     require(!committed && !root->failed, "shader preparation transaction was aborted");
     if (state != nullptr) {
@@ -276,6 +284,11 @@ void ShaderPreparationTransaction::Commit() {
         }
     }
     committed = true;
+    if (state != nullptr) {
+        if (state->lock.owns_lock()) state->lock.unlock();
+        for (auto& action : state->afterCommit) action();
+        state->afterCommit.clear();
+    }
 }
 
 bool FusedHullHeader(const ShaderSnapshot& snapshot, Shader used, const Shader& registered) {
@@ -402,9 +415,15 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
     ShaderRecompiler::BuildPreparedShaderKey(request, key);
     std::unique_lock lock(snapshot.prepared->mutex);
-    AwaitRegisteredPreparation(*snapshot.prepared, lock);
-    for (const auto& entry : snapshot.prepared->entries) {
-        if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
+    for (;;) {
+        if (snapshot.prepared->failure != nullptr) std::rethrow_exception(snapshot.prepared->failure);
+        for (const auto& entry : snapshot.prepared->entries) {
+            if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
+        }
+        if (!snapshot.prepared->pending && snapshot.prepared->pendingAbis.empty()) break;
+        // An unrelated ABI variant must not hold up an already prepared draw.
+        // Retry on each publication; the producer holds this same mutex.
+        snapshot.prepared->settled.wait(lock);
     }
     ReportPreparedAtUse(snapshot, request);
     auto handle = PrepareShaderWithDiagnostics(request);
@@ -689,6 +708,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     auto& request = plan->request.emplace(ShaderRecompiler::RecompileRequest{{stage, address, code, snapshot.headerAddress, snapshot.header}, {wave, firstUser, plan->userData, compute, pixel, vertex, plan->memory, RegisteredFloatMode(snapshot)}, stage == Stage::Compute ? device.ComputeTarget(wave) : device.Target(), {0, 0, 0, 128}, graphics});
     if (graphics && graphics->mesh) request.layout.pushConstantSizeBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;
     if (pixel && device.GraphicsPipelineLibraries()) request.layout.pushConstantOffsetBytes = Graphics::FixedPushOffset(Stage::Fragment);
+    Driver::captureRequest(request);
     return plan;
 }
 
@@ -853,7 +873,7 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
             std::lock_guard lock(prepared.mutex);
             prepared.entries.insert(prepared.entries.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
             if (failure == nullptr && !plan->abiKey.empty()) prepared.registeredAbis.push_back(std::move(plan->abiKey));
-            prepared.failure = failure;
+            if (failure != nullptr) prepared.failure = failure;
             prepared.pending = false;
         }
         prepared.settled.notify_all();
@@ -945,6 +965,8 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
 }
 
 void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
+    // The native renderer translates programs itself (no emulator preparation).
+    if (Native::GpuNative()) return;
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.ResolveGraphicsStagesAbi");
     ShaderPreparationTransaction transaction;
@@ -1021,6 +1043,8 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
 }
 
 void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
+    // The native renderer translates programs itself (no emulator preparation).
+    if (Native::GpuNative()) return;
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.ResolveAbi");
     ShaderPreparationTransaction transaction;
@@ -1052,6 +1076,55 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     struct RegisteredAbiKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, RegisteredAbiKeyStorage>();
     BuildRegisteredAbiKey(state, *localDevice, key);
+    if (AsyncRegistrationPrepare()) {
+        // Interpolant mapping has already produced the guest registers. The
+        // native artifact can be prepared concurrently without changing them.
+        auto plan = PlanRegistered(*snapshot, *localDevice, state, false);
+        if (plan != nullptr) {
+            plan->prebuildDevice = localDevice;
+            plan->abiKey = key;
+            transaction.AfterCommit([snapshot, plan = std::shared_ptr<RegisteredPreparation>(std::move(plan))] {
+                {
+                    std::lock_guard lock(snapshot->prepared->mutex);
+                    auto& prepared = *snapshot->prepared;
+                    if (std::ranges::find(prepared.registeredAbis, plan->abiKey) != prepared.registeredAbis.end() ||
+                        std::ranges::find(prepared.pendingAbis, plan->abiKey) != prepared.pendingAbis.end()) return;
+                    prepared.pendingAbis.push_back(plan->abiKey);
+                }
+                const auto task = [snapshot, plan] {
+                    std::vector<PreparedShaders::Entry> entries;
+                    std::exception_ptr failure;
+                    try { entries = PrepareRegistered(*plan); }
+                    catch (...) { failure = std::current_exception(); }
+                    {
+                        std::lock_guard lock(snapshot->prepared->mutex);
+                        auto& prepared = *snapshot->prepared;
+                        for (auto& entry : entries) {
+                            if (std::ranges::none_of(prepared.entries, [&](const auto& existing) {
+                                return existing.codeOffset == entry.codeOffset && existing.handle->artifact == entry.handle->artifact;
+                            })) prepared.entries.push_back(std::move(entry));
+                        }
+                        if (failure != nullptr) prepared.failure = failure;
+                        else prepared.registeredAbis.push_back(plan->abiKey);
+                        std::erase(prepared.pendingAbis, plan->abiKey);
+                    }
+                    snapshot->prepared->settled.notify_all();
+                };
+                try { SubmitRegistrationPreparation(task); }
+                catch (...) {
+                    {
+                        std::lock_guard lock(snapshot->prepared->mutex);
+                        snapshot->prepared->failure = std::current_exception();
+                        std::erase(snapshot->prepared->pendingAbis, plan->abiKey);
+                    }
+                    snapshot->prepared->settled.notify_all();
+                    throw;
+                }
+            });
+        }
+        transaction.Commit();
+        return;
+    }
     const auto prepare = [&] {
         const auto plan = PlanRegistered(*snapshot, *localDevice, state, false);
         if (plan == nullptr) return std::vector<PreparedShaders::Entry>{};
@@ -1092,6 +1165,8 @@ std::uint64_t NullPixelProgramAddress() {
 }
 
 void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
+    // The native renderer translates programs itself (no emulator preparation).
+    if (Native::GpuNative()) return;
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.ResolveGraphicsAbi");
     CheckFailure();
@@ -1197,6 +1272,8 @@ ShaderSnapshot PrepareNullPixelProgram(const VulkanDevice& device) {
 }
 
 void Driver::RegisterShader(const Shader* shader) {
+    if (Native::Enabled()) Native::RecordShader(shader);
+    if (Native::GpuNative()) return;
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.Register");
     ShaderPreparationTransaction transaction;

@@ -16,6 +16,7 @@ namespace ShaderRecompiler {
 
 inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants, const std::set<std::uint32_t>& specializedIds) {
     std::set<std::uint32_t> packed;
+    std::set<std::uint32_t> rawUint;
     bool dualSource = false;
     for (const auto& constant : constants) {
         if (constant.id == PipelineSpecialization::DualSourceBlend) {
@@ -23,7 +24,8 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
             dualSource = constant.value != 0u;
         }
         if (constant.id < PipelineSpecialization::ExportPackingBase || constant.id >= PipelineSpecialization::ExportPackingBase + 8u) continue;
-        if (constant.value > static_cast<std::uint32_t>(ColorExportPacking::Unorm10_11_11)) throw std::runtime_error("invalid prepared fragment export packing");
+        if (constant.value > static_cast<std::uint32_t>(ColorExportPacking::RawUint32)) throw std::runtime_error("invalid prepared fragment export packing");
+        if (constant.value == static_cast<std::uint32_t>(ColorExportPacking::RawUint32)) rawUint.insert(constant.id - PipelineSpecialization::ExportPackingBase);
         if (constant.value != static_cast<std::uint32_t>(ColorExportPacking::None)) packed.insert(constant.id - PipelineSpecialization::ExportPackingBase);
     }
     if (packed.empty() && !dualSource) return words;
@@ -72,7 +74,7 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
     for (const auto location : packed) {
         const auto variable = output(location);
         if (variable == 0u) continue;
-        if (!specializedIds.contains(PipelineSpecialization::ExportPackingBase + location)) throw std::runtime_error("fragment output " + std::to_string(location) + " has no 10_11_11 unorm packing path");
+        if (!rawUint.contains(location) && !specializedIds.contains(PipelineSpecialization::ExportPackingBase + location)) throw std::runtime_error("fragment output " + std::to_string(location) + " has no 10_11_11 unorm packing path");
         if (!floatVectorPointer(outputs.at(variable))) throw std::runtime_error("packed fragment output " + std::to_string(location) + " is not a float4");
         retyped.insert(variable);
     }

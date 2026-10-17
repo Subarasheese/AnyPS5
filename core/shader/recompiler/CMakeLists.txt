@@ -215,6 +215,9 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            # Graphics diagnostics only serialize results and record their source identity.
+            "ShaderDiskCache::EncodeResult"
+            "ShaderDiskCache::SourceVersion"
             BuildBarycentricGeometryShader
             BuildPreparedShaderKey
             BuildRectListShaders

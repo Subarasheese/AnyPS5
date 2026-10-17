@@ -57,6 +57,10 @@ struct PipelineSetLayouts {
     bool split = false;
     std::span<const std::uint32_t> mainKey;
     std::span<const std::uint32_t> fragmentKey;
+    // The native renderer's bindless image heap (RuntimeAbi::NativeHeap::Set = 2) and the empty
+    // layout of set 1 before it; null for every other pipeline.
+    VkDescriptorSetLayout heap = VK_NULL_HANDLE;
+    VkDescriptorSetLayout empty = VK_NULL_HANDLE;
 };
 
 class DescriptorCache {

@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x=64) in;
+layout(binding=0,std430) readonly buffer Input { uint src[]; };
+layout(binding=1,std430) writeonly buffer Output { uint dst[]; };
+layout(push_constant) uniform Params { uint width; uint height; uint bytes; uint flags; } p;
+void main() {
+ uint x=gl_GlobalInvocationID.x, y=gl_GlobalInvocationID.y;
+ if(x>=p.width || y>=p.height) return;
+ uint pixel=y*p.width+x;
+ if((p.flags&255u)==240u) {
+  uint v=src[pixel];
+  dst[pixel]=(p.flags&256u)==0 ? (v>>21)|(((v>>10)&2047u)<<11)|((v&1023u)<<22)
+                              : (v>>22)|(((v>>11)&2047u)<<10)|((v&2047u)<<21);
+  return;
+ }
+ uint lanes=p.bytes/4; uint outWords[4];
+ for(uint w=0;w<lanes;w++) outWords[w]=0;
+ uint bits=p.bytes*2;
+ for(uint c=0;c<4;c++) {
+  uint other=((p.flags&255u)>>(2*c))&3;
+  uint from=(p.flags&256u)==0 ? c : other;
+  uint to=(p.flags&256u)==0 ? other : c;
+  uint off=from*bits; uint value=src[pixel*lanes+off/32]>>(off%32);
+  if(bits<32) value&=(1u<<bits)-1;
+  uint target=to*bits; outWords[target/32]|=value<<(target%32);
+ }
+ for(uint w=0;w<lanes;w++) dst[pixel*lanes+w]=outWords[w];
+}

@@ -1,0 +1,68 @@
+#ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_NATIVE_INCLUDE_NATIVEIMAGES_HPP
+#define CORE_LIBS_PRX_LIBSCEAGCDRIVER_NATIVE_INCLUDE_NATIVEIMAGES_HPP
+
+// The native renderer's images and samplers. GT7 describes every texture it creates with a T# made
+// by its statically linked texture initializer (0x27d120) and every render target with the
+// render-target initializer (0x1638690); hooks on both hand those descriptions here, and each
+// becomes a native VkImage, detiled once from the game's (imported) memory when it is a texture.
+//
+// Translated shaders find their images from their own T# words: a global hash table (device
+// memory, RuntimeAbi::NativeHeap) maps the words to heap indices of descriptor set
+// NativeHeap::Set, one bindless array per image binding kind. A T# or S# the table does not hold
+// yet (a descriptor GT7 patched after initializing it, or a sampler, which has no initializer) is
+// appended by the shader to the table's miss region and registered after the batch.
+
+#include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+
+namespace AgcDriver::Graphics {
+struct ColorTarget;
+struct DepthTarget;
+}
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <span>
+
+namespace AgcDriver::Native {
+
+class NativeImages {
+public:
+    // The imported VkBuffer holding [address, address + bytes) and the offset of `address` in it.
+    using Locate = std::function<bool(std::uint64_t address, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset)>;
+
+    NativeImages(const Graphics::Context& context, Locate locate);
+    ~NativeImages();
+    NativeImages(const NativeImages&) = delete;
+    NativeImages& operator=(const NativeImages&) = delete;
+
+    // Device addresses of the lookup tables (SpirvTarget::nativeImageTable / nativeSamplerTable).
+    std::uint64_t ImageTable() const;
+    std::uint64_t SamplerTable() const;
+    VkDescriptorSetLayout HeapLayout() const;
+    VkDescriptorSet HeapSet() const;
+
+    // A color target's attachment view (and its image), recording the surface's creation if new.
+    VkImageView TargetView(VkCommandBuffer commands, const Graphics::ColorTarget& color, VkImage& image);
+    // A depth target's depth/stencil attachment view (GENERAL layout).
+    VkImageView DepthView(VkCommandBuffer commands, const Graphics::DepthTarget& depth);
+    // The image GT7 last rendered into at `address` (a display buffer), false when none.
+    bool Display(std::uint64_t address, VkImage& image, VkExtent2D& extent, VkFormat& format) const;
+
+    // On the recording thread, in the open batch before work that may use the resources: creates the
+    // images and samplers noted since the last call and records their uploads.
+    void Prepare(VkCommandBuffer commands);
+    // After the batch completed: frees its staging memory and takes the shaders' misses.
+    void Completed();
+
+private:
+    struct State;
+    std::unique_ptr<State> state;
+};
+
+// From the game's initializer hooks (any thread, before or after the native device exists).
+void NoteTextureDescriptor(std::span<const std::uint32_t, 8> words);
+void NoteRenderTarget(std::uint64_t address, std::uint64_t bytes);
+
+}
+
+#endif

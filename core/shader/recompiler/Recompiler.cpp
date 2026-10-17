@@ -12,6 +12,7 @@
 #include "SpirvBackend/SpirvSpecialization.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include <list>
 #include <functional>
 #include <map>
@@ -259,6 +260,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         tessellationLowering.Lower(program, inputInfo.vertex->tess);
     }
 
+    program.Metadata().gpuResolvedResources = request.target.gpuResolvedResources;
     constexpr SrtWalker srtWalker;
     srtWalker.BuildPlan(program);
     deadCodeEliminator.Eliminate(program);
@@ -423,7 +425,8 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     shaderInfoCollector.Collect(program, inputInfo);
 
     constexpr BindingAllocator bindingAllocator;
-    bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
+    // GPU-resolved shaders take every image property at run time, as registration modules do, in every stage.
+    bool registration = request.target.gpuResolvedResources || (request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment));
     auto bindings = bindingAllocator.Allocate(program, request.layout, registration);
 
     SpirvTargetOptions targetOptions {};
@@ -437,14 +440,29 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
     targetOptions.float64DenormPreserve = request.target.float64DenormPreserve;
     targetOptions.registrationModules = registration;
-    targetOptions.fragmentDescriptorSet = request.target.registrationModules;
+    // The native renderer binds every stage's buffers in one push-descriptor set.
+    targetOptions.fragmentDescriptorSet = request.target.registrationModules && !request.target.gpuResolvedResources;
+    targetOptions.nativeImageTable = request.target.nativeImageTable;
+    targetOptions.nativeSamplerTable = request.target.nativeSamplerTable;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
     result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
-    if (registration && result.spirv.size() > request.target.registrationWordLimit) {
+    bool optimizedRegistration = false;
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    // The cutoff bounds the module sent to the driver. Measuring the raw
+    // emitter output prematurely turns optimized-small fragment shaders into
+    // descriptor-specific variants, which cannot be prebuilt at registration.
+    if (registration && request.shader.stage == ShaderStage::Fragment) {
+        result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion,
+            request.target.spirvVersion, request.target.nonConstantImageOffsets, true);
+        optimizedRegistration = true;
+    }
+#endif
+    if (registration && !request.target.gpuResolvedResources && result.spirv.size() > request.target.registrationWordLimit) {
         registration = false;
+        optimizedRegistration = false;
         program.Metadata().bindingLayoutComplete = false;
         bindings = bindingAllocator.Allocate(program, request.layout, false);
         targetOptions.registrationModules = false;
@@ -461,6 +479,9 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         if (program.Info().images[index].indirectRoot != ImageResource::NoIndirectImage) result.runtimeImageResources.push_back(index);
     }
     result.hostSubgroupSize = HostSubgroupSize(request);
+    result.shaderDataUserRegisters = bindings.layout.userDataRegisters;
+    result.pushDataStartDword = bindings.layout.UsesPushData() ? bindings.layout.pushDataStartDword : ~0u;
+    result.dispatchThreadLimitDword = bindings.layout.dispatchThreadLimit ? bindings.layout.DispatchThreadLimitDword() : ~0u;
     result.vertexOffsetSgpr = program.Info().vertexOffsetSgpr;
     result.instanceOffsetSgpr = program.Info().instanceOffsetSgpr;
     result.vertexOffsetShared = program.Info().vertexOffsetShared;
@@ -495,7 +516,8 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     const bool embedded = !result.vertexInputs.empty() && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded;
     if (embedded) PrepareVertexInputSpecialization(result);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded);
+    if (!optimizedRegistration)
+        result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded);
     if (embedded) {
         std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> classes{};
         for (std::uint32_t kind = 1u; kind < 3u; ++kind) {
@@ -521,6 +543,74 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
+struct SpecializedCacheHeader {
+    std::uint64_t magic = 0x31444f4d53535041ull;
+    std::uint64_t keyBytes = 0;
+    std::uint64_t payloadBytes = 0;
+    std::uint64_t payloadHash = 0;
+};
+
+std::vector<std::byte> SpecializedDiskKey(std::span<const std::uint32_t> words,
+        const std::map<std::uint32_t, std::uint32_t>& constants, const SpirvTarget& target) {
+    std::vector<std::byte> key;
+    const auto append = [&](const auto& value) {
+        const auto bytes = std::as_bytes(std::span(&value, 1));
+        key.insert(key.end(), bytes.begin(), bytes.end());
+    };
+    append(ShaderDiskCache::SourceVersion());
+    append(target.vulkanVersion);
+    append(target.spirvVersion);
+    append(target.nonConstantImageOffsets);
+    append(words.size());
+    const auto bytes = std::as_bytes(words);
+    key.insert(key.end(), bytes.begin(), bytes.end());
+    append(constants.size());
+    for (const auto& [id, value] : constants) { append(id); append(value); }
+    const char* mode = std::getenv("APS5_SPIRV_OPT");
+    const auto modeBytes = mode != nullptr ? std::strlen(mode) : 0u;
+    append(modeBytes);
+    if (modeBytes != 0u) {
+        const auto* first = reinterpret_cast<const std::byte*>(mode);
+        key.insert(key.end(), first, first + modeBytes);
+    }
+    return key;
+}
+
+bool LoadSpecializedModule(const std::filesystem::path& path, std::span<const std::byte> key,
+        std::vector<std::uint32_t>& words) {
+    std::vector<std::byte> file;
+    if (!ReadWholeFile(path, file) || file.size() < sizeof(SpecializedCacheHeader)) return false;
+    SpecializedCacheHeader header;
+    std::memcpy(&header, file.data(), sizeof(header));
+    if (header.magic != SpecializedCacheHeader{}.magic || header.keyBytes != key.size() ||
+        header.keyBytes > file.size() - sizeof(header) || header.payloadBytes < 20u ||
+        header.payloadBytes % 4u != 0u || header.payloadBytes != file.size() - sizeof(header) - header.keyBytes) return false;
+    const auto savedKey = std::span(file).subspan(sizeof(header), header.keyBytes);
+    const auto payload = std::span(file).subspan(sizeof(header) + header.keyBytes);
+    if (!std::ranges::equal(savedKey, key) || HashBytes(payload) != header.payloadHash) return false;
+    words.resize(payload.size() / 4u);
+    std::memcpy(words.data(), payload.data(), payload.size());
+    if (words[0] != spv::MagicNumber) return false;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        if (count == 0u || count > words.size() - cursor) return false;
+        cursor += count;
+    }
+    return true;
+}
+
+void StoreSpecializedModule(const std::filesystem::path& path, std::span<const std::byte> key,
+        std::span<const std::uint32_t> words) {
+    const auto payload = std::as_bytes(words);
+    SpecializedCacheHeader header;
+    header.keyBytes = key.size(); header.payloadBytes = payload.size(); header.payloadHash = HashBytes(payload);
+    std::vector<std::byte> file(sizeof(header));
+    std::memcpy(file.data(), &header, sizeof(header));
+    file.insert(file.end(), key.begin(), key.end());
+    file.insert(file.end(), payload.begin(), payload.end());
+    static_cast<void>(WriteFileAtomically(path, file));
+}
+
 std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
@@ -542,7 +632,13 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
-    std::vector<std::uint32_t> materialized(words.begin(), words.begin() + 5);
+    const auto diskKey = ShaderDiskCache::Enabled() ? SpecializedDiskKey(words, supplied, target) : std::vector<std::byte>{};
+    const auto diskPath = diskKey.empty() ? std::filesystem::path{} :
+        ShaderDiskCache::EntryDirectory() / "specialized" / ShaderDiskCache::EntryName(diskKey);
+    std::vector<std::uint32_t> materialized;
+    const bool diskHit = !diskPath.empty() && LoadSpecializedModule(diskPath, diskKey, materialized);
+    if (!diskHit) {
+    materialized.assign(words.begin(), words.begin() + 5);
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
@@ -591,14 +687,29 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
 #endif
+    if (!diskPath.empty()) StoreSpecializedModule(diskPath, diskKey, materialized);
+    }
+    if (std::getenv("APS5_TRACE_PIPELINE_CREATE") != nullptr)
+        std::fprintf(stderr, "[specialized-cache] %s words=%zu\n", diskHit ? "hit" : "miss", materialized.size());
     auto module = std::make_shared<SpecializedModule>();
-    std::map<std::uint32_t, std::uint32_t> bindingNumbers;
+    std::map<std::uint32_t, std::uint32_t> bindingNumbers, descriptorSets;
+    bool computeEntry = false;
     for (std::size_t cursor = 5; cursor < materialized.size();) {
         const auto count = materialized[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
+        if (op == spv::OpEntryPoint && count >= 4u) computeEntry |= materialized[cursor + 1u] == spv::ExecutionModelGLCompute;
         if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
+        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationDescriptorSet) descriptorSets.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
         if (op == spv::OpVariable && count >= 4u) {
-            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end()) module->bindings.push_back(found->second);
+            const auto variable = materialized[cursor + 2u];
+            const auto set = descriptorSets.find(variable);
+            if (const auto found = bindingNumbers.find(variable); found != bindingNumbers.end()) {
+                // Spilled LDS is an auxiliary compute descriptor, supplied by
+                // workgroupMemoryDwords rather than the guest-resource plan.
+                const bool workgroupMemory = computeEntry && found->second == 0u &&
+                    set != descriptorSets.end() && set->second == WorkgroupMemoryDescriptorSet;
+                if (!workgroupMemory) module->bindings.push_back(found->second);
+            }
             module->pushData |= materialized[cursor + 3u] == spv::StorageClassPushConstant;
         }
         cursor += count;
@@ -661,7 +772,7 @@ std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t varian
     return entry->module;
 }
 
-std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet) {
+std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet, bool nativeHeap) {
     struct BindingPlanKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
     key.clear();
@@ -688,6 +799,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
+    key.push_back((fragmentDescriptorSet ? 1u : 0u) | (nativeHeap ? 2u : 0u));
     static PrimedSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
@@ -702,7 +814,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     std::call_once(plan->ready, [&] {
         try {
-            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, variant.artifact.registrationModule, fragmentDescriptorSet);
+            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, variant.artifact.registrationModule, fragmentDescriptorSet, nativeHeap);
         } catch (...) {
             plan->failure = std::current_exception();
         }
@@ -760,12 +872,15 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .vertexOffsetConflict = artifact.vertexOffsetConflict,
         .instanceOffsetConflict = artifact.instanceOffsetConflict,
         .hostSubgroupSize = artifact.hostSubgroupSize,
+        .shaderDataUserRegisters = artifact.shaderDataUserRegisters,
+        .pushDataStartDword = artifact.pushDataStartDword,
+        .dispatchThreadLimitDword = artifact.dispatchThreadLimitDword,
         .parameterExports = artifact.parameterExports,
         .fragmentParameters = artifact.fragmentParameters,
         .barycentricEmulation = artifact.barycentricEmulation,
         .variantId = artifact.variantId
     };
-    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
+    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules && !request.target.gpuResolvedResources, request.target.gpuResolvedResources);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};

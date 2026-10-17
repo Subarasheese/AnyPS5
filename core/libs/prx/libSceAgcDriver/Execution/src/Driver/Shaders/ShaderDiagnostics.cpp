@@ -1,10 +1,37 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "ShaderCacheDirectory.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <functional>
 #include <string_view>
 
 namespace AgcDriver::DriverDetail {
+
+void Driver::captureRequest(const ShaderRecompiler::RecompileRequest& request) {
+    static const char* directory = std::getenv("APS5_CAPTURE_SHADER_REQUESTS");
+    if (directory == nullptr || *directory == '\0') return;
+    try {
+        const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(request);
+        const auto bytes = std::as_bytes(std::span(text));
+        char name[96];
+        std::snprintf(name, sizeof(name), "request-%016llx-%zu.req",
+                      static_cast<unsigned long long>(ShaderRecompiler::HashBytes(bytes)), text.size());
+        const auto path = std::filesystem::path(directory) / name;
+        static std::mutex mutex;
+        std::lock_guard lock(mutex);
+        std::vector<std::byte> previous;
+        if (ShaderRecompiler::ReadWholeFile(path, previous)) {
+            if (!std::ranges::equal(previous, bytes)) throw std::runtime_error("request capture hash collision");
+            return;
+        }
+        std::filesystem::create_directories(path.parent_path());
+        if (!ShaderRecompiler::WriteFileAtomically(path, bytes)) throw std::runtime_error("cannot write request capture");
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[shader-capture] 0x%llx: %s\n",
+                      static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+    }
+}
 
 void Driver::reportSkip(const char* kind, const std::string& what) {
     static std::mutex reportedMutex;

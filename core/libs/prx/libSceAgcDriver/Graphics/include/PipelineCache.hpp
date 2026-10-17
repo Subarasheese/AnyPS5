@@ -23,7 +23,7 @@ public:
     VkPipelineCache Handle() const { return cache; }
 
 private:
-    void load(std::vector<std::byte>& initialData);
+    void load(std::vector<std::byte>& initialData, bool quiet = false);
     void save(bool final);
     void run();
 

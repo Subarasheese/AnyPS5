@@ -110,7 +110,8 @@ enum class ConservativeZExport : std::uint8_t {
 
 enum class ColorExportPacking : std::uint8_t {
     None,
-    Unorm10_11_11
+    Unorm10_11_11,
+    RawUint32
 };
 
 enum class RasterPrimitive : std::uint8_t {
@@ -168,6 +169,7 @@ struct ShaderVertexStageInfo {
     std::array<ShaderVertexBufferResource, MaxResources> resources;
     std::array<ShaderVertexResourceDestination, MaxResources> resourcesDst;
     std::uint32_t resourcesNum;
+    std::uint32_t paClVsOutCntl = 0;
     std::uint32_t fetchAttribReg;
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
@@ -241,6 +243,12 @@ struct SpirvTarget {
     bool registrationModules = false;
     std::uint32_t registrationWordLimit = 200000u;
     bool vertexSubgroups = true;
+    // The native GT7 renderer's shaders resolve their resources on the GPU: resource-table reads
+    // go through the BDA page table, buffers take their V# at run time, images their T# (no CPU
+    // capture or flattening per dispatch or draw).
+    bool gpuResolvedResources = false;
+    std::uint64_t nativeImageTable = 0;
+    std::uint64_t nativeSamplerTable = 0;
 };
 
 struct BindingLayout {
@@ -339,7 +347,9 @@ enum class DescriptorImageShape {
     Image2DArray,
     ImageCube,
     Image3D,
-    Image1DArray
+    Image1DArray,
+    Image2DMultisample,
+    Image2DMultisampleArray
 };
 
 enum class DescriptorRole {
@@ -499,6 +509,14 @@ struct CompiledShaderArtifact {
     bool vertexOffsetConflict = false;
     bool instanceOffsetConflict = false;
     std::uint32_t hostSubgroupSize = 0;
+    // The shader data block's layout for a driver that fills it per dispatch or draw (the native
+    // renderer): word i of the block is user-data register shaderDataUserRegisters[i] (counted from
+    // the request's userDataBaseRegister); the block is pushed at dword pushDataStartDword of the push
+    // constants when that is not ~0u, else bound as the ShaderData buffer; with dispatchThreadLimitDword
+    // not ~0u a partial-group dispatch's thread counts go there.
+    std::vector<std::uint32_t> shaderDataUserRegisters;
+    std::uint32_t pushDataStartDword = ~0u;
+    std::uint32_t dispatchThreadLimitDword = ~0u;
     std::vector<std::uint32_t> parameterExports;
     std::vector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;

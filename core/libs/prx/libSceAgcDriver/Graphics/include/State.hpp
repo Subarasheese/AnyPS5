@@ -36,6 +36,7 @@ struct ColorTarget {
     VkFormat format;
     std::size_t bytes;
     std::uint8_t componentMapping;
+    std::uint32_t guestFormat = 0; // explicit storage format when attachment packing differs
     ColorTileMode tileMode = ColorTileMode::Linear;
     std::uint32_t elementBytes = 4;
     ShaderRecompiler::ColorExportPacking packing = ShaderRecompiler::ColorExportPacking::None;
@@ -58,6 +59,7 @@ struct ColorTarget {
     std::uint64_t arrayAddress = 0;
     std::uint32_t arrayLastSlice = 0;
     std::uint32_t arraySlice = 0;
+    std::uint32_t viewLayers = 1;
     std::uint32_t exportIndex = 0;
     bool uintExport = false;
     std::uint32_t pipeBankXor = 0;
@@ -100,6 +102,7 @@ struct State {
     std::vector<VkPipelineColorBlendAttachmentState> blends;
     bool hasColorTarget;
     bool rectList = false;
+    bool polygon = false;
     bool dualSourceBlend = false;
     VkExtent2D renderExtent;
     VkPrimitiveTopology topology;
@@ -195,6 +198,7 @@ inline constexpr std::array<DrawKeyRange, 49> DrawKeyRegisters{{
     {RegisterBank::UserConfig, 0x242, 1}, {RegisterBank::UserConfig, 0x24b, 1}, {RegisterBank::UserConfig, 0x25b, 1},
 }};
 bool SplitsAlternateAlpha(const State& state);
+bool UsesLogicalColorOrder(const State& state, const ColorTarget& color);
 // Whether DrawKeyRegisters holds the read.
 bool DrawKeyCovers(RegisterRead read);
 

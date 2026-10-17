@@ -126,8 +126,13 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
         if (allowFolding) optimizer.RegisterPass(spvtools::CreateCCPPass());
         optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true));
         if (full) optimizer.RegisterPass(spvtools::CreateLoopUnrollPass(true));
-        optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
-            .RegisterPass(spvtools::CreateRedundancyEliminationPass());
+        optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass());
+        // Global redundancy elimination copies the accumulated value-number
+        // table along the dominator tree. Large game shaders can spend minutes
+        // here during draw-time specialization. Keep elimination local in the
+        // default path; exhaustive optimization remains available in full mode.
+        if (full) optimizer.RegisterPass(spvtools::CreateRedundancyEliminationPass());
+        else optimizer.RegisterPass(spvtools::CreateLocalRedundancyEliminationPass());
         if (full) optimizer.RegisterPass(spvtools::CreateCombineAccessChainsPass());
         if (allowFolding) optimizer.RegisterPass(spvtools::CreateSimplificationPass());
         if (full) {
