@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <span>
@@ -19,7 +20,7 @@ namespace AgcDriver::Graphics {
 namespace {
 
 constexpr std::uint32_t FileMagic = 0x50565041u;
-constexpr std::uint32_t FileFormat = 1;
+constexpr std::uint32_t FileFormat = 2;
 
 bool profiling() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -51,6 +52,13 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         char name[160];
         std::snprintf(name, sizeof(name), "vk-pipelines-%04x-%04x-%08x-%s.bin", properties.vendorID, properties.deviceID, properties.driverVersion, uuid.c_str());
         path = directory / name;
+        std::error_code error;
+        const auto stale = std::filesystem::file_time_type::clock::now() - std::chrono::minutes(10);
+        const auto prefix = path.filename().string() + ".tmp.";
+        for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+            if (!entry.is_regular_file(error) || !entry.path().filename().string().starts_with(prefix)) continue;
+            if (entry.last_write_time(error) < stale) std::filesystem::remove(entry.path(), error);
+        }
     }
     std::vector<std::byte> initialData;
     if (!path.empty()) {

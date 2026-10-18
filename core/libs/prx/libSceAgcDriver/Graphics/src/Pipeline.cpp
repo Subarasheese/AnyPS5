@@ -204,8 +204,8 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
 
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (resources.heap != VK_NULL_HANDLE) return false;
     if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || state.depthBiasPerFace || state.rectList || SplitsAlternateAlpha(state)) return false;
+    if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.stage == Stage::Fragment; })) return false;
     keys = {};
     for (const auto& shader : shaders) {
         const auto identity = shader.program->Identity();
@@ -277,6 +277,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     appendKey(keys.fragmentOutput, HostSampleMask(state));
     if (!resources.split) {
         appendKey(keys.layout, pushStagesOf(context));
+        appendKey(keys.layout, resources.heap != VK_NULL_HANDLE);
         for (const auto word : resources.mainKey) appendKey(keys.layout, word);
         keys.preRasterizationLayout = keys.fragmentLayout = keys.layout;
         return true;
@@ -644,6 +645,13 @@ bool Pipeline::Prebuild(const Context& context, const State& state, const Vertex
     } scope;
     const Pipeline pipeline(context, state, vertexInput, resources, shaders);
     return prebuilt;
+}
+
+void Pipeline::PrepareOptimization() const {
+    if (optimized == nullptr) return;
+    optimized->Schedule();
+    WaitForOptimizedPipelines(context.device);
+    Require(optimized->handle.load() != VK_NULL_HANDLE, "pipeline preparation optimization failed");
 }
 
 Pipeline::~Pipeline() {

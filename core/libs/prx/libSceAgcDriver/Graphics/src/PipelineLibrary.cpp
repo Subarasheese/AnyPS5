@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineEntryCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
@@ -212,9 +213,12 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     static const bool backgroundLinking = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
     const bool optimize = backgroundLinking && context.pipelineLinkTimeOptimization;
     std::vector<VkPipeline> libraries;
+    Key linkKey;
     for (std::size_t part = 0; part < flags.size(); ++part) {
         if (part == 0 && mesh) continue;
         const auto key = Combined(*partKeys[part], *contextKeys[part]);
+        linkKey.insert(linkKey.end(), key.begin(), key.end());
+        linkKey.push_back(static_cast<std::byte>(part));
         auto& cache = device.parts[part];
         if (const auto found = cache.find(key); found != cache.end()) {
             libraries.push_back(found->second);
@@ -259,8 +263,12 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         lock.unlock();
         VkResult created;
         {
-            auto pipelineCacheLock = context.LockPipelineCacheForUse();
-            created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
+            auto entryKey = key;
+            entryKey.push_back(static_cast<std::byte>(part));
+            created = CreateWithEntryCache(context, entryKey, [&](VkPipelineCache entry) {
+                auto pipelineCacheLock = context.LockPipelineCacheForUse();
+                return context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, entry, 1, &create, nullptr, &handle);
+            });
         }
         lock.lock();
         Check(created, "vkCreateGraphicsPipelines library");
@@ -306,7 +314,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         const auto cache = context.pipelineCache;
         const auto cacheSynchronization = context.pipelineCacheSynchronization;
         const auto libraryLayout = fullLayout;
-        std::function<void()> relink = [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, &store, devicePointer = &device] {
+        std::function<void()> relink = [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, &store, devicePointer = &device, entryContext = context, linkKey] {
             if (slot->released.load()) return;
             VkPipelineLibraryCreateInfoKHR linked{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
             linked.libraryCount = static_cast<std::uint32_t>(libraries.size());
@@ -315,10 +323,10 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
             create.layout = libraryLayout;
             VkPipeline result = VK_NULL_HANDLE;
-            const auto pipelineCreationResult = [&] {
+            const auto pipelineCreationResult = CreateWithEntryCache(entryContext, linkKey, [&](VkPipelineCache entry) {
                 auto pipelineCacheLock = cacheSynchronization != nullptr ? cacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
-                return createPipelines(slot->device, cache, 1, &create, nullptr, &result);
-            }();
+                return createPipelines(slot->device, entry != VK_NULL_HANDLE ? entry : cache, 1, &create, nullptr, &result);
+            });
             if (pipelineCreationResult != VK_SUCCESS) return;
             slot->handle.store(result);
             if (slot->released.load()) {

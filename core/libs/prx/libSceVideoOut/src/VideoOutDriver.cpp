@@ -696,7 +696,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
             padInput.Update();
             updateDisplayRefreshRate();
             pollHostHdr();
-            mouseInput.UpdateCapture(!padInput.MouseModeEnabled());
+            mouseInput.UpdateCapture(!padInput.MouseModeEnabled(), (SDL_GetWindowFlags(window.Handle()) & SDL_WINDOW_FULLSCREEN) != 0);
             if (current) {
                 require(current->timing != nullptr, "missing presentation timing");
                 if (!flipFinished.valid()) {

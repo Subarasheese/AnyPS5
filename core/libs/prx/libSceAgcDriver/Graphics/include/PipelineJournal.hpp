@@ -92,6 +92,8 @@ public:
 
 struct PipelineJournalHooks {
     std::function<bool(const ShaderRecompiler::RecompileResult& shader, bool pushConstants)> compute;
+    std::function<bool(const GraphicsPipelineRecipe& recipe, std::span<const CompiledShader> shaders)> nativeGraphics;
+    bool prepareAll = false;
 };
 
 // The journal belongs to the device that wrote it, named by the same properties as the driver's

@@ -110,6 +110,8 @@ private:
     bool orderReleased(std::uint32_t queue, std::uint64_t received) const;
     void noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool blocked);
     void reportPresents(double waitedMs, std::size_t inFlight);
+    void runCompileStatus();
+    void presentCompileStatus();
     static bool stampValidate();
     static bool dataHits();
     static bool verifyDataHits();
@@ -389,6 +391,10 @@ private:
     std::map<std::uint32_t, EopFlip> eopFlips;
     std::uint32_t nextEopToken = EopFlipTokenBase;
     DevicePointer device;
+    std::mutex presentationMutex;
+    std::optional<PresentationWindow> statusWindow;
+    std::atomic<std::int64_t> lastGamePresentNs{0};
+    std::once_flag compileStatusStarted;
 
     std::mutex labelStoresMutex;
     std::unordered_map<std::uint64_t, std::array<LabelStore, LabelStoreHistory>> labelStores;

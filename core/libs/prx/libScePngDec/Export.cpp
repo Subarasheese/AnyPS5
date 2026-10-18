@@ -1,6 +1,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <new>
 #include <optional>
 #include <span>
@@ -8,6 +10,7 @@
 #include <utility>
 #include "Decoder/Png.hpp"
 #include "SceTypes.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestWrites.hpp"
 
 static_assert(sizeof(PngDecCreateParam) == 0xC);
 static_assert(sizeof(PngDecParseParam) == 0x10);
@@ -158,6 +161,9 @@ int32_t APS5_VABI scePngDecDecode(void* handle, const PngDecDecodeParam* param, 
         }
     }
 
+    AgcDriverNoteGuestWrite_nid_postfix(param->image_mem_addr, static_cast<std::size_t>((header->height - 1) * pitch + rowSize));
+    static const bool log = std::getenv("APS5_NATIVE_LOG") != nullptr;
+    if (log) std::fprintf(stderr, "[png] decoded %ux%u into 0x%llx (pitch %llu)\n", header->width, header->height, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(param->image_mem_addr)), static_cast<unsigned long long>(pitch));
     if (image_info) fillImageInfo(*header, image_info);
     if (header->width > MAX_PACKED_DIMENSION || header->height > MAX_PACKED_DIMENSION) return 0;
     return static_cast<std::int32_t>(header->width << 16 | header->height);

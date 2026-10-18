@@ -1021,9 +1021,9 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VMulF32:
         return floatBinary(inst, IrOpcode::FPMul32, false);
     case RdnaOpcode::VMinF32:
-        return ieeeMode ? ieeeMinMaxF32(inst, IrOpcode::FPMin32) : floatBinary(inst, IrOpcode::FPMin32, false);
+        return ieeeMode && !hostFloat ? ieeeMinMaxF32(inst, IrOpcode::FPMin32) : floatBinary(inst, IrOpcode::FPMin32, false);
     case RdnaOpcode::VMaxF32:
-        return ieeeMode ? ieeeMinMaxF32(inst, IrOpcode::FPMax32) : floatBinary(inst, IrOpcode::FPMax32, false);
+        return ieeeMode && !hostFloat ? ieeeMinMaxF32(inst, IrOpcode::FPMax32) : floatBinary(inst, IrOpcode::FPMax32, false);
     case RdnaOpcode::VDivScaleF32:
         return vDivScaleF32(inst);
     case RdnaOpcode::VDivFmasF32:
@@ -1048,11 +1048,11 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VMadLegacyF32:
         return vFmaLegacyF32(inst, false);
     case RdnaOpcode::VMin3F32:
-        return ieeeMode ? ieeeMinMaxF32(inst, IrOpcode::FPMinTri32) : floatTernary(inst, IrOpcode::FPMinTri32, false, false);
+        return ieeeMode && !hostFloat ? ieeeMinMaxF32(inst, IrOpcode::FPMinTri32) : floatTernary(inst, IrOpcode::FPMinTri32, false, false);
     case RdnaOpcode::VMax3F32:
-        return ieeeMode ? ieeeMinMaxF32(inst, IrOpcode::FPMaxTri32) : floatTernary(inst, IrOpcode::FPMaxTri32, false, false);
+        return ieeeMode && !hostFloat ? ieeeMinMaxF32(inst, IrOpcode::FPMaxTri32) : floatTernary(inst, IrOpcode::FPMaxTri32, false, false);
     case RdnaOpcode::VMed3F32:
-        return ieeeMode ? ieeeMinMaxF32(inst, IrOpcode::FPMedTri32) : floatTernary(inst, IrOpcode::FPMedTri32, false, false);
+        return ieeeMode && !hostFloat ? ieeeMinMaxF32(inst, IrOpcode::FPMedTri32) : floatTernary(inst, IrOpcode::FPMedTri32, false, false);
     case RdnaOpcode::VDot2cF32F16:
         return vDot2cF32F16(inst);
     case RdnaOpcode::VDot2F32F16:

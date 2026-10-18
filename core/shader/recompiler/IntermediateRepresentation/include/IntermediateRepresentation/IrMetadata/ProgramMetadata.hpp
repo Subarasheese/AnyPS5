@@ -24,6 +24,7 @@ struct IrProgramMetadata {
     // SpirvTarget::gpuResolvedResources: no SRT read is folded into the CPU-flattened table and
     // every buffer takes its V# at run time (the shader resolves its resources on the GPU).
     bool gpuResolvedResources = false;
+    bool hostFloat = false;
     bool invalidatesCaches = false;
     std::vector<IrValue*> dynamicReads;
     bool shaderInfoComplete = false;

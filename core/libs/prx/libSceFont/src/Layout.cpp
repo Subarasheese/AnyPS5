@@ -13,6 +13,7 @@
 
 #include "prx/libSceFont/include/FontFreeType.hpp"
 #include "prx/libSceFont/include/FontInternal.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestWrites.hpp"
 
 namespace {
 
@@ -186,6 +187,7 @@ int RenderGlyphIndexToSurface(FontObj& obj, std::uint32_t glyphIndex, FontRender
                 std::memset(targetRow + static_cast<std::size_t>(column) * static_cast<std::size_t>(bytesPerPixel), coverage, static_cast<std::size_t>(bytesPerPixel));
             }
         }
+        if (endRow > startRow) AgcDriverNoteGuestWrite_nid_postfix(targetBase + static_cast<std::size_t>(startRow) * static_cast<std::size_t>(surface->widthByte), static_cast<std::size_t>(endRow - startRow) * static_cast<std::size_t>(surface->widthByte));
     }
     result->stage = nullptr;
     result->SurfaceImage.widthByte = static_cast<std::uint32_t>(surface->widthByte);

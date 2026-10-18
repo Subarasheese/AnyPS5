@@ -230,6 +230,10 @@ function(add_shader_recompiler target runtimeTarget)
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes
+            "ShaderDiskCache::BuildKey"
+            "ShaderDiskCache::EntryDirectory"
+            "ShaderDiskCache::EntryName"
+            "ShaderDiskCache::Enabled"
             ImageTableAbi::PoisonCode
             ImageTableAbi::PoisonReasonName
             ImageTableAbi::TableHeader

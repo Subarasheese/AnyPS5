@@ -318,8 +318,8 @@ std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const Mem
     auto& state = ctx.state;
     // GPU-resolved programs reading through a user-data pointer translated in the prologue: a
     // direct load when the dword lies in the pointer's mapped extent, the table lookup otherwise.
-    static const bool noDirect = std::getenv("APS5_NATIVE_NO_DIRECT") != nullptr;
-    if (!noDirect && bits == 32u && mem.kind == ResourceKind::ScalarAddress && !mem.addressIsFull && !state.nativeBases.empty()) {
+    static const bool direct = std::getenv("APS5_NATIVE_DIRECT_BASES") != nullptr;
+    if (direct && bits == 32u && mem.kind == ResourceKind::ScalarAddress && !mem.addressIsFull && !state.nativeBases.empty()) {
         const auto key = UserDataBaseKey(inst.Argument(0) != nullptr ? inst.Argument(0)->Resolve() : nullptr);
         const auto found = std::find_if(state.nativeBases.begin(), state.nativeBases.end(), [&](const auto& entry) { return entry.first == key; });
         if (found != state.nativeBases.end()) {

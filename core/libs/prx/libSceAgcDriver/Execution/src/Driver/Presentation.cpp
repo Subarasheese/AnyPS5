@@ -8,6 +8,8 @@
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
+#include "prx/libSceAgcDriver/Native/include/CompileStatus.hpp"
+#include <thread>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -55,7 +57,7 @@ void Driver::AttachWindow(const PresentationWindow& window) {
     }
     device = std::make_shared<VulkanDevice>(&window);
     // The native renderer runs on this device.
-    if (Native::GpuNative()) Native::NativeDevice::Create(device.Load());
+    if (Native::GpuNative()) Native::NativeDevice::Create(device.Load()).ReplayPipelineJournal();
 }
 
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool opaque, void (*gpuReady)(void*), void* context) {
@@ -72,6 +74,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     CheckFailure();
     require(gpuReady != nullptr && context != nullptr, "missing GPU completion callback");
     require(window.getDrawableSize != nullptr, "missing window drawable size query");
+    std::unique_lock presentation(presentationMutex);
+    if (Native::GpuNative()) std::call_once(compileStatusStarted, [this] { std::thread([this] { runCompileStatus(); }).detach(); });
 
     static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
     static const std::size_t inFlight = VulkanDevice::FlipInFlight();
@@ -99,6 +103,10 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 window.getDrawableSize(window.context, &drawableWidth, &drawableHeight);
             }
             presenting->Resize(drawableWidth, drawableHeight);
+            statusWindow = window;
+            statusWindow->drawableSizeKnown = true;
+            statusWindow->drawableWidth = drawableWidth;
+            statusWindow->drawableHeight = drawableHeight;
             presenting->SelectDynamicRange(buffer);
             timing.Mark("resize");
             presentable = presenting->Presentable();
@@ -122,7 +130,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             VkFormat nativeFormat = VK_FORMAT_UNDEFINED;
             const bool nativeFrame = Native::GpuNative() && buffer != nullptr && Native::NativeDevice::Get() != nullptr && Native::NativeDevice::Get()->DisplayImage(buffer->address, nativeImage, nativeExtent, nativeFormat);
             static std::uint64_t nativePresents = 0;
-            if (Native::GpuNative() && nativePresents++ % 300 == 0) std::fprintf(stderr, "[native] present %llu: display buffer 0x%llx %ux%u format 0x%llx tiling %u: %s\n", static_cast<unsigned long long>(nativePresents), buffer != nullptr ? static_cast<unsigned long long>(buffer->address) : 0ull, buffer != nullptr ? buffer->width : 0u, buffer != nullptr ? buffer->height : 0u, buffer != nullptr ? static_cast<unsigned long long>(buffer->pixelFormat) : 0ull, buffer != nullptr ? buffer->tilingMode : 0u, nativeFrame ? "native image" : "no native image");
+            if (Native::GpuNative() && nativePresents++ % 300 == 0 && Native::Logs()) std::fprintf(stderr, "[native] present %llu: display buffer 0x%llx %ux%u format 0x%llx tiling %u: %s\n", static_cast<unsigned long long>(nativePresents), buffer != nullptr ? static_cast<unsigned long long>(buffer->address) : 0ull, buffer != nullptr ? buffer->width : 0u, buffer != nullptr ? buffer->height : 0u, buffer != nullptr ? static_cast<unsigned long long>(buffer->pixelFormat) : 0ull, buffer != nullptr ? buffer->tilingMode : 0u, nativeFrame ? "native image" : "no native image");
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
             std::lock_guard lock(GuestMemory::GpuMutex());
             timing.Mark("gpu_mutex_wait");
@@ -165,6 +173,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("queue_present");
         }
         gpuReady(context);
+        lastGamePresentNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_release);
         timing.Mark("release_and_callback");
         TracyZone::MarkFrame();
         if (profile) reportPresents(waitedMs, inFlight);
@@ -204,7 +213,51 @@ void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
     waits.clear();
 }
 
+void Driver::runCompileStatus() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        if (stopping.load(std::memory_order_acquire) || failed.load(std::memory_order_acquire)) return;
+        const auto progress = Native::CurrentCompileProgress();
+        const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto last = lastGamePresentNs.load(std::memory_order_acquire);
+        const auto quiet = now - last;
+        const bool shaders = progress.blocked && progress.blockedSeconds >= 0.5 && quiet >= 500'000'000;
+        const bool stalled = last != 0 && quiet >= 1'000'000'000;
+        if (!shaders && !stalled) continue;
+        try {
+            presentCompileStatus();
+        } catch (...) {
+            return;
+        }
+    }
+}
+
+void Driver::presentCompileStatus() {
+    constexpr std::uint32_t width = 1920;
+    constexpr std::uint32_t height = 1080;
+    std::lock_guard presentation(presentationMutex);
+    if (!statusWindow.has_value()) return;
+    const auto presenting = device.Load();
+    if (presenting == nullptr) return;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        if (presenting->Window() != statusWindow->context) return;
+        presenting->Resize(statusWindow->drawableWidth, statusWindow->drawableHeight);
+        if (!presenting->Presentable()) return;
+    }
+    static std::vector<std::byte> pixels;
+    Native::RenderCompileStatus(width, height, Native::CurrentCompileProgress(), pixels);
+    presenting->RetirePresents(0);
+    if (!presenting->AcquireImage()) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    presenting->PresentPixels(width, height, pixels);
+}
+
 void Driver::ReleaseWindow(void* window) {
+    std::lock_guard presentation(presentationMutex);
+    if (statusWindow.has_value() && statusWindow->context == window) statusWindow.reset();
     std::lock_guard lock(GuestMemory::GpuMutex());
     if (device && device->Window() == window) device.Reset();
 }

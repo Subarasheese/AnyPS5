@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestWrites.hpp"
+#include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
+#include "prx/libSceAgcDriver/Native/include/NativeImages.hpp"
 #include <mutex>
 
 namespace AgcDriver {
@@ -125,6 +128,10 @@ extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::Presentation
 
 extern "C" void AgcDriverReleaseWindow_nid_postfix(void* window) {
     AgcDriver::ReleaseWindow(window);
+}
+
+extern "C" void AgcDriverNoteGuestWrite_nid_postfix(const void* address, std::size_t bytes) {
+    if (AgcDriver::Native::GpuNative()) AgcDriver::Native::NoteGuestWrite(reinterpret_cast<std::uint64_t>(address), bytes);
 }
 
 extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {

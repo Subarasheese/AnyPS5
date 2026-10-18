@@ -1,51 +1,61 @@
-# GT7 native Vulkan work in progress
+# Gran Turismo 7 native PC renderer
 
-This branch contains experimental Gran Turismo 7 (PS5) bring-up and a native Vulkan
-backend for a relinked executable. Native rendering is the default on this GT7 branch.
-It is unfinished, is not an official PC port,
-and does not yet provide full-speed gameplay or verified PS5-equivalent graphics.
+This branch runs the PS5 build of Gran Turismo 7 on PC through a native Vulkan
+renderer. The game's own engine code builds every frame; the renderer executes
+the resulting command streams directly on the PC GPU, using shaders translated
+ahead of time to SPIR-V and pipelines prepared before launch. It does not
+emulate the PS5 GPU.
 
-## Current progress (2026-10-17)
+## Architecture
 
-- Post-merge native-default bring-up removed obsolete preloaded exports that
-  intercepted implemented runtime functions, and added layered depth attachments.
-  A 600-second run recorded 24,445 native draws with no draw omissions. It remained
-  on the loading screen while preparing shaders/pipelines; menu access and
-  steady-state performance of this merged build are not yet established.
-- Native Vulkan renders the startup screens and parts of the title-screen UI.
-  The 3D background remains black, and some graphics are incomplete.
-- Recent title-screen runs completed 600 seconds without a failed GPU batch,
-  at approximately 4–5 FPS. These runs do not establish race compatibility.
-- Draws and dispatches wait for first-use shader and pipeline compilation rather
-  than being discarded while compilation is pending. Persistent shader caches
-  and offline replay/preparation tools support cache warm-up.
-- The backend consumes submitted AGC command state and executes translated RDNA
-  shaders as SPIR-V on Vulkan. It includes GPU descriptor lookup, imported guest
-  buffers, native images, device-local GDS, indirect dispatch, and resource hooks.
-  Memory aliasing/coherency and synchronization remain active development areas.
-- All 232 available captured compute requests now translate offline. Selected
-  previously failing modules pass SPIR-V validation. Captures are not included.
-  The latest device-local LDS scratch and sampler-capacity changes build but
-  have not yet been checked in-game.
-- Known issues include pixel shaders reaching the loop guard, missing 3D output,
-  shader expansion/performance, and incomplete graphics validation. No PS5
-  reference captures have been used to establish visual identity.
+- **Command execution.** Submitted AGC command buffers run on a native executor.
+  Draws and dispatches are recorded into Vulkan batches that are cut only where
+  the game observes GPU results. Fences and labels are released when their batch
+  completes.
+- **Shaders.** RDNA programs are translated to SPIR-V with GPU-resolved
+  resources: descriptors are read on the GPU from the game's own memory through
+  a two-level page table, with no CPU-side descriptor folding.
+- **Memory and resources.** Game memory is imported into Vulkan. Textures and
+  render targets become native images, created from the game's texture and
+  render-target initializers and then detiled once. GDS and LDS scratch are
+  device-local.
+- **Pipeline preparation.** `agc_graphics_library_prepare` builds compute
+  pipelines, graphics stage libraries and the recorded pipeline journal ahead of
+  time into the persistent shader cache. Shaders the cache does not cover yet are
+  compiled when first used, on background threads. Work is never discarded while
+  compilation is pending.
 
-## Development entry points
+## GT7 status (2026-10-17)
 
-- `core/libs/prx/libSceAgcDriver/Native`: native execution, device, images, and hooks.
-- `core/shader/recompiler`: GPU-resolved resources, runtime shader addresses,
-  shader translation, and persistent caches.
-- `agc_shader_replay` and `agc_graphics_library_prepare`: offline shader tools.
-- `tools/run_gt7_native.sh GAME_DIRECTORY` builds the runtime and prepares captured
-  native compute pipelines before launch. Captures must already be available in
-  the game directory; graphics variants and uncaptured workloads still prepare
-  at first use. `agc_graphics_library_prepare --native-compute REQUEST_DIRECTORY`
-  runs the compute preparation separately without launching the game.
-- The experimental GT7 native backend is the default on this branch.
-  `APS5_EMULATED_GPU=1` selects the alternate emulated GPU path;
-  `APS5_NATIVE_SKIP_DRAWS=1` selects CPU-only profiling.
-  `APS5_NATIVE_STATS=1` and `APS5_NATIVE_GPU_TIMES=1` enable diagnostics.
+- Startup screens and the title-screen UI render natively. The 3D scene behind
+  the title screen and in-race 3D output are not rendered yet.
+- Recent builds measured 4–37 FPS on the title screen. Full speed has not been
+  reached yet. The known costs are the size of the translated shader code
+  (wave64 on 32-wide hardware, and exec-mask expansion) and pipelines that are
+  still compiled at first use.
+- Visual output has not been compared against PS5 reference captures.
+
+## Usage
+
+- `tools/run_gt7_native.sh GAME_DIRECTORY` builds the runtime, prepares the
+  pipelines and launches the game. Compute requests come from the game
+  directory. Graphics requests are recorded in `native-stage-requests` there, or
+  in `APS5_NATIVE_REQUEST_DIR` when that is set.
+- `agc_graphics_library_prepare --native-compute | --native-graphics |
+  --native-journal DIRECTORY` runs a preparation step without launching the
+  game. `agc_shader_replay` replays individual shaders.
+- During normal play the renderer reports only errors. Diagnostics can be turned on:
+  - `APS5_NATIVE_LOG=1`: backend log;
+  - `APS5_NATIVE_STATS=1`: per-frame statistics;
+  - `APS5_NATIVE_GPU_TIMES=1`: per-program GPU time.
+- `APS5_EMULATED_GPU=1` selects the emulated GPU path. `APS5_NATIVE_SKIP_DRAWS=1`
+  selects CPU-only profiling.
+
+## Source layout
+
+- `core/libs/prx/libSceAgcDriver/Native`: executor, device, images and engine hooks.
+- `core/shader/recompiler`: shader translation, GPU-resolved resources and
+  persistent caches.
 
 This branch includes implementation source and compatibility stubs only. It does
 not include game executables, firmware, proprietary libraries, shaders extracted

@@ -21,6 +21,9 @@ namespace AgcDriver {
 
 namespace Graphics {
 class StorageTexture;
+struct PipelineSetLayouts;
+struct PipelineJournalHooks;
+class PipelineJournalReplay;
 }
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
@@ -52,6 +55,7 @@ public:
     VulkanDevice& operator=(const VulkanDevice&) = delete;
     std::string DeviceName() const;
     void SavePipelineCache();
+    std::shared_ptr<Graphics::PipelineJournalReplay> ReplayPipelineJournal(Graphics::PipelineJournalHooks hooks);
     std::string DriverInfo() const;
     bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const;
     ShaderRecompiler::SpirvTarget Target() const;
@@ -323,7 +327,7 @@ public:
     };
     IndirectDrawSupport DrawIndirectSupport() const;
     void EnqueueDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
-    bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders);
+    bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders, const Graphics::PipelineSetLayouts* nativeLayouts = nullptr);
     // Native renderer (Native/src/NativeDevice.cpp): the device's graphics context and an instance
     // function of its Vulkan instance.
     Graphics::Context NativeContext() const { return graphicsContext(); }

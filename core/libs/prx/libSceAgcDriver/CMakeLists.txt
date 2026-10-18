@@ -171,6 +171,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/ResourceAudit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/NativeDevice.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/NativeImages.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/CompileStatus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferFill.cpp
@@ -244,6 +245,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineEntryCache.cpp
         ${agcTextureDetileShaderHeader}
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
@@ -272,6 +274,9 @@ add_custom_target(agc_trace_revision
 set(agcZlibIncludeDir ${CMAKE_SOURCE_DIR}/3rdparty/libjpeg-turbo/src/spng/zlib)
 set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp PROPERTIES
         INCLUDE_DIRECTORIES ${agcZlibIncludeDir}
+)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Native/src/CompileStatus.cpp PROPERTIES
+        INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/3rdparty/stb
 )
 
 add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL

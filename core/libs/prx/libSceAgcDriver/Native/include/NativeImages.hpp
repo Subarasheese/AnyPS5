@@ -22,13 +22,15 @@ struct DepthTarget;
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
+#include <vector>
 
 namespace AgcDriver::Native {
 
 class NativeImages {
 public:
     // The imported VkBuffer holding [address, address + bytes) and the offset of `address` in it.
-    using Locate = std::function<bool(std::uint64_t address, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset)>;
+    using Locate = std::function<std::uint64_t(std::uint64_t address, VkBuffer& buffer, VkDeviceSize& offset)>;
 
     NativeImages(const Graphics::Context& context, Locate locate);
     ~NativeImages();
@@ -50,7 +52,26 @@ public:
 
     // On the recording thread, in the open batch before work that may use the resources: creates the
     // images and samplers noted since the last call and records their uploads.
+    struct DrawnTarget {
+        std::uint64_t address;
+        VkImage image;
+        VkFormat format;
+        std::uint32_t width;
+        std::uint32_t height;
+        std::uint64_t drawn;
+        std::uint64_t guestBytes = 0;
+        std::uint32_t guestFormat = 0;
+        std::uint32_t tileMode = 0;
+    };
+    std::vector<DrawnTarget> DrawnTargets(std::uint64_t since) const;
+    std::vector<DrawnTarget> SurfacesAt(std::uint64_t address) const;
+    std::string DescribeUploadedOverlap(std::uint64_t begin, std::uint64_t end) const;
+    void MarkGpuWritten(std::uint64_t begin, std::uint64_t end);
+    bool Registered(std::span<const std::uint32_t, 8> words) const;
+    std::uint64_t DrawSerial() const;
+    void NewBatch();
     void Prepare(VkCommandBuffer commands);
+    std::uint64_t Recordings() const;
     // After the batch completed: frees its staging memory and takes the shaders' misses.
     void Completed();
 
@@ -62,6 +83,8 @@ private:
 // From the game's initializer hooks (any thread, before or after the native device exists).
 void NoteTextureDescriptor(std::span<const std::uint32_t, 8> words);
 void NoteRenderTarget(std::uint64_t address, std::uint64_t bytes);
+void NoteGuestWrite(std::uint64_t address, std::uint64_t bytes);
+void NoteSampledDescriptor(std::span<const std::uint32_t, 8> words);
 
 }
 

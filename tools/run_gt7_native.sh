@@ -22,6 +22,22 @@ if [[ -z "${APS5_EMULATED_GPU:-}" || "${APS5_EMULATED_GPU:-0}" == 0 ]] &&
     env -u LD_PRELOAD -u LD_LIBRARY_PATH "$preparer" --native-compute "$game_dir" > "$game_dir/native-compute-prewarm.log" 2>&1
 fi
 
+native_requests="${APS5_NATIVE_REQUEST_DIR:-$game_dir/native-stage-requests}"
+export APS5_NATIVE_REQUEST_DIR="$native_requests"
+if [[ -z "${APS5_EMULATED_GPU:-}" || "${APS5_EMULATED_GPU:-0}" == 0 ]] &&
+   [[ -z "${ANYPS5_NO_SHADER_CACHE:-}" || "${ANYPS5_NO_SHADER_CACHE:-0}" == 0 ]] && compgen -G "$native_requests/*.req" > /dev/null; then
+    echo "Preparing captured native graphics libraries before launch..."
+    env -u LD_PRELOAD -u LD_LIBRARY_PATH "$preparer" --native-graphics "$native_requests" > "$game_dir/native-graphics-prewarm.log" 2>&1
+fi
+
+if [[ -z "${APS5_EMULATED_GPU:-}" || "${APS5_EMULATED_GPU:-0}" == 0 ]] &&
+   [[ -z "${ANYPS5_NO_SHADER_CACHE:-}" || "${ANYPS5_NO_SHADER_CACHE:-0}" == 0 ]] &&
+   [[ -z "${APS5_NO_PIPELINE_JOURNAL:-}" || "${APS5_NO_PIPELINE_JOURNAL:-0}" == 0 ]]; then
+    echo "Preparing recorded native pipeline recipes before launch..."
+    env -u LD_PRELOAD -u LD_LIBRARY_PATH APS5_PIPELINE_JOURNAL_THREADS="${APS5_PIPELINE_JOURNAL_THREADS:-4}" \
+        "$preparer" --native-journal > "$game_dir/native-journal-prewarm.log" 2>&1
+fi
+
 export LD_LIBRARY_PATH="$runtime_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LD_PRELOAD="$runtime_libs/libGt7MissingImports.prx${LD_PRELOAD:+:$LD_PRELOAD}"
 cd -- "$game_dir"

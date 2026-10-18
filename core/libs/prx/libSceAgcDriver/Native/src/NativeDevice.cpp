@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Native/include/NativeDevice.hpp"
 #include "prx/libSceAgcDriver/Native/include/NativeImages.hpp"
 #include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
+#include "prx/libSceAgcDriver/Native/include/CompileStatus.hpp"
 #include "RuntimeAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -9,10 +10,15 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "BdaAbi.hpp"
+#include <filesystem>
+#include <fstream>
 #include <spirv/unified1/spirv.hpp>
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineEntryCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
@@ -41,6 +47,29 @@
 namespace AgcDriver::Native {
 
 namespace {
+
+bool DrawBarriersRequested() {
+    static const bool requested = std::getenv("APS5_NATIVE_DRAW_BARRIERS") != nullptr;
+    return requested;
+}
+
+std::vector<VkDescriptorSetLayoutBinding> NativeGraphicsBindings(const Graphics::Context& context) {
+    using Stage = ShaderRecompiler::RuntimeAbi::Stage;
+    using Binding = ShaderRecompiler::RuntimeAbi::Binding;
+    const std::array<std::pair<Stage, VkShaderStageFlags>, 4> stages{{
+        {Stage::Main, VK_SHADER_STAGE_VERTEX_BIT | (context.meshShader ? VK_SHADER_STAGE_MESH_BIT_EXT : 0u)},
+        {Stage::Fragment, VK_SHADER_STAGE_FRAGMENT_BIT},
+        {Stage::TessellationControl, context.tessellationShader ? VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT : 0u},
+        {Stage::TessellationEvaluation, context.tessellationShader ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : 0u}
+    }};
+    constexpr std::array roles{Binding::Gds, Binding::BdaPagetable, Binding::FaultBuffer, Binding::ShaderData};
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    for (const auto& [stage, flags] : stages) {
+        if (flags == 0) continue;
+        for (const auto role : roles) bindings.push_back({static_cast<std::uint32_t>(stage) * static_cast<std::uint32_t>(Binding::Count) + static_cast<std::uint32_t>(role), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags, nullptr});
+    }
+    return bindings;
+}
 
 // The device functions this file calls, resolved from the driver device (the driver's headers
 // declare no Vulkan prototypes, so the usual names are free for them).
@@ -208,14 +237,13 @@ struct NativeDevice::State {
         write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         write.pBufferInfo = &buffer;
         context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(vk, 1, &write, 0, nullptr);
-        std::fprintf(stderr, "[native] device-local LDS scratch: %llu bytes for %ux%ux%u groups (stride %u dwords)\n",
+        if (Native::Logs()) std::fprintf(stderr, "[native] device-local LDS scratch: %llu bytes for %ux%ux%u groups (stride %u dwords)\n",
             static_cast<unsigned long long>(size), groups[0], groups[1], groups[2], dwords);
         workgroupScratch = made;
         return made;
     }
-    // Graphics: one push-descriptor layout per set of stage buffer bindings, and what recorded
-    // draws reference until their batch completed.
-    std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> graphicsLayouts;
+    VkDescriptorSetLayout graphicsLayout = VK_NULL_HANDLE;
+    std::vector<std::uint32_t> graphicsLayoutKey;
     std::vector<std::shared_ptr<void>> kept;
     std::vector<std::function<void()>> afterBatch;
     // What the open batch records, for a batch that does not complete (the last 48 entries).
@@ -384,7 +412,10 @@ struct NativeDevice::State {
                 pipelineReady.notify_all();
             }).detach();
         }
-        pipelineReady.wait(lock, [&] { return !building.contains(key); });
+        {
+            const CompileWait waiting;
+            pipelineReady.wait(lock, [&] { return !building.contains(key); });
+        }
         if (const auto found = pipelines.find(key); found != pipelines.end()) return &found->second;
         failure = failedPipelines.at(key);
         return nullptr;
@@ -454,15 +485,23 @@ struct NativeDevice::State {
         subgroupSize.requiredSubgroupSize = 32u;
         // The driver device enables subgroup size control where it can (VulkanDevice::ComputeTarget asks wave32 only then).
         if (shader.hostSubgroupSize == 32u) info.stage.pNext = &subgroupSize;
+        if (shader.fullSubgroups) info.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
         info.layout = made.layout;
         const auto started = std::chrono::steady_clock::now();
-        std::fprintf(stderr, "[native] building compute pipeline: %zu SPIR-V words, %zu bindings\n", shader.spirv.size(), shader.bindings.size());
+        if (Native::Logs()) std::fprintf(stderr, "[native] building compute pipeline: %zu SPIR-V words, %zu bindings\n", shader.spirv.size(), shader.bindings.size());
         VkResult result;
         {
             auto cacheLock = context.LockPipelineCacheForUse();
-            result = vkCreateComputePipelines(vk, context.pipelineCache, 1, &info, nullptr, &made.pipeline);
+            std::vector<std::byte> entryKey(std::as_bytes(std::span(shader.spirv)).begin(), std::as_bytes(std::span(shader.spirv)).end());
+            const auto specialization = std::as_bytes(std::span(shader.specialization));
+            entryKey.insert(entryKey.end(), specialization.begin(), specialization.end());
+            for (const auto value : {shader.hostSubgroupSize, static_cast<std::uint32_t>(shader.fullSubgroups), static_cast<std::uint32_t>(shader.bindings.size()), shader.workgroupMemoryDwords}) {
+                const auto bytes = std::as_bytes(std::span(&value, 1));
+                entryKey.insert(entryKey.end(), bytes.begin(), bytes.end());
+            }
+            result = Graphics::CreateWithEntryCache(context, entryKey, [&](VkPipelineCache entry) { return vkCreateComputePipelines(vk, entry, 1, &info, nullptr, &made.pipeline); });
         }
-        std::fprintf(stderr, "[native] compute pipeline built in %.0f ms (%d)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), static_cast<int>(result));
+        if (Native::Logs()) std::fprintf(stderr, "[native] compute pipeline built in %.0f ms (%d)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), static_cast<int>(result));
         vkDestroyShaderModule(vk, module, nullptr);
         if (result != VK_SUCCESS) {
             failure = "vkCreateComputePipelines " + std::to_string(static_cast<int>(result));
@@ -502,7 +541,7 @@ struct NativeDevice::State {
             waitedMs += ms;
             worstMs = std::max(worstMs, ms);
             if (now - reported > std::chrono::seconds(5)) {
-                std::fprintf(stderr, "[native] batches: %llu in 5 s, GPU wait %.0f ms total (worst %.1f ms), %.1f entries per batch\n", static_cast<unsigned long long>(flushes), waitedMs, worstMs, flushes ? static_cast<double>(recorded) / flushes : 0.0);
+                if (Native::Logs()) std::fprintf(stderr, "[native] batches: %llu in 5 s, GPU wait %.0f ms total (worst %.1f ms), %.1f entries per batch\n", static_cast<unsigned long long>(flushes), waitedMs, worstMs, flushes ? static_cast<double>(recorded) / flushes : 0.0);
                 flushes = recorded = 0;
                 waitedMs = worstMs = 0.0;
                 reported = now;
@@ -514,14 +553,22 @@ struct NativeDevice::State {
         for (const auto word : {0u, ShaderRecompiler::BdaAbi::NativeDiagnosticWord}) {
             auto* faultRecord = reinterpret_cast<ShaderRecompiler::BdaAbi::Fault*>(static_cast<std::uint32_t*>(s.faultMapping) + word);
             if (faultRecord->state == ShaderRecompiler::BdaAbi::FaultState::Ready) {
-                std::fprintf(stderr, "[native] GPU address fault: reason %u address 0x%llx bytes %u pc 0x%x\n", static_cast<unsigned>(faultRecord->reason), static_cast<unsigned long long>(faultRecord->address), faultRecord->bytes, faultRecord->instruction);
+                static constexpr const char* Reasons[] = {"unknown", "read of unmapped memory", "access without permission", "address overflow", "invalid page table", "invalid rectangle", "shader loop limit reached", "unaligned access", "invalid descriptor", "image table fault", "unlinked call", "direct load mismatch"};
+                const auto reason = static_cast<std::uint32_t>(faultRecord->reason);
+                char detail[192];
+                if (faultRecord->reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) std::snprintf(detail, sizeof(detail), "%s in program 0x%llx", Reasons[6], static_cast<unsigned long long>(faultRecord->address));
+                else std::snprintf(detail, sizeof(detail), "%s (stage %u, pc 0x%x, address 0x%llx, %u bytes)", reason < std::size(Reasons) ? Reasons[reason] : Reasons[0], faultRecord->stage, faultRecord->instruction, static_cast<unsigned long long>(faultRecord->address), faultRecord->bytes);
+                ReportGraphicsIssue("GPU fault", detail);
                 if (waited == VK_SUCCESS) std::memset(faultRecord, 0, sizeof(*faultRecord));
             }
         }
         if (waited != VK_SUCCESS) {
-            std::fprintf(stderr, "[native] batch failed (%d); its last work:\n", static_cast<int>(waited));
-            for (const auto& entry : s.batchLog) std::fprintf(stderr, "[native]   %s\n", entry.c_str());
-            throw std::runtime_error("native device: batch did not complete (" + std::to_string(static_cast<int>(waited)) + ")");
+            if (Native::Logs()) {
+                std::fprintf(stderr, "[native] batch failed (%d); its last work:\n", static_cast<int>(waited));
+                for (const auto& entry : s.batchLog) std::fprintf(stderr, "[native]   %s\n", entry.c_str());
+            }
+            throw std::runtime_error(waited == VK_ERROR_DEVICE_LOST ? std::string("the graphics device was lost (VK_ERROR_DEVICE_LOST)")
+                : "GPU work did not complete (VkResult " + std::to_string(static_cast<int>(waited)) + ")");
         }
         // A timeout does not mean the queue retired: never reset its fence,
         // release kept resources, or destroy retired imports on that path.
@@ -552,8 +599,41 @@ struct NativeDevice::State {
 
     }
 
+    bool graphicsBarrier = true;
+    bool tracing = false;
+    std::vector<std::string> frameTrace;
+    std::vector<std::uint64_t> requestedDumps;
+    std::uint64_t barrierRecordings = 0;
+    std::vector<VkImageView> lastViews;
+    VkExtent2D lastExtent{};
+    std::map<std::pair<std::uint64_t, std::uint64_t>, bool> memoryWriters;
+
+    bool writesGuestMemory(const ShaderRecompiler::RecompileResult& shader) {
+        const auto identity = shader.Identity();
+        const std::pair<std::uint64_t, std::uint64_t> key{identity.low, identity.high};
+        if (const auto found = memoryWriters.find(key); found != memoryWriters.end() && !identity.Empty()) return found->second;
+        const auto code = std::span(shader.spirv);
+        std::set<std::uint32_t> pointers;
+        bool writes = false;
+        for (std::size_t i = 5; i < code.size() && !writes;) {
+            const auto count = code[i] >> 16u;
+            const auto opcode = code[i] & 0xffffu;
+            if (count == 0 || i + count > code.size()) break;
+            if (opcode == 120u && count >= 4) pointers.insert(code[i + 2]);
+            else if ((opcode == 65u || opcode == 66u || opcode == 67u || opcode == 70u || opcode == 124u || opcode == 83u) && count >= 4 && pointers.contains(code[i + 3])) pointers.insert(code[i + 2]);
+            else if ((opcode == 62u || opcode == 228u) && count >= 3 && pointers.contains(code[i + 1])) writes = true;
+            else if (opcode >= 229u && opcode <= 242u && count >= 4 && pointers.contains(code[i + 3])) writes = true;
+            else if (opcode == 99u) writes = true;
+            i += count;
+        }
+        if (!identity.Empty()) memoryWriters.emplace(key, writes);
+        return writes;
+    }
+
     void begin() {
         if (recording) return;
+        graphicsBarrier = true;
+        if (images) images->NewBatch();
         VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandBuffer(commands, 0);
@@ -579,7 +659,7 @@ struct NativeDevice::State {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         const auto result = vkAllocateMemory(vk, &allocation, nullptr, &memory);
         if (memory != VK_NULL_HANDLE) vkFreeMemory(vk, memory, nullptr);
-        std::fprintf(stderr, "[native] allocation probe at %s: %d (thread %ld)\n", where, static_cast<int>(result), static_cast<long>(gettid()));
+        if (Native::Logs()) std::fprintf(stderr, "[native] allocation probe at %s: %d (thread %ld)\n", where, static_cast<int>(result), static_cast<long>(gettid()));
     }
 
     void destroy(Import& import) const {
@@ -740,7 +820,7 @@ struct NativeDevice::State {
         }
         if (shared != 0) {
             static std::size_t reported = 0;
-            if (reported++ < 4) std::fprintf(stderr, "[native] page table: %zu 64 KiB pages shared by two imports (the later one maps them)\n", shared);
+            if (reported++ < 4 && Native::Logs()) std::fprintf(stderr, "[native] page table: %zu 64 KiB pages shared by two imports (the later one maps them)\n", shared);
         }
         tableUsedBytes = needed;
         ++tableGeneration;
@@ -754,7 +834,7 @@ NativeDevice& NativeDevice::Create(std::shared_ptr<VulkanDevice> driverDevice) {
     device.store(made);
     made->SyncGpuMemory();
     const auto stats = made->Stats();
-    std::fprintf(stderr, "[native] device ready: %zu GPU ranges imported (%.1f MiB), %zu failed\n", stats.imports, stats.importedBytes / 1048576.0, stats.failedImports);
+    if (Native::Logs()) std::fprintf(stderr, "[native] device ready: %zu GPU ranges imported (%.1f MiB), %zu failed\n", stats.imports, stats.importedBytes / 1048576.0, stats.failedImports);
     return *made;
 }
 
@@ -774,15 +854,15 @@ NativeDevice::NativeDevice(std::shared_ptr<VulkanDevice> driverDevice) : state(s
     state->udmabuf = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
     if (vkGetMemoryHostPointerPropertiesEXT == nullptr) throw std::runtime_error("native device: VK_EXT_external_memory_host is unavailable");
     if (vkCmdPushDescriptorSetKHR == nullptr) throw std::runtime_error("native device: VK_KHR_push_descriptor is unavailable");
-    state->images = std::make_unique<NativeImages>(state->context, [this](std::uint64_t address, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+    state->images = std::make_unique<NativeImages>(state->context, [this](std::uint64_t address, VkBuffer& buffer, VkDeviceSize& offset) -> std::uint64_t {
         std::shared_lock lock(state->importsMutex);
         auto it = state->imports.upper_bound(address);
-        if (it == state->imports.begin()) return false;
+        if (it == state->imports.begin()) return 0;
         --it;
-        if (address + bytes > it->second.end) return false;
+        if (address >= it->second.end) return 0;
         buffer = it->second.buffer;
         offset = address - it->second.begin;
-        return true;
+        return it->second.end - address;
     });
     VkDescriptorSetLayoutCreateInfo emptyInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     if (vkCreateDescriptorSetLayout(state->vk, &emptyInfo, nullptr, &state->emptyLayout) != VK_SUCCESS) throw std::runtime_error("native device: empty set layout");
@@ -792,7 +872,15 @@ NativeDevice::NativeDevice(std::shared_ptr<VulkanDevice> driverDevice) : state(s
     workgroupInfo.pBindings = &workgroupBinding;
     if (vkCreateDescriptorSetLayout(state->vk, &workgroupInfo, nullptr, &state->workgroupLayout) != VK_SUCCESS)
         throw std::runtime_error("native LDS descriptor layout");
-    std::fprintf(stderr, "[native] native device on %s, host import alignment %llu\n", state->driverDevice->DeviceName().c_str(), static_cast<unsigned long long>(state->importAlignment));
+    const auto graphicsBindings = NativeGraphicsBindings(state->context);
+    for (const auto& binding : graphicsBindings) state->graphicsLayoutKey.insert(state->graphicsLayoutKey.end(), {binding.binding, binding.stageFlags});
+    state->graphicsLayoutKey.push_back(0x4e48u);
+    VkDescriptorSetLayoutCreateInfo graphicsInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    graphicsInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    graphicsInfo.bindingCount = static_cast<std::uint32_t>(graphicsBindings.size());
+    graphicsInfo.pBindings = graphicsBindings.data();
+    if (vkCreateDescriptorSetLayout(state->vk, &graphicsInfo, nullptr, &state->graphicsLayout) != VK_SUCCESS) throw std::runtime_error("native graphics descriptor layout");
+    if (Native::Logs()) std::fprintf(stderr, "[native] native device on %s, host import alignment %llu\n", state->driverDevice->DeviceName().c_str(), static_cast<unsigned long long>(state->importAlignment));
 }
 
 NativeDevice::~NativeDevice() {
@@ -885,6 +973,7 @@ bool NativeDevice::DmaGds(std::span<const std::uint32_t> packet) {
     s.prepareCompute();
     s.begin();
     s.prepareGds();
+    s.graphicsBarrier = true;
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1025,6 +1114,11 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
     char timedName[64];
     std::snprintf(timedName, sizeof(timedName), "dispatch 0x%llx", static_cast<unsigned long long>(work.programAddress));
     const auto timed = s.beginTimed(timedName);
+    if (s.tracing) {
+        char line[256];
+        std::snprintf(line, sizeof(line), "%s groups %ux%ux%u%s", timedName, work.groups[0], work.groups[1], work.groups[2], work.indirectArguments != 0 ? " indirect" : "");
+        s.frameTrace.emplace_back(line);
+    }
     if (work.indirectArguments != 0) {
         std::shared_lock imports(s.importsMutex);
         auto it = s.imports.upper_bound(work.indirectArguments);
@@ -1042,6 +1136,7 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
     } else {
         vkCmdDispatch(s.commands, work.groups[0], work.groups[1], work.groups[2]);
     }
+    s.graphicsBarrier = true;
     s.endTimed(timed);
     return true;
 }
@@ -1057,12 +1152,12 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     }
     // The stages' buffer bindings, one push-descriptor set (every stage's bindings have their own
     // numbers, RuntimeAbi::BindingNumber), and the shader data blocks that do not fit push constants.
-    std::vector<VkDescriptorSetLayoutBinding> bindings;
-    std::vector<std::uint32_t> layoutKey;
+    const auto& layoutKey = s.graphicsLayoutKey;
+    const auto setLayout = s.graphicsLayout;
     bool heap = false;
     std::size_t ringBytes = 0;
+    std::size_t bufferBindingCount = 0;
     for (const auto& stage : work.stages) {
-        const auto stageFlag = Graphics::VulkanStage(stage.stage);
         if (stage.shader->pushDataStartDword == ~0u) ringBytes += (stage.shaderData.size() * 4u + 255u) & ~std::size_t{255};
         for (const auto& binding : stage.shader->bindings) {
             if (binding.descriptorSet == ShaderRecompiler::RuntimeAbi::NativeHeap::Set && (binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers)) {
@@ -1077,23 +1172,7 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
                 failure = "graphics stage buffers outside set 0";
                 return false;
             }
-            const auto found = std::find_if(bindings.begin(), bindings.end(), [&](const VkDescriptorSetLayoutBinding& b) { return b.binding == binding.binding; });
-            if (found != bindings.end()) found->stageFlags |= stageFlag;
-            else bindings.push_back({binding.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, static_cast<VkShaderStageFlags>(stageFlag), nullptr});
-        }
-    }
-    std::sort(bindings.begin(), bindings.end(), [](const auto& a, const auto& b) { return a.binding < b.binding; });
-    for (const auto& binding : bindings) layoutKey.insert(layoutKey.end(), {binding.binding, binding.stageFlags});
-    layoutKey.push_back(heap ? 0x4e48u : 0u);
-    auto& setLayout = s.graphicsLayouts[layoutKey];
-    if (setLayout == VK_NULL_HANDLE) {
-        VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-        info.bindingCount = static_cast<std::uint32_t>(bindings.size());
-        info.pBindings = bindings.data();
-        if (vkCreateDescriptorSetLayout(s.vk, &info, nullptr, &setLayout) != VK_SUCCESS) {
-            failure = "graphics descriptor set layout";
-            return false;
+            ++bufferBindingCount;
         }
     }
     std::vector<Graphics::CompiledShader> compiled;
@@ -1122,7 +1201,7 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
             static int reported = 0;
             if (reported < 24) {
                 ++reported;
-                std::fprintf(stderr, "[native] vertex attribute %u: V# %08x %08x %08x %08x address 0x%llx %s; viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %ux%u\n", attribute.location, fields[0], fields[1], fields[2], fields[3], static_cast<unsigned long long>(address), Graphics::NullVertexDescriptor(attribute) ? "null" : (it == s.imports.begin() || address >= std::prev(it)->second.end) ? "NOT IMPORTED" : "imported", graphics.viewport.x, graphics.viewport.y, graphics.viewport.width, graphics.viewport.height, graphics.scissor.offset.x, graphics.scissor.offset.y, graphics.scissor.extent.width, graphics.scissor.extent.height);
+                if (Native::Logs()) std::fprintf(stderr, "[native] vertex attribute %u: V# %08x %08x %08x %08x address 0x%llx %s; viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %ux%u\n", attribute.location, fields[0], fields[1], fields[2], fields[3], static_cast<unsigned long long>(address), Graphics::NullVertexDescriptor(attribute) ? "null" : (it == s.imports.begin() || address >= std::prev(it)->second.end) ? "NOT IMPORTED" : "imported", graphics.viewport.x, graphics.viewport.y, graphics.viewport.width, graphics.viewport.height, graphics.scissor.offset.x, graphics.scissor.offset.y, graphics.scissor.extent.width, graphics.scissor.extent.height);
             }
             if (Graphics::NullVertexDescriptor(attribute) || address == 0 || it == s.imports.begin() || address >= std::prev(it)->second.end) {
                 vertexBuffers.push_back(s.zeroVertex.buffer);
@@ -1153,7 +1232,16 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
                     std::string reason;
                     try {
                         const Graphics::PipelineSetLayouts copied{setLayout, VK_NULL_HANDLE, false, layoutKey, {}, heapLayout, empty};
+                        const auto started = std::chrono::steady_clock::now();
+                        const auto before = Graphics::PipelineLibraryCountersOf(context.device);
                         static_cast<void>(Graphics::BuildCachedPipeline(context, state, vertexInput, copied, compiled, VK_IMAGE_LAYOUT_GENERAL));
+                        if (Native::Logs()) {
+                            const auto after = Graphics::PipelineLibraryCountersOf(context.device);
+                            std::fprintf(stderr, "[native] graphics pipeline %016llx built in %.0f ms (libraries: vertex input %llu, pre-rasterization %llu, fragment shader %llu, fragment output %llu)\n",
+                                static_cast<unsigned long long>(hash), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
+                                static_cast<unsigned long long>(after.built[0] - before.built[0]), static_cast<unsigned long long>(after.built[1] - before.built[1]),
+                                static_cast<unsigned long long>(after.built[2] - before.built[2]), static_cast<unsigned long long>(after.built[3] - before.built[3]));
+                        }
                     } catch (const std::exception& error) {
                         reason = std::string("graphics pipeline: ") + error.what();
                     }
@@ -1163,7 +1251,10 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
                     s.pipelineReady.notify_all();
                 }).detach();
             }
-            s.pipelineReady.wait(lock, [&] { return !s.buildingGraphics.contains(hash); });
+            {
+                const CompileWait waiting;
+                s.pipelineReady.wait(lock, [&] { return !s.buildingGraphics.contains(hash); });
+            }
             if (const auto failed = s.failedGraphics.find(hash); failed != s.failedGraphics.end()) {
                 failure = failed->second;
                 return false;
@@ -1211,7 +1302,7 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
                 stages += ")";
             }
             stages += " topology " + std::to_string(static_cast<int>(graphics.topology)) + " rect " + std::to_string(graphics.rectList) + " cull " + std::to_string(static_cast<int>(graphics.cullMode)) + " front " + std::to_string(static_cast<int>(graphics.frontFace)) + " mesh " + std::to_string(graphics.stages.mesh.has_value());
-            std::fprintf(stderr, "[native] draw into 0x%llx (%zu targets) %ux%u VkFormat %d blend %u mask 0x%x heap %d count %u:%s\n", static_cast<unsigned long long>(color.address), graphics.colors.size(), graphics.renderExtent.width, graphics.renderExtent.height, static_cast<int>(color.format), graphics.blends.empty() ? 0u : graphics.blends.front().blendEnable, graphics.blends.empty() ? 0u : graphics.blends.front().colorWriteMask, heap, work.count, stages.c_str());
+            if (Native::Logs()) std::fprintf(stderr, "[native] draw into 0x%llx (%zu targets) %ux%u VkFormat %d blend %u mask 0x%x heap %d count %u:%s\n", static_cast<unsigned long long>(color.address), graphics.colors.size(), graphics.renderExtent.width, graphics.renderExtent.height, static_cast<int>(color.format), graphics.blends.empty() ? 0u : graphics.blends.front().blendEnable, graphics.blends.empty() ? 0u : graphics.blends.front().colorWriteMask, heap, work.count, stages.c_str());
         }
     }
     const std::vector<std::shared_ptr<Graphics::StorageTexture>> owners(graphics.colors.size());
@@ -1221,8 +1312,9 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     // Shader data blocks: push constants (pushDataStartDword) or the ring.
     auto block = Graphics::AssemblePushConstants(compiled);
     std::vector<VkDescriptorBufferInfo> infos;
-    infos.reserve(bindings.size());
+    infos.reserve(bufferBindingCount);
     std::vector<VkWriteDescriptorSet> writes;
+    writes.reserve(bufferBindingCount);
     const auto alignment = std::max<VkDeviceSize>(s.context.limits.minStorageBufferOffsetAlignment, 16);
     for (const auto& stage : work.stages) {
         const auto dataBytes = stage.shaderData.size() * sizeof(std::uint32_t);
@@ -1293,11 +1385,22 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
         const std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4> words{work.count, work.firstVertex, work.firstInstance, work.indexed ? work.indexSize : 0u, 0u, 0u};
         std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
     }
+    const bool targetsChanged = views != s.lastViews || graphics.renderExtent.width != s.lastExtent.width || graphics.renderExtent.height != s.lastExtent.height;
+    const bool barrierNeeded = s.graphicsBarrier || targetsChanged || s.images->Recordings() != s.barrierRecordings || DrawBarriersRequested();
+    s.lastViews = views;
+    s.lastExtent = graphics.renderExtent;
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barrier.srcAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    if (barrierNeeded) {
+        vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        s.graphicsBarrier = false;
+        s.barrierRecordings = s.images->Recordings();
+    }
+    for (const auto& stage : work.stages) {
+        if (s.writesGuestMemory(*stage.shader)) s.graphicsBarrier = true;
+    }
     std::int32_t query = -1;
     {
         static const std::uint32_t wanted = [] { const char* text = std::getenv("APS5_NATIVE_DRAW_STATS"); return text != nullptr ? static_cast<std::uint32_t>(std::atoi(text)) : 0u; }();
@@ -1308,7 +1411,8 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
             info.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT | VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT | VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_EVALUATION_SHADER_INVOCATIONS_BIT;
             if (s.context.Function<PFN_vkCreateQueryPool>("vkCreateQueryPool")(s.vk, &info, nullptr, &s.statistics) == VK_SUCCESS) s.statisticsLeft = wanted;
         }
-        if (s.statisticsLeft != 0 && s.statisticsUsed < 64) {
+        static const std::uint64_t statisticsProgram = [] { const char* text = std::getenv("APS5_NATIVE_DRAW_STATS_PS"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+        if (s.statisticsLeft != 0 && s.statisticsUsed < 64 && (statisticsProgram == 0 || work.programAddresses[1] == statisticsProgram)) {
             --s.statisticsLeft;
             query = static_cast<std::int32_t>(s.statisticsUsed++);
             char name[96];
@@ -1320,6 +1424,11 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     char timedName[96];
     std::snprintf(timedName, sizeof(timedName), "draw vs 0x%llx ps 0x%llx %ux%u", static_cast<unsigned long long>(work.programAddresses[0]), static_cast<unsigned long long>(work.programAddresses[1]), graphics.renderExtent.width, graphics.renderExtent.height);
     const auto timed = s.beginTimed(timedName);
+    if (s.tracing) {
+        char line[256];
+        std::snprintf(line, sizeof(line), "%s target 0x%llx VkFormat %d count %u x%u heap %d depth %d", timedName, static_cast<unsigned long long>(graphics.colors.empty() ? 0ull : graphics.colors.front().address), static_cast<int>(graphics.colors.empty() ? VK_FORMAT_UNDEFINED : graphics.colors.front().format), work.count, work.instances, static_cast<int>(heap), static_cast<int>(graphics.depth.has_value()));
+        s.frameTrace.emplace_back(line);
+    }
     pipeline->Begin(s.commands, *framebuffer, graphics.renderExtent, graphics);
     if (query >= 0) s.context.Function<PFN_vkCmdBeginQuery>("vkCmdBeginQuery")(s.commands, s.statistics, static_cast<std::uint32_t>(query), 0);
     if (!writes.empty()) vkCmdPushDescriptorSetKHR(s.commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), 0, static_cast<std::uint32_t>(writes.size()), writes.data());
@@ -1349,6 +1458,174 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     Graphics::EndRenderPass(s.context, s.commands);
     s.endTimed(timed);
     return true;
+}
+
+namespace {
+
+std::uint32_t TexelBytes(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_UINT: return 1;
+        case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_UINT: return 2;
+        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+        case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_UINT:
+        case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return 4;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32G32_SFLOAT: return 8;
+        case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
+        case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGB_SRGB_BLOCK: case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+        case VK_FORMAT_BC4_UNORM_BLOCK: case VK_FORMAT_BC4_SNORM_BLOCK: return 8;
+        case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK: case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK:
+        case VK_FORMAT_BC5_UNORM_BLOCK: case VK_FORMAT_BC5_SNORM_BLOCK: case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+        case VK_FORMAT_BC7_UNORM_BLOCK: case VK_FORMAT_BC7_SRGB_BLOCK: return 16;
+        default: return 0;
+    }
+}
+
+}
+
+void NativeDevice::NoteFlip() {
+    static const double dumpAt = [] { const char* text = std::getenv("APS5_NATIVE_DUMP_TARGETS_AT"); return text != nullptr ? std::atof(text) : -1.0; }();
+    static const std::vector<std::uint64_t> named = [] {
+        std::vector<std::uint64_t> addresses;
+        if (const char* text = std::getenv("APS5_NATIVE_DUMP_ADDRESSES")) {
+            while (*text) {
+                char* end = nullptr;
+                const auto address = std::strtoull(text, &end, 0);
+                if (end == text) break;
+                addresses.push_back(address);
+                text = *end == ',' ? end + 1 : end;
+            }
+        }
+        return addresses;
+    }();
+    static const auto started = std::chrono::steady_clock::now();
+    static std::uint64_t frameStart = 0;
+    static bool dumped = false;
+    static int namedEvents = 0;
+    auto& s = *state;
+    std::lock_guard lock(s.workMutex);
+    const auto previous = frameStart;
+    frameStart = s.images->DrawSerial();
+    const char* directory = std::getenv("APS5_NATIVE_DUMP_DIR");
+    const std::filesystem::path root = directory != nullptr ? directory : "native-targets";
+    const auto dumpSurfaces = [&](const std::vector<NativeImages::DrawnTarget>& targets, const std::string& prefix) {
+        std::filesystem::create_directories(root);
+        struct Pending {
+            NativeImages::DrawnTarget target;
+            Import buffer;
+            void* mapping = nullptr;
+            std::size_t bytes = 0;
+        };
+        std::vector<Pending> pending;
+        s.begin();
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        for (const auto& target : targets) {
+            const auto texel = TexelBytes(target.format);
+            if (texel == 0) {
+                std::fprintf(stderr, "[native] target dump: 0x%llx VkFormat %d not dumped\n", static_cast<unsigned long long>(target.address), static_cast<int>(target.format));
+                continue;
+            }
+            Pending entry;
+            entry.target = target;
+            const bool blocks = target.format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && target.format <= VK_FORMAT_BC7_SRGB_BLOCK;
+            entry.bytes = blocks ? static_cast<std::size_t>((target.width + 3u) / 4u) * ((target.height + 3u) / 4u) * texel : static_cast<std::size_t>(target.width) * target.height * texel;
+            entry.buffer = s.hostBuffer(entry.bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, entry.mapping);
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {target.width, target.height, 1};
+            s.context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(s.commands, target.image, VK_IMAGE_LAYOUT_GENERAL, entry.buffer.buffer, 1, &region);
+            pending.push_back(std::move(entry));
+        }
+        s.flushLocked();
+        for (const auto& entry : pending) {
+            char name[192];
+            std::snprintf(name, sizeof(name), "%starget_%012llx_%ux%u_f%d_d%llu.bin", prefix.c_str(), static_cast<unsigned long long>(entry.target.address), entry.target.width, entry.target.height, static_cast<int>(entry.target.format), static_cast<unsigned long long>(entry.target.drawn));
+            std::ofstream file(root / name, std::ios::binary);
+            file.write(static_cast<const char*>(entry.mapping), static_cast<std::streamsize>(entry.bytes));
+            if (entry.target.guestBytes != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(entry.target.address), entry.target.guestBytes)) {
+                std::snprintf(name, sizeof(name), "%sguest_%012llx_%ux%u_fmt%u_tile%u.bin", prefix.c_str(), static_cast<unsigned long long>(entry.target.address), entry.target.width, entry.target.height, entry.target.guestFormat, entry.target.tileMode);
+                std::ofstream(root / name, std::ios::binary).write(reinterpret_cast<const char*>(entry.target.address), static_cast<std::streamsize>(entry.target.guestBytes));
+            }
+            s.context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(s.vk, entry.buffer.buffer, nullptr);
+            s.context.Function<PFN_vkFreeMemory>("vkFreeMemory")(s.vk, entry.buffer.memory, nullptr);
+        }
+        std::fprintf(stderr, "[native] target dump: %zu surfaces written to %s (%s)\n", pending.size(), root.string().c_str(), prefix.c_str());
+    };
+    if (!named.empty() && namedEvents < 4) {
+        bool hit = dumpAt >= 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= dumpAt + 10.0 * namedEvents;
+        for (const auto& target : s.images->DrawnTargets(previous)) hit = hit || std::find(named.begin(), named.end(), target.address) != named.end();
+        if (hit) {
+            std::vector<NativeImages::DrawnTarget> surfaces;
+            for (const auto address : named) {
+                const auto found = s.images->SurfacesAt(address);
+                surfaces.insert(surfaces.end(), found.begin(), found.end());
+            }
+            char prefix[32];
+            std::snprintf(prefix, sizeof(prefix), "named%d_", namedEvents++);
+            dumpSurfaces(surfaces, prefix);
+        }
+    }
+    if (!s.requestedDumps.empty()) {
+        static int requestedEvents = 0;
+        std::vector<NativeImages::DrawnTarget> surfaces;
+        for (const auto address : s.requestedDumps) {
+            const auto found = s.images->SurfacesAt(address);
+            surfaces.insert(surfaces.end(), found.begin(), found.end());
+        }
+        s.requestedDumps.clear();
+        char prefix[32];
+        std::snprintf(prefix, sizeof(prefix), "traced%d_", requestedEvents++);
+        dumpSurfaces(surfaces, prefix);
+    }
+    if (dumpAt < 0 || dumped || std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() < dumpAt) return;
+    if (!s.tracing) {
+        s.tracing = true;
+        s.frameTrace.clear();
+        return;
+    }
+    s.tracing = false;
+    dumped = true;
+    dumpSurfaces(s.images->DrawnTargets(previous), "");
+    std::ofstream trace(root / "frame-trace.txt");
+    for (const auto& line : s.frameTrace) trace << line << '\n';
+}
+
+void NativeDevice::RequestSurfaceDump(std::uint64_t address) {
+    std::lock_guard lock(state->workMutex);
+    state->requestedDumps.push_back(address);
+}
+
+bool NativeDevice::WritesGuestMemory(const ShaderRecompiler::RecompileResult& shader) {
+    std::lock_guard lock(state->workMutex);
+    return state->writesGuestMemory(shader);
+}
+
+void NativeDevice::MarkTextureMemoryWritten(std::uint64_t begin, std::uint64_t end) {
+    std::lock_guard lock(state->workMutex);
+    state->images->MarkGpuWritten(begin, end);
+}
+
+std::string NativeDevice::TextureOverlap(std::uint64_t begin, std::uint64_t end) {
+    std::lock_guard lock(state->workMutex);
+    return state->images->DescribeUploadedOverlap(begin, end);
+}
+
+bool NativeDevice::TextureRegistered(std::span<const std::uint32_t, 8> words) {
+    std::lock_guard lock(state->workMutex);
+    return state->images->Registered(words);
+}
+
+void NativeDevice::NoteSubmission() {
+    std::lock_guard lock(state->workMutex);
+    state->images->NewBatch();
+}
+
+void NativeDevice::RequireBarrier() {
+    std::lock_guard lock(state->workMutex);
+    state->graphicsBarrier = true;
 }
 
 ShaderRecompiler::SpirvTarget NativeDevice::GraphicsTarget() const {
@@ -1384,6 +1661,55 @@ void NativeDevice::AfterBatch(std::function<void()> action) {
 bool NativeDevice::Pending() const {
     std::lock_guard lock(state->workMutex);
     return state->recording;
+}
+
+std::shared_ptr<Graphics::PipelineJournalReplay> NativeDevice::ReplayPipelineJournal(bool prepareAll) {
+    Graphics::PipelineJournalHooks hooks;
+    hooks.nativeGraphics = [this, prepareAll](const Graphics::GraphicsPipelineRecipe& recipe, std::span<const Graphics::CompiledShader> shaders) {
+        return ReplayGraphicsPipeline(recipe, shaders, prepareAll);
+    };
+    hooks.prepareAll = prepareAll;
+    return state->driverDevice->ReplayPipelineJournal(std::move(hooks));
+}
+
+bool NativeDevice::ReplayGraphicsPipeline(const Graphics::GraphicsPipelineRecipe& recipe, std::span<const Graphics::CompiledShader> shaders, bool prepareAll) {
+    auto& s = *state;
+    if (recipe.splitSets || !recipe.fragmentLayoutKey.empty()) throw std::runtime_error("native pipeline journal requires a single stage-buffer set");
+    for (const auto& shader : shaders) {
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.descriptorSet == ShaderRecompiler::RuntimeAbi::NativeHeap::Set && (binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers)) continue;
+            if (binding.descriptorSet != 0 || binding.count != 1) throw std::runtime_error("native pipeline journal has an unsupported buffer set or count");
+            if (binding.role != ShaderRecompiler::DescriptorRole::BdaPagetable && binding.role != ShaderRecompiler::DescriptorRole::FaultBuffer && binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::Gds) throw std::runtime_error("native pipeline journal has an unsupported buffer role");
+            bool found = false;
+            for (std::size_t index = 0; index + 1 < s.graphicsLayoutKey.size(); index += 2) {
+                if (s.graphicsLayoutKey[index] == binding.binding && (s.graphicsLayoutKey[index + 1] & Graphics::VulkanStage(shader.stage)) != 0) found = true;
+            }
+            if (!found) throw std::runtime_error("native pipeline journal binding is outside the canonical layout");
+        }
+    }
+    const Graphics::PipelineSetLayouts layouts{s.graphicsLayout, VK_NULL_HANDLE, false, s.graphicsLayoutKey, {}, s.images->HeapLayout(), s.emptyLayout};
+    bool created = false;
+    const auto pipeline = Graphics::CachedPipeline(s.context, recipe.state, recipe.vertexInput, layouts, shaders, recipe.attachmentLayout, &created);
+    if (prepareAll) pipeline->PrepareOptimization();
+    return created;
+}
+
+bool NativeDevice::PrebuildGraphicsLibrary(const ShaderRecompiler::RecompileResult& shader, ShaderRecompiler::ShaderStage stage, std::uint32_t wave, std::uint32_t pushOffset, const std::optional<ShaderRecompiler::MeshConfiguration>& mesh) {
+    auto& s = *state;
+    std::unique_lock lock(s.workMutex);
+    const auto& key = s.graphicsLayoutKey;
+    const auto layout = s.graphicsLayout;
+    for (const auto& binding : shader.bindings) {
+        if (binding.descriptorSet == ShaderRecompiler::RuntimeAbi::NativeHeap::Set) continue;
+        if (binding.descriptorSet != 0) throw std::runtime_error("native graphics preparation requires stage buffers in set 0");
+        if (binding.role != ShaderRecompiler::DescriptorRole::BdaPagetable && binding.role != ShaderRecompiler::DescriptorRole::FaultBuffer && binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::Gds) throw std::runtime_error("unsupported native graphics preparation binding role");
+    }
+    const Graphics::PipelineSetLayouts layouts{layout, VK_NULL_HANDLE, false, key, {}, s.images->HeapLayout(), s.emptyLayout};
+    lock.unlock();
+    const bool fragment = stage == ShaderRecompiler::ShaderStage::Fragment;
+    Graphics::ShaderStages stages{Graphics::ShaderPath::Vertex, 0u, fragment ? 32u : wave, fragment ? wave : 32u, mesh, {}};
+    const std::array<Graphics::CompiledShader, 1> shaders{{{stage, &shader, pushOffset}}};
+    return s.driverDevice->PrebuildGraphicsLibraries(stages, shaders, &layouts);
 }
 
 bool NativeDevice::PrebuildCompute(const ShaderRecompiler::RecompileResult& shader, std::string& failure) {

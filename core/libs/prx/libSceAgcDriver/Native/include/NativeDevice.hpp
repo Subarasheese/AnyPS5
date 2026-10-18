@@ -23,6 +23,9 @@ namespace AgcDriver {
 class VulkanDevice;
 namespace Graphics {
 struct State;
+struct GraphicsPipelineRecipe;
+struct CompiledShader;
+class PipelineJournalReplay;
 }
 }
 
@@ -70,6 +73,8 @@ public:
         std::uint64_t indirectArguments = 0;   // DISPATCH_INDIRECT: the group counts' address in GT7's memory (read by the GPU)
     };
     bool Dispatch(const ComputeWork& work, std::string& failure);
+    std::shared_ptr<Graphics::PipelineJournalReplay> ReplayPipelineJournal(bool prepareAll = false);
+    bool PrebuildGraphicsLibrary(const ShaderRecompiler::RecompileResult& shader, ShaderRecompiler::ShaderStage stage, std::uint32_t wave, std::uint32_t pushOffset, const std::optional<ShaderRecompiler::MeshConfiguration>& mesh);
     bool PrebuildCompute(const ShaderRecompiler::RecompileResult& shader, std::string& failure);
     // DMA_DATA to/from the persistent device-local GDS; false for other DMA.
     bool DmaGds(std::span<const std::uint32_t> packet);
@@ -108,9 +113,18 @@ public:
     // is open: GT7's end-of-pipe events (RELEASE_MEM label writes and interrupts).
     void AfterBatch(std::function<void()> action);
     bool Pending() const;
+    void RequireBarrier();
+    void NoteFlip();
+    void NoteSubmission();
+    bool WritesGuestMemory(const ShaderRecompiler::RecompileResult& shader);
+    std::string TextureOverlap(std::uint64_t begin, std::uint64_t end);
+    void MarkTextureMemoryWritten(std::uint64_t begin, std::uint64_t end);
+    bool TextureRegistered(std::span<const std::uint32_t, 8> words);
+    void RequestSurfaceDump(std::uint64_t address);
 
 private:
     explicit NativeDevice(std::shared_ptr<VulkanDevice> device);
+    bool ReplayGraphicsPipeline(const Graphics::GraphicsPipelineRecipe& recipe, std::span<const Graphics::CompiledShader> shaders, bool prepareAll);
     struct State;
     std::unique_ptr<State> state;
 };

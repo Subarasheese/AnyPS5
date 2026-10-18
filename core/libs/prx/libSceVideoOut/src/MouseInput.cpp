@@ -81,12 +81,12 @@ bool MouseInput::CaptureWanted(bool allowed) const {
     return allowed && focused && MouseIsOpen_nid_no_patch();
 }
 
-void MouseInput::UpdateCapture(bool allowed) {
+void MouseInput::UpdateCapture(bool allowed, bool fullscreen) {
     if (!allowed) {
         captured = false;
         return;
     }
-    const bool wanted = CaptureWanted(allowed);
+    const bool wanted = fullscreen && CaptureWanted(allowed);
     if (wanted == captured && (SDL_GetRelativeMouseMode() == SDL_TRUE) == wanted) return;
     if (SDL_SetRelativeMouseMode(wanted ? SDL_TRUE : SDL_FALSE) != 0) {
         static bool warned = false;

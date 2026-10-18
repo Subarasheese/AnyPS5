@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StageLibraryCapture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "ShaderDiskCache.hpp"
 #include "prx/libSceAgcDriver/Native/include/NativeDevice.hpp"
 #include <memory>
@@ -14,25 +15,119 @@
 #include <cstring>
 #include <filesystem>
 #include <vector>
+#include <atomic>
+#include <exception>
+#include <mutex>
+#include <thread>
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_graphics_library_prepare [--live] [--mesh-only] [--native-compute] <directory of captures or requests>...\n");
+        std::fprintf(stderr, "usage: agc_graphics_library_prepare [--live] [--mesh-only] [--native-compute] [--native-graphics] <directory of captures or requests>...\n       agc_graphics_library_prepare --native-journal\n");
         return 2;
     }
     try {
         const bool nativeCompute = std::any_of(argv + 1, argv + argc, [](const char* argument) { return std::string_view(argument) == "--native-compute"; });
+        const bool nativeGraphics = std::any_of(argv + 1, argv + argc, [](const char* argument) { return std::string_view(argument) == "--native-graphics"; });
+        const bool nativeJournal = std::any_of(argv + 1, argv + argc, [](const char* argument) { return std::string_view(argument) == "--native-journal"; });
         auto driver = std::make_shared<AgcDriver::VulkanDevice>();
         auto& device = *driver;
-        auto* native = nativeCompute ? &AgcDriver::Native::NativeDevice::Create(driver) : nullptr;
+        auto* native = (nativeCompute || nativeGraphics || nativeJournal) ? &AgcDriver::Native::NativeDevice::Create(driver) : nullptr;
+        if (nativeJournal) {
+            const auto replay = native->ReplayPipelineJournal(true);
+            if (replay == nullptr) throw std::runtime_error("native pipeline journal preparation is disabled");
+            replay->Wait();
+            const auto totals = AgcDriver::Graphics::PipelineJournalTotals();
+            device.SavePipelineCache();
+            std::printf("Native journal: %llu loaded, %llu graphics built, %llu present, %llu skipped, %llu rejected, %llu failed in %.0f ms\n",
+                static_cast<unsigned long long>(totals.loadedRecipes), static_cast<unsigned long long>(totals.replayedGraphics),
+                static_cast<unsigned long long>(totals.replayPresent), static_cast<unsigned long long>(totals.replaySkipped),
+                static_cast<unsigned long long>(totals.replayRejected), static_cast<unsigned long long>(totals.replayFailed), totals.replayMs);
+            return totals.replayFailed == 0 && totals.writeFailures == 0 ? 0 : 1;
+        }
         std::uint64_t prepared = 0;
         std::uint64_t liveOnly = 0;
         std::set<std::uint64_t> registrationModules;
         std::set<std::uint64_t> liveModules;
         bool live = false;
         bool meshOnly = false;
-        for (int argument = 1; argument < argc; ++argument) {
-            if (std::string_view(argv[argument]) == "--native-compute") continue;
+        if (nativeCompute || nativeGraphics) {
+            std::vector<std::filesystem::path> files;
+            for (int argument = 1; argument < argc; ++argument) {
+                if (std::string_view(argv[argument]).starts_with("--")) continue;
+                for (const auto& file : std::filesystem::directory_iterator(argv[argument])) {
+                    if (file.is_regular_file() && file.path().extension() == ".req") files.push_back(file.path());
+                }
+            }
+            std::sort(files.begin(), files.end());
+            std::mutex mutex;
+            std::atomic<std::size_t> next{0};
+            std::exception_ptr failure;
+            const auto prepareFile = [&](const std::filesystem::path& path) {
+                std::vector<std::byte> requestBytes;
+                if (!ShaderRecompiler::ReadWholeFile(path, requestBytes)) throw std::runtime_error("cannot read request: " + path.string());
+                auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(std::string_view(reinterpret_cast<const char*>(requestBytes.data()), requestBytes.size()));
+                const auto stage = request.request.shader.stage;
+                if (nativeCompute) {
+                    if (stage != ShaderRecompiler::ShaderStage::Compute) return;
+                    request.request.target = native->ComputeTarget(request.request.context.waveSize);
+                    if (request.request.context.floatMode && std::getenv("APS5_NATIVE_EXACT_DENORMALS") == nullptr) request.request.context.floatMode->floatMode |= 0x30u;
+                    const auto result = ShaderRecompiler::Recompile(request.request);
+                    {
+                        std::lock_guard lock(mutex);
+                        if (!liveModules.insert(result.PipelineVariantId()).second) return;
+                    }
+                    std::string reason;
+                    if (!native->PrebuildCompute(result, reason)) throw std::runtime_error("native compute preparation: " + reason);
+                    std::lock_guard lock(mutex);
+                    std::printf("Prepared native compute pipeline %llu: %s\n", static_cast<unsigned long long>(++prepared), path.filename().string().c_str());
+                    std::fflush(stdout);
+                    return;
+                }
+                if (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment && stage != ShaderRecompiler::ShaderStage::Mesh) return;
+                request.request.target = native->GraphicsTarget();
+                if (request.request.context.floatMode && std::getenv("APS5_NATIVE_EXACT_DENORMALS") == nullptr) request.request.context.floatMode->floatMode |= 0x30u;
+                const auto result = ShaderRecompiler::Recompile(request.request);
+                {
+                    std::lock_guard lock(mutex);
+                    if (!liveModules.insert(result.PipelineVariantId()).second) return;
+                }
+                const auto mesh = stage == ShaderRecompiler::ShaderStage::Mesh && request.request.graphics ? request.request.graphics->mesh : std::nullopt;
+                const bool built = native->PrebuildGraphicsLibrary(result, stage, request.request.context.waveSize, request.request.layout.pushConstantOffsetBytes, mesh);
+                std::lock_guard lock(mutex);
+                if (!built) {
+                    ++liveOnly;
+                    std::fprintf(stderr, "Translated native graphics request requires live pipeline state: %s\n", path.filename().string().c_str());
+                    return;
+                }
+                std::printf("Prepared native graphics library %llu: %s\n", static_cast<unsigned long long>(++prepared), path.filename().string().c_str());
+                if (prepared % 32u == 0u) device.SavePipelineCache();
+                std::fflush(stdout);
+            };
+            const auto work = [&] {
+                for (;;) {
+                    const auto index = next.fetch_add(1);
+                    if (index >= files.size()) return;
+                    {
+                        std::lock_guard lock(mutex);
+                        if (failure) return;
+                    }
+                    try {
+                        prepareFile(files[index]);
+                    } catch (...) {
+                        std::lock_guard lock(mutex);
+                        if (!failure) failure = std::current_exception();
+                        return;
+                    }
+                }
+            };
+            const char* requested = std::getenv("APS5_PREPARE_THREADS");
+            const unsigned threads = requested != nullptr ? std::max(1, std::atoi(requested)) : std::max(1u, std::thread::hardware_concurrency() / 2u);
+            std::vector<std::thread> pool;
+            for (unsigned i = 0; i < threads; ++i) pool.emplace_back(work);
+            for (auto& thread : pool) thread.join();
+            if (failure) std::rethrow_exception(failure);
+        }
+        for (int argument = 1; !nativeCompute && !nativeGraphics && argument < argc; ++argument) {
             if (std::string_view(argv[argument]) == "--live") { live = true; continue; }
             if (std::string_view(argv[argument]) == "--mesh-only") { meshOnly = true; continue; }
             for (const auto& file : std::filesystem::directory_iterator(argv[argument])) {
@@ -43,18 +138,6 @@ int main(int argc, char** argv) {
                     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(
                         std::string_view(reinterpret_cast<const char*>(requestBytes.data()), requestBytes.size()));
                     const auto stage = request.request.shader.stage;
-                    if (nativeCompute) {
-                        if (stage != ShaderRecompiler::ShaderStage::Compute) continue;
-                        request.request.target = native->ComputeTarget(request.request.context.waveSize);
-                        if (request.request.context.floatMode && std::getenv("APS5_NATIVE_EXACT_DENORMALS") == nullptr) request.request.context.floatMode->floatMode |= 0x30u;
-                        const auto result = ShaderRecompiler::Recompile(request.request);
-                        if (!liveModules.insert(result.PipelineVariantId()).second) continue;
-                        std::string failure;
-                        if (!native->PrebuildCompute(result, failure)) throw std::runtime_error("native compute preparation: " + failure);
-                        std::printf("Prepared native compute pipeline %llu: %s\n", static_cast<unsigned long long>(++prepared), file.path().filename().string().c_str());
-                        std::fflush(stdout);
-                        continue;
-                    }
                     const bool fragment = stage == ShaderRecompiler::ShaderStage::Fragment;
                     const bool mesh = stage == ShaderRecompiler::ShaderStage::Mesh;
                     if (meshOnly && !mesh) continue;
@@ -96,7 +179,7 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     continue;
                 }
-                if (nativeCompute || !file.is_regular_file()) continue;
+                if (!file.is_regular_file()) continue;
                 const auto filename = file.path().filename().string();
                 const bool fragmentCapture = filename.ends_with(".fragment.bin");
                 const bool vertexCapture = filename.ends_with(".vertex.bin");

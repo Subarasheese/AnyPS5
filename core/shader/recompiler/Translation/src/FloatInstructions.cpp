@@ -130,6 +130,7 @@ bool TranslationContext::float16Unary(const RdnaInstruction& inst, IrOpcode opco
 }
 
 std::pair<IrF32, IrU1> TranslationContext::unaryFloatSpecials(IrOpcode opcode, IrF32 argument, IrF32 result) {
+    if (hostFloat && opcode != IrOpcode::FPFract32) return {result, IrU1(ir.ConstantBool(false))};
     const IrU32 bits(ir.BitCastU32(argument.Value()));
     const IrU32 magnitude(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)));
     const IrU32 sign(ir.BitwiseAnd(bits.Value(), ir.Constant(0x80000000u)));
@@ -595,6 +596,10 @@ bool TranslationContext::floatUnary(const RdnaInstruction& inst, IrOpcode opcode
     const IrU32 bits = flushF32Denormal(readU32(sourceAt(inst, 0u)));
     const IrF32 argument(ir.BitCastF32(bits.Value()));
     const auto [result, invalid] = unaryFloatSpecials(opcode, argument, IrF32(ir.Emit(opcode, IrType::F32, {&argument.Value()})));
+    if (hostFloat && opcode != IrOpcode::FPFract32) {
+        writeOperand(inst.destination, &result.Value());
+        return true;
+    }
     const IrU1 nan(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)));
     const IrU32 special(ir.Select(nan.Value(), quietNan32(bits).Value(), ir.Constant(0xffc00000u)));
     const IrF32 value(ir.Select(ir.LogicalOr(nan.Value(), invalid.Value()), ir.BitCastF32(special.Value()), result.Value()));

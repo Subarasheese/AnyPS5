@@ -4,7 +4,7 @@ add_library(libScePngDec SHARED EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/Exp
 target_include_directories(libScePngDec PRIVATE ${LIBS_INCLUDE_DIR})
 set_target_properties(libScePngDec PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(libScePngDec)
-target_link_libraries(libScePngDec PRIVATE decoder_png)
+target_link_libraries(libScePngDec PRIVATE decoder_png libSceAgcDriver)
 
 if(BUILD_TESTING)
     add_test_executable(guest_png_dec_tests ${LIBS_INCLUDE_DIR}/tests/GuestPngDec.cpp)

@@ -9,7 +9,7 @@ public:
     void HandleEvent(const SDL_Event& event, unsigned windowId);
     void SetPresentation(std::uint32_t sourceWidth, std::uint32_t sourceHeight, std::uint32_t presentedWidth, std::uint32_t presentedHeight);
     bool CaptureWanted(bool allowed) const;
-    void UpdateCapture(bool allowed);
+    void UpdateCapture(bool allowed, bool fullscreen = true);
 
 private:
     std::int32_t scaled(std::int32_t delta, double scale, double& remainder);

@@ -905,7 +905,7 @@ private:
         std::call_once(loadOnce, [&] {
             try {
                 auto journal = Journal::Instance().Load();
-                const auto limit = configured("APS5_PIPELINE_JOURNAL_ENTRIES", 1024u);
+                const auto limit = configured("APS5_PIPELINE_JOURNAL_ENTRIES", hooks.prepareAll ? journal.entries.size() : 1024u);
                 if (journal.entries.size() > limit) journal.entries.resize(static_cast<std::size_t>(limit));
                 loaded = std::move(journal);
             } catch (const std::exception& error) {
@@ -962,8 +962,16 @@ private:
             return;
         }
         const auto store = PipelineStoreTotals();
-        if (store.cached >= store.bound) {
+        if (!hooks.prepareAll && store.cached >= store.bound) {
             counters.skipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!entry.graphics.mainLayoutKey.empty() && entry.graphics.mainLayoutKey.back() == 0x4e48u) {
+            if (!hooks.nativeGraphics) {
+                counters.rejected.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            (hooks.nativeGraphics(entry.graphics, shaders) ? counters.graphics : counters.present).fetch_add(1, std::memory_order_relaxed);
             return;
         }
         const auto layouts = DescribeSetLayouts(context, shaders);

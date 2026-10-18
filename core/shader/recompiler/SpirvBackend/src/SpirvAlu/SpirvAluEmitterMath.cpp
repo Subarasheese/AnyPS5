@@ -828,6 +828,12 @@ std::uint32_t EmitFPMaxTri32(SpirvEmitterState& state, std::uint32_t arg0, std::
 }
 
 std::uint32_t EmitFPMedTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    if (state.program.Metadata().hostFloat) {
+        const auto f32 = TypeF32(state);
+        const auto low = EmitExt(state, f32, GLSLstd450NMin, {arg0, arg1});
+        const auto high = EmitExt(state, f32, GLSLstd450NMax, {arg0, arg1});
+        return EmitExt(state, f32, GLSLstd450NMax, {low, EmitExt(state, f32, GLSLstd450NMin, {high, arg2})});
+    }
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
     const auto bits = [&](std::uint32_t value) { return Unary(state, spv::OpBitcast, u32, value); };
@@ -884,6 +890,7 @@ std::uint32_t Log2SeriesNearOne(SpirvEmitterState& state, std::uint32_t differen
 
 std::uint32_t EmitFPLog2(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto value = EmitExt(state, TypeF32(state), GLSLstd450Log2, {arg0});
+    if (state.program.Metadata().hostFloat) return value;
     const auto difference = Exact(state, Binary(state, spv::OpFSub, TypeF32(state), arg0, ConstantF32(state, 0x3f800000u)));
     const auto series = Log2SeriesNearOne(state, difference);
     const auto valueBits = Unary(state, spv::OpBitcast, TypeU32(state), value);
@@ -928,6 +935,7 @@ std::uint32_t TrigLinearNearZero(SpirvEmitterState& state, std::uint32_t value, 
 
 std::uint32_t EmitFPSin(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto cycle = EmitTrigCycleF32(state, arg0, true);
+    if (state.program.Metadata().hostFloat) return EmitExt(state, TypeF32(state), GLSLstd450Sin, {Binary(state, spv::OpFMul, TypeF32(state), cycle, ConstantF32(state, 0x40c90fdbu))});
     const auto absolute = EmitExt(state, TypeF32(state), GLSLstd450FAbs, {cycle});
     const auto signBits = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Unary(state, spv::OpBitcast, TypeU32(state), cycle), ConstantU32(state, 0x80000000u));
     const auto nearHalf = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), absolute, ConstantF32(state, 0x3e800000u));
@@ -942,6 +950,7 @@ std::uint32_t EmitFPSin(SpirvEmitterState& state, std::uint32_t arg0) {
 
 std::uint32_t EmitFPCos(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto cycle = EmitTrigCycleF32(state, arg0, false);
+    if (state.program.Metadata().hostFloat) return EmitExt(state, TypeF32(state), GLSLstd450Cos, {Binary(state, spv::OpFMul, TypeF32(state), cycle, ConstantF32(state, 0x40c90fdbu))});
     const auto absolute = EmitExt(state, TypeF32(state), GLSLstd450FAbs, {cycle});
     const auto distance = Exact(state, Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3e800000u), absolute));
     const auto low = CosTurnSeries(state, absolute);

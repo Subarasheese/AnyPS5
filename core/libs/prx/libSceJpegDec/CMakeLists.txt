@@ -6,7 +6,7 @@ add_library(libSceJpegDec SHARED EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/Ex
 target_include_directories(libSceJpegDec PRIVATE ${LIBS_INCLUDE_DIR})
 set_target_properties(libSceJpegDec PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(libSceJpegDec)
-target_link_libraries(libSceJpegDec PRIVATE decoder_jpeg)
+target_link_libraries(libSceJpegDec PRIVATE decoder_jpeg libSceAgcDriver)
 
 if(BUILD_TESTING)
     add_test_executable(guest_jpeg_dec_tests ${LIBS_INCLUDE_DIR}/tests/GuestJpegDec.cpp)

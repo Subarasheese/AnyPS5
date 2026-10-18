@@ -13,11 +13,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include <cstdint>
 #include <atomic>
+#include <string>
 
 namespace AgcDriver::Native {
 
 bool Enabled();
-// The default native renderer (in development): GT7's command buffers run on the native
+// The default native renderer: GT7's command buffers run on the native
 // executor (native compute and draws on the driver's Vulkan device, no PM4 emulation).
 bool GpuNative();
 // CPU-only profiling (APS5_NATIVE_SKIP_DRAWS=1): draw packets are counted and not rendered.
@@ -31,6 +32,8 @@ public:
     BackgroundSlot(const BackgroundSlot&) = delete;
     BackgroundSlot& operator=(const BackgroundSlot&) = delete;
 };
+bool Logs();
+void ReportGraphicsIssue(const std::string& category, const std::string& detail);
 // Per-frame statistics (APS5_NATIVE_STATS=1), counted at each presented frame.
 void NotePresent();
 

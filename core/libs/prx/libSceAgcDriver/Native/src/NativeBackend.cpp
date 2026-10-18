@@ -13,6 +13,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -103,6 +104,51 @@ const bool hooksInstalled = [] {
     if (Enabled()) InstallGraphicsContextHooks();
     return true;
 }();
+}
+
+namespace {
+
+struct GraphicsIssues {
+    std::mutex mutex;
+    std::map<std::string, std::uint64_t> counts;
+    bool dirty = false;
+    std::chrono::steady_clock::time_point written{};
+};
+
+GraphicsIssues& Issues() {
+    static GraphicsIssues issues;
+    return issues;
+}
+
+void WriteGraphicsIssues(GraphicsIssues& issues) {
+    std::vector<std::pair<std::string, std::uint64_t>> sorted(issues.counts.begin(), issues.counts.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (std::FILE* file = std::fopen("graphics-issues.txt", "w")) {
+        for (const auto& [issue, count] : sorted) std::fprintf(file, "%10llu  %s\n", static_cast<unsigned long long>(count), issue.c_str());
+        std::fclose(file);
+    }
+    issues.dirty = false;
+    issues.written = std::chrono::steady_clock::now();
+}
+
+}
+
+void ReportGraphicsIssue(const std::string& category, const std::string& detail) {
+    auto& issues = Issues();
+    std::lock_guard lock(issues.mutex);
+    const auto key = category + ": " + detail;
+    if (issues.counts[key]++ == 0) {
+        std::fprintf(stderr, "[graphics] %s\n", key.c_str());
+        WriteGraphicsIssues(issues);
+        return;
+    }
+    issues.dirty = true;
+    if (std::chrono::steady_clock::now() - issues.written > std::chrono::seconds(10)) WriteGraphicsIssues(issues);
+}
+
+bool Logs() {
+    static const bool logs = EnvSet("APS5_NATIVE_LOG") || EnvSet("APS5_NATIVE_STATS");
+    return logs;
 }
 
 bool GpuNative() {

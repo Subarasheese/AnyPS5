@@ -1825,7 +1825,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         byteFeatures.pNext = &subgroupSizeFeatures;
         APS5_LOG_OUT("Wave32 programs run on subgroups of %u: compute %d, mesh %d", 32u, state->computeWave32, state->meshWave32);
     }
-    if (std::getenv("APS5_SPANNED_WAVE") != nullptr) {
+    if (std::getenv("APS5_SPANNED_WAVE") != nullptr || (Native::GpuNative() && std::getenv("APS5_NATIVE_TWO_LANES") == nullptr)) {
         state->spannedWaves = state->computeFullSubgroups;
         APS5_LOG_OUT("APS5_SPANNED_WAVE: single-wave wave64 compute spans two full 32-lane subgroups: %d", state->spannedWaves);
     }
@@ -2040,7 +2040,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // (Driver::AttachWindow): its replay starts at its first draw or dispatch instead, so the
     // journal is replayed once, on the device the title draws with.
     state->journalReplayPending.store(!compileOnly, std::memory_order_release);
-    if (window != nullptr) startJournalReplay();
+    if (window != nullptr && !Native::GpuNative()) startJournalReplay();
 }
 
 void VulkanDevice::startJournalReplay() {
@@ -2886,7 +2886,7 @@ bool VulkanDevice::PresentClear(std::uint32_t width, std::uint32_t height, bool 
 }
 
 void VulkanDevice::PresentPixels(std::uint32_t width, std::uint32_t height, std::span<const std::byte> pixels) {
-    APS5_LOG_OUT("PresentPixels width=%u height=%u pixels=%zu expected=%llu", width, height, pixels.size(), static_cast<unsigned long long>(width) * height * 4u);
+    APS5_LOG_OUT_DEBUG("PresentPixels width=%u height=%u pixels=%zu expected=%llu", width, height, pixels.size(), static_cast<unsigned long long>(width) * height * 4u);
     require(width != 0 && height != 0 && width <= 16384 && height <= 16384, "invalid display image extent");
     require(pixels.size() == static_cast<std::uint64_t>(width) * height * 4, "invalid display pixel buffer size");
     // Debug aid: APS5_DUMP_FRAMES=<n> saves the first n presented frames as frame_<index>.bmp.
@@ -3711,11 +3711,21 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
 }
 
+std::shared_ptr<Graphics::PipelineJournalReplay> VulkanDevice::ReplayPipelineJournal(Graphics::PipelineJournalHooks hooks) {
+    if (state->journalReplay != nullptr) {
+        state->journalReplay->Cancel();
+        state->journalReplay->Wait();
+    }
+    state->journalReplayPending.store(false, std::memory_order_release);
+    state->journalReplay = Graphics::StartPipelineJournalReplay(graphicsContext(), Graphics::PipelineJournalDeviceFingerprint(state->properties), std::move(hooks));
+    return state->journalReplay;
+}
+
 void VulkanDevice::SavePipelineCache() {
     if (state->pipelineCache != nullptr) state->pipelineCache->SaveNow();
 }
 
-bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders) {
+bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders, const Graphics::PipelineSetLayouts* nativeLayouts) {
     PerformanceTimer timing("Vulkan.GraphicsPipelinePrebuild");
     const auto context = graphicsContext();
     if (!context.graphicsPipelineLibrary || context.descriptorCache == nullptr) return false;
@@ -3749,6 +3759,7 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
         if (vertex) group.insert(group.begin(), {ShaderRecompiler::ShaderStage::Vertex, vertexStub.get(), 0u});
         else group.push_back({ShaderRecompiler::ShaderStage::Fragment, fragmentStub.get(), Graphics::PipelinePushSlotBytes});
     }
+    if (nativeLayouts != nullptr) return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, *nativeLayouts, group);
     const auto layouts = Graphics::DescribeSetLayouts(context, group);
     return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
 }

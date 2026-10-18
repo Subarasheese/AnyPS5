@@ -61,6 +61,7 @@ bool Replay(const char* path) {
         request.request.target.registrationModules = true;
         request.request.target.nativeImageTable = 1u;
         request.request.target.nativeSamplerTable = 1u;
+        if (std::getenv("APS5_SPANNED_WAVE") != nullptr) request.request.target.spannedWaves = true;
         // As the native renderer translates: FP32 denormals left to the host GPU (NativeFloatMode).
         if (request.request.context.floatMode && std::getenv("APS5_NATIVE_EXACT_DENORMALS") == nullptr) request.request.context.floatMode->floatMode |= 0x30u;
     }
