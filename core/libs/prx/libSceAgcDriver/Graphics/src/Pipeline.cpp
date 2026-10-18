@@ -793,6 +793,14 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     Continue(commands, state);
 }
 
+std::vector<std::uint64_t> Pipeline::PassKey(const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
+    if (!dynamicRendering) return {};
+    std::vector<std::uint64_t> key{extent.width, extent.height, state.renderLayers, static_cast<std::uint64_t>(attachmentLayout), static_cast<std::uint64_t>(depthFormat)};
+    for (const auto view : framebuffer.Views()) key.push_back(reinterpret_cast<std::uint64_t>(view));
+    for (const auto slot : colorSlots) key.push_back(slot);
+    return key;
+}
+
 void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;

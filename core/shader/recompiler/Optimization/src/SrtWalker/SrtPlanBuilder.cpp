@@ -91,7 +91,7 @@ void PlanBuilder::Record(IrValue* inst) {
         return;
     }
     IrValue* offset = inst->Argument(1)->Resolve();
-    const auto foldable = !_program.Metadata().gpuResolvedResources && offset->HasImmediate() && offset->Type() == IrType::U32 && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst);
+    const auto foldable = (!_program.Metadata().gpuResolvedResources || _program.Metadata().descriptorSlots) && offset->HasImmediate() && offset->Type() == IrType::U32 && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst);
     if (!foldable) {
         if (std::find(_program.Metadata().dynamicReads.begin(), _program.Metadata().dynamicReads.end(), inst) == _program.Metadata().dynamicReads.end()) {
             _program.Metadata().dynamicReads.push_back(inst);

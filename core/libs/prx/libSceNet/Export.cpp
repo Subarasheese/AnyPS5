@@ -937,6 +937,9 @@ int APS5_VABI sceNetConnect(int s, const void* addr, uint32_t addrlen) {
     if (socket.type == NET_SOCK_STREAM) RefuseClosedLoopbackAtOnce_nid_no_patch(socket.native->value, reinterpret_cast<const sockaddr*>(&native));
 #endif
     if (native.ss_family != (socket.family == NET_AF_INET ? AF_INET : AF_INET6)) return fail(NET_EAFNOSUPPORT);
+    // Offline, as a console without a network: stream connects fail at once (titles that poll a
+    // pending non-blocking connect otherwise spin until their own timeout).
+    if (socket.type == NET_SOCK_STREAM) return fail(NET_ENETUNREACH);
     if (::connect(socket.native->value, reinterpret_cast<const sockaddr*>(&native), native_length) == 0) {
 #ifdef _WIN32
         note_local_address(s, socket);

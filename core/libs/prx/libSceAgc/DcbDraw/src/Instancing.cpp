@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Native/include/FrontEnd.hpp"
 #include "prx/libSceAgc/DcbDraw/include/Instancing.hpp"
 
 #include "prx/libSceAgc/Command/include/Packet.hpp"
@@ -9,6 +10,7 @@
 extern "C" {
 
 std::uint32_t* APS5_VABI sceAgcDcbSetNumInstances(CommandBuffer* buf, std::uint32_t numInstances) {
+    AgcFrontEndIndexState_nid_postfix(buf, buf->bottom, static_cast<std::uint32_t>(AgcDriver::Native::FrontEndIndexField::Instances), numInstances);
     return Agc::Command::Emit(buf, 0x2fu, {numInstances}, __func__);
 }
 
@@ -22,6 +24,7 @@ uint32_t* APS5_VABI sceAgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t sh
     const auto address = reinterpret_cast<std::uintptr_t>(indirect_base_addr);
     if (address != 0) Agc::Command::CheckAddress(address, 8, __func__);
     Agc::Command::CheckBits(address, 0xffffffffffffull, __func__);
+    AgcFrontEndIndexState_nid_postfix(buf, buf->bottom, static_cast<std::uint32_t>(shader_type != 0 ? AgcDriver::Native::FrontEndIndexField::DispatchIndirectBase : AgcDriver::Native::FrontEndIndexField::DrawIndirectBase), address);
     auto* packet = Agc::Command::Allocate(buf, 4, __func__);
     packet[0] = Agc::Command::Header(0x11u, 4, shader_type != 0 ? 2u : 0u);
     packet[1] = 1;

@@ -9,10 +9,12 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
+#include "prx/libSceAgcDriver/Native/include/FrontEnd.hpp"
 #include "prx/libSceAgcDriver/Native/include/CompileStatus.hpp"
 #include "prx/libSceAgcDriver/Native/include/NativeImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -60,10 +62,23 @@ bool IgnoredOpcode(std::uint32_t opcode) {
 // Polls a WAIT_REG_MEM like the command processor. A wait still unsatisfied after two seconds
 // is reported once with the packets that preceded it, which names the GPU work that would
 // have produced the awaited value.
+bool SatisfiedByPendingRelease(std::span<const std::uint32_t> packet);
+
+// Per GT7 queue, the native batch its latest GPU work was recorded into: an end-of-pipe release on
+// that queue completes with that batch, as on a GPU whose queues run independently.
+std::atomic<std::uint64_t>& QueueWorkSerial(std::uint32_t queue) {
+    static std::array<std::atomic<std::uint64_t>, 256> serials{};
+    return serials[queue & 0xffu];
+}
+
+void NoteQueueWork(std::uint32_t queue) {
+    if (auto* device = Native::NativeDevice::Get(); device != nullptr) QueueWorkSerial(queue).store(device->RecordingSerial(), std::memory_order_release);
+}
+
 void WaitWithReport(const Submission& submission, std::size_t at, std::span<const std::uint32_t> packet) {
     const auto start = std::chrono::steady_clock::now();
     bool reported = false;
-    while (!Pm4::WaitSatisfied(packet)) {
+    while (!Pm4::WaitSatisfied(packet) && !SatisfiedByPendingRelease(packet)) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
         if (reported || std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) continue;
         reported = true;
@@ -99,25 +114,92 @@ struct NativeProgram {
     Native::RecordedProgram program;
     std::optional<ShaderRecompiler::RecompileRequest> classic;
     std::shared_ptr<const ShaderRecompiler::SourceHandle> descriptors;
+    std::shared_ptr<const ShaderRecompiler::IrResourcePlan> flattened;
 };
 
+struct VerifiedSpans {
+    std::uint64_t generation = 0;
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 16> spans{};
+    std::size_t next = 0;
+};
+
+thread_local VerifiedSpans verifiedSpans;
+
+bool Readable(std::uint64_t address, std::uint64_t bytes) {
+    if (address == 0 || bytes > ~address) return false;
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto& verified = verifiedSpans;
+    if (verified.generation != generation) verified = {generation};
+    for (const auto& [begin, end] : verified.spans) {
+        if (address >= begin && address + bytes <= end) return true;
+    }
+    const auto begin = address & ~0xffffull, end = (address + bytes + 0xffffull) & ~0xffffull;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin))) return GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+    verified.spans[verified.next++ % verified.spans.size()] = {begin, end};
+    return true;
+}
+
 bool ReadGuestWord(void*, std::uint64_t address, std::uint32_t* value) {
-    std::array<std::byte, 4> bytes{};
-    if (GuestMemory::CopyMapped(address, bytes) != GuestMemory::Compare::Equal) return false;
-    std::memcpy(value, bytes.data(), sizeof(*value));
+    Native::NotePoolUse("walk", address);
+    if (!Readable(address, 4)) return false;
+    std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
     return true;
 }
 
 bool ReadGuestWords(void*, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
-    return GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(values, static_cast<std::size_t>(count)))) == GuestMemory::Compare::Equal;
+    Native::NotePoolUse("walk", address);
+    if (!Readable(address, count * 4u)) return false;
+    std::memcpy(values, reinterpret_cast<const void*>(address), static_cast<std::size_t>(count * 4u));
+    return true;
 }
 
 bool GuestRangeAccessible(void*, std::uint64_t address, std::uint64_t bytes) {
-    return GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+    return Readable(address, bytes);
 }
 
 bool NoPendingWrite(void*, std::uint64_t, std::uint64_t) {
     return false;
+}
+
+// The plan whose SRT reads a translation folded into its flattened table (DescriptorRole::FlattenedSrt),
+// walked per dispatch or draw at the call site; null when the translation has no such table.
+std::shared_ptr<const ShaderRecompiler::IrResourcePlan> FlattenedPlan(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::RecompileResult& result) {
+    const bool flattened = std::any_of(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt; });
+    return flattened || !result.nativeImageSources.empty() || !result.nativeSamplerSources.empty() ? ShaderRecompiler::GetResourcePlan(request) : nullptr;
+}
+
+// The call site's walk of a translation's plan: its flattened SRT, and the T#s (8 words each) then
+// S#s (4 words each) of its image and sampler slots in `slotWords`.
+std::vector<std::uint32_t> FlattenedSrt(const ShaderRecompiler::IrResourcePlan* plan, const ShaderRecompiler::RecompileResult& result, std::span<const std::uint32_t> userData, std::uint64_t codeAddress, std::vector<std::uint32_t>& slotWords) {
+    std::vector<std::uint32_t> flat;
+    slotWords.clear();
+    if (plan == nullptr) return flat;
+    ShaderRecompiler::SrtRuntime runtime;
+    runtime.userData = userData;
+    runtime.shaderBase = codeAddress;
+    runtime.readMemory = &ReadGuestWord;
+    runtime.readSpecializationMemory = &ReadGuestWord;
+    runtime.accessible = &GuestRangeAccessible;
+    runtime.pendingWrite = &NoPendingWrite;
+    runtime.readWords = &ReadGuestWords;
+    std::vector<std::uint32_t> sources(result.nativeImageSources);
+    sources.insert(sources.end(), result.nativeSamplerSources.begin(), result.nativeSamplerSources.end());
+    try {
+        constexpr ShaderRecompiler::SrtWalker walker;
+        std::vector<ShaderRecompiler::DescriptorValue> descriptors;
+        std::vector<std::uint8_t> active;
+        walker.EvaluateRuntimeSources(*plan, sources, runtime, descriptors, flat, {}, active);
+        slotWords.reserve(result.nativeImageSources.size() * 8 + result.nativeSamplerSources.size() * 4);
+        for (std::size_t index = 0; index < descriptors.size(); ++index) {
+            const auto width = index < result.nativeImageSources.size() ? 8u : 4u;
+            slotWords.insert(slotWords.end(), descriptors[index].dwords.begin(), descriptors[index].dwords.begin() + width);
+        }
+    } catch (const std::exception& error) {
+        Native::ReportGraphicsIssue("descriptor words not walked at the call site", error.what());
+        flat.clear();
+        slotWords.clear();
+    }
+    return flat;
 }
 
 ShaderRecompiler::RecompileRequest ClassicRequest(ShaderRecompiler::RecompileRequest request) {
@@ -204,7 +286,25 @@ void InspectCapture(const ShaderRecompiler::ResourceCapture& capture, std::uint6
     }
 }
 
-void RegisterSampledDescriptors(const ShaderRecompiler::RecompileRequest& classic, const ShaderRecompiler::SourceHandle& handle, std::uint64_t target = 0, bool stores = false) {
+using KeyDigest = std::array<std::uint64_t, 2>;
+
+KeyDigest Digest(std::span<const std::uint64_t> words) {
+    std::uint64_t a = 0x9e3779b97f4a7c15ull ^ words.size(), b = 0xc2b2ae3d27d4eb4full + words.size();
+    for (const auto word : words) {
+        a = (a ^ word) * 0xff51afd7ed558ccdull;
+        a ^= a >> 32u;
+        b = (b + word) * 0xc4ceb9fe1a85ec53ull;
+        b ^= b >> 29u;
+    }
+    return {a ^ (b >> 17u), b ^ (a << 13u)};
+}
+
+struct KeyDigestHash {
+    std::size_t operator()(const KeyDigest& digest) const noexcept { return static_cast<std::size_t>(digest[0] ^ (digest[1] * 0x9e3779b97f4a7c15ull)); }
+};
+
+std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureMemoized(const ShaderRecompiler::RecompileRequest& request, bool toClassic, const ShaderRecompiler::SourceHandle& handle) {
+    const auto classic = toClassic ? ClassicRequest(request) : request;
     ShaderRecompiler::SrtRuntime runtime;
     runtime.userData = classic.context.userData;
     runtime.shaderBase = classic.shader.codeAddress;
@@ -213,13 +313,18 @@ void RegisterSampledDescriptors(const ShaderRecompiler::RecompileRequest& classi
     runtime.accessible = &GuestRangeAccessible;
     runtime.pendingWrite = &NoPendingWrite;
     runtime.readWords = &ReadGuestWords;
+    return ShaderRecompiler::CaptureResources(classic, runtime, handle);
+}
+
+void RegisterSampledDescriptors(const ShaderRecompiler::RecompileRequest& request, bool toClassic, const ShaderRecompiler::SourceHandle& handle, std::uint64_t target = 0, bool stores = false, std::vector<std::uint64_t>* sampled = nullptr) {
     try {
-        const auto capture = ShaderRecompiler::CaptureResources(classic, runtime, handle);
+        const auto capture = CaptureMemoized(request, toClassic, handle);
         for (const auto& image : capture->snapshot.images) {
             if (image.dwordCount != 8u) continue;
             Native::NoteSampledDescriptor(std::span<const std::uint32_t, 8>(image.dwords));
+            if (sampled != nullptr) sampled->push_back((static_cast<std::uint64_t>(image.dwords[0]) | (static_cast<std::uint64_t>(image.dwords[1] & 0xffu) << 32u)) << 8u);
         }
-        InspectCapture(*capture, classic.shader.codeAddress, target, stores);
+        InspectCapture(*capture, request.shader.codeAddress, target, stores);
     } catch (const std::exception& error) {
         Native::ReportGraphicsIssue("texture descriptors not resolved before a draw", error.what());
     }
@@ -231,6 +336,7 @@ struct NativeCompute {
     std::unordered_map<std::uint64_t, NativeProgram> programs;
     std::map<std::string, std::uint64_t> fallbacks;
     std::uint64_t native = 0;
+    std::uint64_t frontEnd = 0;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
@@ -254,7 +360,7 @@ void ReportCompute() {
     compute.reported = now;
     std::uint64_t skipped = 0;
     for (const auto& [reason, count] : compute.fallbacks) skipped += count;
-    if (Native::Logs()) std::fprintf(stderr, "[native] compute: %llu native dispatches, %llu skipped, %zu programs\n", static_cast<unsigned long long>(compute.native), static_cast<unsigned long long>(skipped), compute.programs.size());
+    if (Native::Logs()) std::fprintf(stderr, "[native] compute: %llu native dispatches (%llu prepared at the game's call site), %llu skipped, %zu programs\n", static_cast<unsigned long long>(compute.native), static_cast<unsigned long long>(compute.frontEnd), static_cast<unsigned long long>(skipped), compute.programs.size());
 }
 
 // The FLOAT_MODE a native translation runs with: GT7's rounding, with FP32 denormals left to the
@@ -270,7 +376,7 @@ std::uint32_t NativeFloatMode(std::uint32_t mode) {
 // A stage's shader data block for one dispatch or draw: the translation's own block (its runtime
 // state, e.g. vertex component selectors) with the user-data words replaced by this invocation's.
 // `pushOffset` is where the stage's push constants start; registers count from `firstUserSgpr`.
-std::vector<std::uint32_t> ShaderDataFor(const ShaderRecompiler::RecompileResult& shader, std::uint32_t pushOffset, std::span<const std::uint32_t> userData, std::uint32_t firstUserSgpr) {
+std::vector<std::uint32_t> ShaderDataFor(const ShaderRecompiler::RecompileResult& shader, std::uint32_t pushOffset, std::span<const std::uint32_t> userData, std::uint32_t firstUserSgpr, std::span<const std::uint32_t> flattenedSrt = {}) {
     std::vector<std::uint32_t> data(shader.shaderDataDwords, 0u);
     if (shader.pushDataStartDword != ~0u) {
         const auto start = static_cast<std::size_t>(shader.pushDataStartDword) * 4u;
@@ -288,6 +394,28 @@ std::vector<std::uint32_t> ShaderDataFor(const ShaderRecompiler::RecompileResult
     for (std::size_t j = 0; j < shader.shaderDataUserRegisters.size() && j < data.size(); ++j) {
         const auto reg = shader.shaderDataUserRegisters[j];
         if (reg >= firstUserSgpr && reg - firstUserSgpr < userData.size()) data[j] = userData[reg - firstUserSgpr];
+    }
+    // User-data pointers translated here, once per invocation, instead of by every read.
+    const auto bases = shader.nativeBaseKeys.size() * 4u;
+    if (bases != 0 && data.size() >= bases + ShaderRecompiler::RuntimeAbi::NativeHeap::InvocationAddressDwords) {
+        auto* device = Native::NativeDevice::Get();
+        const auto word = [&](std::uint32_t key, std::uint32_t index) -> std::uint32_t {
+            if ((key & ShaderRecompiler::NativeBaseFlat) != 0) return index < flattenedSrt.size() ? flattenedSrt[index] : 0u;
+            return index >= firstUserSgpr && index - firstUserSgpr < userData.size() ? userData[index - firstUserSgpr] : 0u;
+        };
+        auto* slot = data.data() + data.size() - ShaderRecompiler::RuntimeAbi::NativeHeap::InvocationAddressDwords - bases;
+        for (const auto key : shader.nativeBaseKeys) {
+            const auto high = word(key, (key >> ShaderRecompiler::NativeBaseHighShift) & ShaderRecompiler::NativeBaseWordMask);
+            const auto guest = word(key, key & ShaderRecompiler::NativeBaseWordMask) | static_cast<std::uint64_t>((key & ShaderRecompiler::NativeBaseVsharp) != 0 ? high & 0xffffu : high) << 32u;
+            Native::NotePoolUse((key & ShaderRecompiler::NativeBaseVsharp) != 0 ? "vsharp" : "pointer", guest);
+            std::uint64_t extent = 0;
+            const auto address = device != nullptr && guest != 0 ? device->DeviceSpan(guest, extent) : 0;
+            slot[0] = static_cast<std::uint32_t>(address);
+            slot[1] = static_cast<std::uint32_t>(address >> 32u);
+            slot[2] = static_cast<std::uint32_t>(std::min<std::uint64_t>(address != 0 ? extent : 0, 0xfffffffcu));
+            slot[3] = 0;
+            slot += 4;
+        }
     }
     return data;
 }
@@ -333,6 +461,7 @@ struct NativeGraphicsStage {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
     std::string failure;
     std::shared_ptr<const ShaderRecompiler::SourceHandle> descriptors;
+    std::shared_ptr<const ShaderRecompiler::IrResourcePlan> flattened;
 };
 
 struct NativeGraphics {
@@ -340,7 +469,8 @@ struct NativeGraphics {
     std::condition_variable ready;
     // Per-draw CPU time by phase (microseconds), reported with the draw counts.
     std::array<double, 5> phaseUs{};
-    std::map<std::vector<std::uint64_t>, NativeGraphicsStage> stages;
+    std::uint64_t frontEnd = 0;
+    std::unordered_map<KeyDigest, NativeGraphicsStage, KeyDigestHash> stages;
     // RECTLIST draws: the generated tessellation pair per vertex/pixel translation pair.
     std::map<std::pair<const void*, const void*>, std::shared_ptr<const ShaderRecompiler::RectListShaders>> rectangles;
     std::map<std::string, std::uint64_t> fallbacks;
@@ -390,11 +520,54 @@ void ReportGraphics() {
     graphics.reported = now;
     std::uint64_t skipped = 0;
     for (const auto& [reason, count] : graphics.fallbacks) skipped += count;
-    const double draws = std::max<double>(1.0, static_cast<double>(graphics.native + skipped));
-    if (Native::Logs()) std::fprintf(stderr, "[native] draws: %llu native, %llu skipped, %zu stage translations; us per draw: state %.1f, programs %.1f, stage keys %.1f, record %.1f, total %.1f\n", static_cast<unsigned long long>(graphics.native), static_cast<unsigned long long>(skipped), graphics.stages.size(), graphics.phaseUs[0] / draws, graphics.phaseUs[1] / draws, graphics.phaseUs[2] / draws, graphics.phaseUs[3] / draws, graphics.phaseUs[4] / draws);
+    static std::uint64_t lastDraws = 0;
+    static std::array<double, 5> lastPhases{};
+    const double windowDraws = std::max<double>(1.0, static_cast<double>(graphics.native + skipped - lastDraws));
+    std::array<double, 5> window{};
+    for (std::size_t i = 0; i < window.size(); ++i) window[i] = graphics.phaseUs[i] - lastPhases[i];
+    if (Native::Logs()) std::fprintf(stderr, "[native] draws: %llu native, %llu skipped, %zu stage translations; last 5 s: %.0f draws, %.0f ms in DrawNatively, us per draw: state %.1f, programs %.1f, stage keys %.1f, record %.1f, total %.1f\n", static_cast<unsigned long long>(graphics.native), static_cast<unsigned long long>(skipped), graphics.stages.size(), windowDraws, window[4] / 1000.0, window[0] / windowDraws, window[1] / windowDraws, window[2] / windowDraws, window[3] / windowDraws, window[4] / windowDraws);
+    static std::uint64_t lastFrontEnd = 0, lastNative = 0;
+    if (Native::Logs()) std::fprintf(stderr, "[native] last 5 s: %llu draws prepared at the game's call site, %llu decoded by the executor\n", static_cast<unsigned long long>(graphics.frontEnd - lastFrontEnd), static_cast<unsigned long long>((graphics.native - lastNative) - (graphics.frontEnd - lastFrontEnd)));
+    lastFrontEnd = graphics.frontEnd;
+    lastNative = graphics.native;
+    lastDraws = graphics.native + skipped;
+    lastPhases = graphics.phaseUs;
 }
 
-bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool prefetch = false) {
+thread_local std::uint32_t frontEndDraw = 0;
+
+struct PreparedDraw {
+    Graphics::State state;
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
+    std::shared_ptr<const ShaderRecompiler::RectListShaders> rectangle;
+    Native::NativeDevice::DrawWork work;
+    bool ready = false;
+};
+
+bool RecordPreparedDraw(PreparedDraw& prepared) {
+    auto* device = Native::NativeDevice::Get();
+    std::string failure;
+    if (device == nullptr || !device->Draw(prepared.work, failure)) {
+        CountDrawFallback(device == nullptr ? std::string("no native device yet") : failure);
+        return false;
+    }
+    {
+        auto& graphics = GraphicsWork();
+        std::lock_guard lock(graphics.mutex);
+        ++graphics.native;
+        ++graphics.frontEnd;
+    }
+    ReportGraphics();
+    return true;
+}
+
+bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool prefetch = false, PreparedDraw* prepareOnly = nullptr) {
+    if (!prefetch && prepareOnly == nullptr && frontEndDraw != 0) {
+        const auto id = frontEndDraw;
+        frontEndDraw = 0;
+        if (Native::FrontEndValidating()) Native::CompareFrontEndDraw(id, queue);
+        if (auto prepared = std::static_pointer_cast<PreparedDraw>(Native::TakeFrontEndDraw(id)); prepared != nullptr && prepared->ready) return RecordPreparedDraw(*prepared);
+    }
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
     auto* device = Native::NativeDevice::Get();
@@ -551,8 +724,10 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
     const auto target = device->GraphicsTarget();
     const auto capacity = state.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushSlotBytes;
     std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
+    std::vector<std::shared_ptr<const ShaderRecompiler::IrResourcePlan>> flattenedPlans;
     std::vector<std::uint32_t> offsets;
     std::optional<ShaderRecompiler::ShaderVertexStageInfo> liveVertex;
+    std::vector<std::uint64_t> sampled;
     std::uint32_t pushOffset = 0;
     for (const bool launchOnly : {true, false}) {
     if (!launchOnly && prefetch) return true;
@@ -604,18 +779,19 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
         }
         key.push_back(program.binary.codeAddress);
         key.push_back(pushOffset);
+        const auto digest = Digest(key);
         auto& graphics = GraphicsWork();
         std::unique_lock lock(graphics.mutex);
-        auto found = graphics.stages.find(key);
+        auto found = graphics.stages.find(digest);
         if (found == graphics.stages.end()) {
             // A worker owns the linked-program copies. Preserve this draw while
             // it translates: a one-time producer must never be discarded.
             NativeGraphicsStage pending;
             pending.failure = "draw stage still translating";
-            found = graphics.stages.emplace(key, std::move(pending)).first;
+            found = graphics.stages.emplace(digest, std::move(pending)).first;
             lock.unlock();
             const auto index = static_cast<std::size_t>(&program - programs.data());
-            std::thread([programs, index, wave, pixel, vertex, target, pushOffset, room, floatMode, mesh = state.stages.mesh, tessellation = state.stages.tessellation, key, job = std::make_shared<Native::CompileJob>()] {
+            std::thread([programs, index, wave, pixel, vertex, target, pushOffset, room, floatMode, mesh = state.stages.mesh, tessellation = state.stages.tessellation, key, digest, job = std::make_shared<Native::CompileJob>()] {
                 Native::BackgroundSlot slot;
                 const auto& own = programs[index];
                 const bool fragment = own.stage == Stage::Fragment;
@@ -629,6 +805,7 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
                 if (!TranslationCached(request)) job->Compiling();
                 try {
                     made.result = std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
+                    made.flattened = FlattenedPlan(request, *made.result);
                     made.descriptors = ResolveDescriptors(ClassicRequest(request));
                     if (auto* native = Native::NativeDevice::Get(); native != nullptr) {
                         try {
@@ -655,11 +832,11 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
                 }
                 auto& graphics = GraphicsWork();
                 std::lock_guard done(graphics.mutex);
-                graphics.stages[key] = std::move(made);
+                graphics.stages[digest] = std::move(made);
                 graphics.ready.notify_all();
             }).detach();
             lock.lock();
-            found = graphics.stages.find(key);
+            found = graphics.stages.find(digest);
             if (!prefetch && !drawLookahead.done) {
                 lock.unlock();
                 RunDrawLookahead();
@@ -669,9 +846,9 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
         if (launchOnly) continue;
         {
             const Native::CompileWait waiting;
-            graphics.ready.wait(lock, [&] { return graphics.stages.at(key).failure != "draw stage still translating"; });
+            graphics.ready.wait(lock, [&] { return graphics.stages.at(digest).failure != "draw stage still translating"; });
         }
-        found = graphics.stages.find(key);
+        found = graphics.stages.find(digest);
         if (!found->second.failure.empty()) {
             const auto failure = found->second.failure;
             lock.unlock();
@@ -681,11 +858,12 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
         if (found->second.descriptors != nullptr) {
             const auto descriptors = found->second.descriptors;
             lock.unlock();
-            RegisterSampledDescriptors(ClassicRequest(request), *descriptors, state.colors.empty() ? 0ull : state.colors.front().address);
+            RegisterSampledDescriptors(request, true, *descriptors, state.colors.empty() ? 0ull : state.colors.front().address, false, &sampled);
             lock.lock();
-            found = graphics.stages.find(key);
+            found = graphics.stages.find(digest);
         }
         results.push_back(found->second.result);
+        flattenedPlans.push_back(found->second.flattened);
         offsets.push_back(pushOffset);
     }
     }
@@ -699,7 +877,8 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
         stage.stage = programs[i].stage;
         stage.pushOffset = offsets[i];
         stage.programAddress = programs[i].binary.codeAddress;
-        stage.shaderData = ShaderDataFor(shader, offsets[i], programs[i].userData, programs[i].firstUserSgpr);
+        stage.flattenedSrt = FlattenedSrt(flattenedPlans[i].get(), shader, programs[i].userData, programs[i].binary.codeAddress, stage.slotWords);
+        stage.shaderData = ShaderDataFor(shader, offsets[i], programs[i].userData, programs[i].firstUserSgpr, stage.flattenedSrt);
         // Fixed-function vertex fetch: the compiled attributes with this draw's buffers.
         if (liveVertex && !shader.vertexAttributes.empty()) {
             for (auto attribute : shader.vertexAttributes) {
@@ -776,6 +955,7 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
             }
         }
     }
+    work.sampled = std::move(sampled);
     work.programAddresses = {programs.front().binary.codeAddress, programs.back().stage == Stage::Fragment ? programs.back().binary.codeAddress : 0u};
     work.indexed = draw.indexed;
     work.indexAddress = draw.indexAddress;
@@ -784,6 +964,15 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
     work.instances = draw.instanceCount;
     work.firstVertex = draw.firstVertex;
     work.firstInstance = draw.firstInstance;
+    if (prepareOnly != nullptr) {
+        prepareOnly->state = std::move(state);
+        prepareOnly->results = std::move(results);
+        prepareOnly->rectangle = std::move(rectangle);
+        prepareOnly->work = std::move(work);
+        prepareOnly->work.state = &prepareOnly->state;
+        prepareOnly->ready = true;
+        return true;
+    }
     std::string failure;
     struct RecordMark {
         Phases& phases;
@@ -803,7 +992,41 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
 }
 
 // A DISPATCH_DIRECT as native compute. False (the dispatch skipped) when it cannot run natively yet.
-bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool indirect = false) {
+struct PreparedDispatch {
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    std::uint64_t key = 0;
+    std::array<std::uint32_t, 3> groups{};
+    std::vector<std::uint32_t> shaderData;
+    std::uint64_t address = 0;
+    std::uint64_t indirectArguments = 0;
+    bool ready = false;
+    std::vector<std::uint32_t> flattenedSrt;
+    std::vector<std::uint32_t> slotWords;
+};
+
+bool RecordPreparedDispatch(PreparedDispatch& prepared) {
+    auto* device = Native::NativeDevice::Get();
+    std::string failure;
+    if (device == nullptr || !device->Dispatch({prepared.result.get(), prepared.key, prepared.groups, prepared.shaderData, prepared.address, prepared.indirectArguments, prepared.flattenedSrt, prepared.slotWords}, failure)) {
+        CountFallback(device == nullptr ? std::string("no native device yet") : failure);
+        return false;
+    }
+    {
+        auto& compute = Compute();
+        std::lock_guard lock(compute.mutex);
+        ++compute.native;
+        ++compute.frontEnd;
+    }
+    ReportCompute();
+    return true;
+}
+
+bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool indirect = false, PreparedDispatch* prepareOnly = nullptr) {
+    if (prepareOnly == nullptr && frontEndDraw != 0) {
+        const auto id = frontEndDraw;
+        frontEndDraw = 0;
+        if (auto prepared = std::static_pointer_cast<PreparedDispatch>(Native::TakeFrontEndDraw(id)); prepared != nullptr && prepared->ready) return RecordPreparedDispatch(*prepared);
+    }
     auto* device = Native::NativeDevice::Get();
     if (device == nullptr) {
         CountFallback("no native device yet");
@@ -850,6 +1073,7 @@ bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::vector<std::uint32_t> userData(userCount);
     for (std::uint32_t i = 0; i < userCount; ++i) userData[i] = readUserData(queue.shader, 0x240 + i);
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    std::shared_ptr<const ShaderRecompiler::IrResourcePlan> flattened;
     {
         auto& compute = Compute();
         std::unique_lock lock(compute.mutex);
@@ -889,6 +1113,7 @@ bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, 
                             {0, 0, 0, 128}};
                         if (!TranslationCached(request)) job->Compiling();
                         made.result = std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
+                        made.flattened = FlattenedPlan(request, *made.result);
                         made.program = program;
                         made.classic = ClassicRequest(request);
                         made.descriptors = ResolveDescriptors(*made.classic);
@@ -919,12 +1144,13 @@ bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, 
             return false;
         }
         result = found->second.result;
+        flattened = found->second.flattened;
         if (found->second.descriptors != nullptr && found->second.classic.has_value()) {
             auto classic = *found->second.classic;
             const auto descriptors = found->second.descriptors;
             lock.unlock();
             classic.context.userData = userData;
-            RegisterSampledDescriptors(classic, *descriptors, 0, device->WritesGuestMemory(*result));
+            RegisterSampledDescriptors(classic, false, *descriptors, 0, device->WritesGuestMemory(*result));
         }
     }
     const auto& shader = *result;
@@ -952,10 +1178,16 @@ bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, 
             std::fprintf(stderr, "[native] watch 0x%llx groups %ux%ux%u%s user %zu words, table 0x%llx:%s\n", static_cast<unsigned long long>(address), groups[0], groups[1], groups[2], indirect ? " (indirect)" : "", userData.size(), static_cast<unsigned long long>(pointer), words.c_str());
         }
     }
-    auto shaderData = ShaderDataFor(shader, 0, userData, 0);
+    std::vector<std::uint32_t> slotWords;
+    auto flat = FlattenedSrt(flattened.get(), shader, userData, address, slotWords);
+    auto shaderData = ShaderDataFor(shader, 0, userData, 0, flat);
     if (shader.dispatchThreadLimitDword != ~0u && shader.dispatchThreadLimitDword + 3u <= shaderData.size()) std::copy(partial.begin(), partial.end(), shaderData.begin() + shader.dispatchThreadLimitDword);
+    if (prepareOnly != nullptr) {
+        *prepareOnly = {result, key, groups, std::move(shaderData), address, indirectArguments, true, std::move(flat), std::move(slotWords)};
+        return true;
+    }
     std::string failure;
-    if (!device->Dispatch({&shader, key, groups, shaderData, address, indirectArguments}, failure)) {
+    if (!device->Dispatch({&shader, key, groups, shaderData, address, indirectArguments, flat, slotWords}, failure)) {
         CountFallback(failure);
         return false;
     }
@@ -1044,6 +1276,95 @@ struct PendingReleases {
     std::uint64_t serial = 0;
 };
 
+struct WaitStats {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::string> writers;
+    struct Entry {
+        std::uint64_t count = 0;
+        double ms = 0.0;
+        std::uint32_t queue = 0;
+    };
+    std::map<std::uint64_t, Entry> waits;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+WaitStats& Waits() {
+    static WaitStats stats;
+    return stats;
+}
+
+void NoteLabelWriter(std::uint64_t address, std::uint32_t queue, const char* how) {
+    if (!Native::Logs() || address == 0) return;
+    auto& stats = Waits();
+    std::lock_guard lock(stats.mutex);
+    char text[48];
+    std::snprintf(text, sizeof(text), "%s q%u", how, queue);
+    stats.writers[address] = text;
+}
+
+void NoteBlockedWait(std::uint64_t address, std::uint32_t queue, double ms) {
+    if (!Native::Logs()) return;
+    auto& stats = Waits();
+    std::lock_guard lock(stats.mutex);
+    auto& entry = stats.waits[address];
+    ++entry.count;
+    entry.ms += ms;
+    entry.queue = queue;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stats.reported < std::chrono::seconds(5)) return;
+    stats.reported = now;
+    std::vector<std::pair<std::uint64_t, WaitStats::Entry>> sorted(stats.waits.begin(), stats.waits.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    double total = 0.0;
+    for (const auto& [where, waited] : sorted) total += waited.ms;
+    std::fprintf(stderr, "[native] blocked memory waits in 5 s: %.0f ms total\n", total);
+    for (std::size_t i = 0; i < std::min<std::size_t>(sorted.size(), 10); ++i) {
+        const auto found = stats.writers.find(sorted[i].first);
+        std::fprintf(stderr, "[native]   0x%llx q%u: %llu waits, %.1f ms, written by %s\n", static_cast<unsigned long long>(sorted[i].first), sorted[i].second.queue, static_cast<unsigned long long>(sorted[i].second.count), sorted[i].second.ms, found != stats.writers.end() ? found->second.c_str() : "no packet seen (CPU or shader)");
+    }
+    stats.waits.clear();
+}
+
+struct QueueBusy {
+    std::mutex mutex;
+    std::map<std::uint32_t, std::pair<double, double>> queues;
+    std::map<std::uint32_t, std::uint64_t> submissions;
+    std::map<std::uint32_t, double> offCpu;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+QueueBusy& Busy() {
+    static QueueBusy busy;
+    return busy;
+}
+
+void NoteQueueTime(std::uint32_t queue, double busyMs, double blockedMs, double offCpuMs) {
+    if (!Native::Logs()) return;
+    auto& busy = Busy();
+    std::lock_guard lock(busy.mutex);
+    auto& entry = busy.queues[queue];
+    entry.first += busyMs;
+    entry.second += blockedMs;
+    busy.offCpu[queue] += offCpuMs;
+    ++busy.submissions[queue];
+    const auto now = std::chrono::steady_clock::now();
+    const auto window = std::chrono::duration<double, std::milli>(now - busy.reported).count();
+    if (window < 5000.0) return;
+    busy.reported = now;
+    std::string line;
+    for (const auto& [id, times] : busy.queues) {
+        char item[128];
+        std::snprintf(item, sizeof(item), " q%u: %.0f%% executing (%.0f%% off-CPU, %.0f%% blocked on other queues), %llu submissions;", id, 100.0 * times.first / window, times.first > 0 ? 100.0 * busy.offCpu[id] / times.first : 0.0, times.first > 0 ? 100.0 * times.second / times.first : 0.0, static_cast<unsigned long long>(busy.submissions[id]));
+        line += item;
+    }
+    std::fprintf(stderr, "[native] queue workers over %.1f s:%s\n", window / 1000.0, line.c_str());
+    busy.queues.clear();
+    busy.submissions.clear();
+    busy.offCpu.clear();
+}
+
+thread_local double blockedThisSubmission = 0.0;
+
 PendingReleases& Releases() {
     static PendingReleases releases;
     return releases;
@@ -1095,6 +1416,10 @@ void FlushNative() {
         device->Flush();
         if (trace && Native::Logs()) std::fprintf(stderr, "[native] native work done\n");
     }
+}
+
+void SubmitNative() {
+    if (auto* device = Native::NativeDevice::Get(); device != nullptr) device->Submit();
 }
 
 void ReportUnexecuted(std::uint32_t header, const char* reason) {
@@ -1163,6 +1488,27 @@ void RunDrawLookahead() {
 }
 
 void Driver::executeNative(const Submission& submission) {
+    struct BusyTimer {
+        std::uint32_t queue;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        double blockedBefore = blockedThisSubmission;
+        double cpuStart = ThreadCpuMs();
+        static double ThreadCpuMs() {
+            timespec now{};
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+            return static_cast<double>(now.tv_sec) * 1000.0 + static_cast<double>(now.tv_nsec) / 1e6;
+        }
+        ~BusyTimer() {
+            const auto wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            NoteQueueTime(queue, wall, blockedThisSubmission - blockedBefore, wall - (ThreadCpuMs() - cpuStart));
+        }
+    } busyTimer{submission.queue};
+    Native::TimelineEvent("exec begin", submission.queue, submission.serial);
+    struct ExecEnd {
+        std::uint32_t queue;
+        std::uint64_t serial;
+        ~ExecEnd() { Native::TimelineEvent("exec end", queue, serial); }
+    } execEnd{submission.queue, submission.serial};
     struct FlipHold {
         Driver& driver;
         bool held;
@@ -1232,10 +1578,40 @@ void Driver::executeNative(const Submission& submission) {
         ++Counts().packets;
         activity.cursor = static_cast<std::uint32_t>(cursor);
         activity.opcode = opcode;
+        if (opcode == 0x10 && packet.size() >= 3 && packet[1] == Native::FrontEndDrawMarker) frontEndDraw = packet[2];
+        else if (opcode != 0x27 && opcode != 0x2d && opcode != 0x25 && opcode != 0x15 && opcode != 0x16) frontEndDraw = 0;
         activity.phase = "packet";
         if (submissionLog) opcodes[opcode]++;
         const bool waitByOrder = (opcode == 0x3c || opcode == 0x93) && !Pm4::WaitSatisfied(packet) && SatisfiedByPendingRelease(packet);
-        if (NeedsNativeResults(opcode) && !waitByOrder) {
+        bool onGpu = false;
+        if ((opcode == 0x37 || opcode == 0x50) && !(Pm4::Predicated(header) && queue.predication.operation != 0)) {
+            if (auto* device = Native::NativeDevice::Get(); device != nullptr) {
+                try {
+                    onGpu = device->TransferOnGpu(packet);
+                    if (onGpu) NoteQueueWork(submission.queue);
+                } catch (const std::exception& error) {
+                    ReportUnexecuted(header, error.what());
+                }
+            }
+            if (onGpu && opcode == 0x37 && packet.size() >= 5 && ((packet[1] >> 8u) & 0xfu) != 0u) {
+                const auto destination = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+                const auto value = packet.size() >= 6 ? (packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u)) : static_cast<std::uint64_t>(packet[4]);
+                NoteLabelWriter(destination, submission.queue, "WRITE_DATA");
+                std::uint64_t serial = 0;
+                {
+                    auto& releases = Releases();
+                    std::lock_guard lock(releases.mutex);
+                    serial = ++releases.serial;
+                    releases.entries.push_back({destination, value, serial});
+                }
+                Native::NativeDevice::Get()->AfterBatch([serial] {
+                    auto& releases = Releases();
+                    std::lock_guard lock(releases.mutex);
+                    std::erase_if(releases.entries, [&](const PendingRelease& entry) { return entry.serial == serial; });
+                });
+            }
+        }
+        if (NeedsNativeResults(opcode) && !waitByOrder && !onGpu) {
             activity.phase = "flushing native work";
             {
                 // APS5_NATIVE_STATS: which packets cut the native batch.
@@ -1254,7 +1630,8 @@ void Driver::executeNative(const Submission& submission) {
                     }
                 }
             }
-            FlushNative();
+            if (opcode == 0x3c || opcode == 0x93) SubmitNative();
+            else FlushNative();
             activity.phase = "packet";
         }
         if (Pm4::Predicated(header) && queue.predication.operation != 0 && !Pm4::PredicationPasses(queue)) {
@@ -1264,12 +1641,18 @@ void Driver::executeNative(const Submission& submission) {
 
         if (header == RenderingWaitPacketHeader) {
             if (submissionLog) std::fprintf(stderr, "[native] submission %llu: waiting until safe for rendering\n", static_cast<unsigned long long>(submission.serial));
+            const auto safeAt = std::chrono::steady_clock::now();
+            Native::TimelineEvent("safe-for-rendering wait", submission.queue);
             submission.renderingWaits.at(cursor)->Wait();
+            const auto waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - safeAt).count();
+            blockedThisSubmission += waitedMs;
+            NoteBlockedWait(0, submission.queue, waitedMs);
             if (submissionLog) std::fprintf(stderr, "[native] submission %llu: safe for rendering\n", static_cast<unsigned long long>(submission.serial));
         } else if (header == FlipPacketHeader && (++Counts().flips, true)) {
+            Native::TimelineEvent("flip packet", submission.queue);
             // The frame's native work completes before the presenter reads the display buffer.
             activity.phase = "flushing native work";
-            FlushNative();
+            SubmitNative();
             activity.phase = "packet";
             ++flipsCounted;
             if (auto* native = Native::NativeDevice::Get(); native != nullptr) native->NoteFlip();
@@ -1284,10 +1667,13 @@ void Driver::executeNative(const Submission& submission) {
         } else if (Pm4::DrawOpcode(opcode) && (++Counts().draws, activity.phase = "native draw", true)) {
             drawLookahead.cursor = cursor;
             if (!DrawNatively(queue, packet)) Native::CountSkippedDraw();
+            NoteQueueWork(submission.queue);
         } else if (opcode == 0x15 && (++Counts().dispatches, activity.phase = "native dispatch", true)) {
             if (!DispatchNatively(queue, packet)) Native::CountSkippedDispatch();
+            NoteQueueWork(submission.queue);
         } else if (opcode == 0x16 && (++Counts().dispatches, activity.phase = "native dispatch", true)) {
             if (!DispatchNatively(queue, packet, true)) Native::CountSkippedDispatch();
+            NoteQueueWork(submission.queue);
         } else if (DispatchOpcode(opcode)) {
             CountFallback("indirect dispatch");
             Native::CountSkippedDispatch();
@@ -1304,7 +1690,13 @@ void Driver::executeNative(const Submission& submission) {
                     std::uint64_t awaited;
                     ~Unblock() { driver.noteWaitBlocked(queue, awaited, false); }
                 } unblock{*this, submission.queue, awaited};
+                const auto blockedAt = std::chrono::steady_clock::now();
+                Native::TimelineEvent("wait blocked", submission.queue, awaited);
                 WaitWithReport(submission, cursor, packet);
+                Native::TimelineEvent("wait done", submission.queue, awaited);
+                const auto blockedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - blockedAt).count();
+                blockedThisSubmission += blockedMs;
+                NoteBlockedWait(awaited, submission.queue, blockedMs);
             }
         } else if (opcode == 0x22) {
             if (Pm4::ReadCondition(packet) == 0) nextCursor = submission.conditionalEnds.at(cursor);
@@ -1321,6 +1713,8 @@ void Driver::executeNative(const Submission& submission) {
                 // A release with immediate data satisfies waits on it within the batch.
                 const auto dataSelect = copy[2] >> 29u;
                 const auto destination = copy[3] | (static_cast<std::uint64_t>(copy[4]) << 32u);
+                NoteLabelWriter(destination, queueId, "RELEASE_MEM");
+                Native::NotePoolUse("label", destination);
                 std::uint64_t serial = 0;
                 if (device != nullptr && device->Pending() && (dataSelect == 1 || dataSelect == 2) && destination != 0) {
                     auto& releases = Releases();
@@ -1329,7 +1723,8 @@ void Driver::executeNative(const Submission& submission) {
                     const auto value = dataSelect == 1 ? static_cast<std::uint64_t>(copy[5]) : (copy[5] | (static_cast<std::uint64_t>(copy[6]) << 32u));
                     releases.entries.push_back({destination, value, serial});
                 }
-                auto release = [copy = std::move(copy), &queue, queueId, header, serial] {
+                auto release = [copy = std::move(copy), &queue, queueId, header, serial, destination] {
+                    Native::TimelineEvent("label write", queueId, destination);
                     if (serial != 0) {
                         auto& releases = Releases();
                         std::lock_guard lock(releases.mutex);
@@ -1343,11 +1738,14 @@ void Driver::executeNative(const Submission& submission) {
                     const auto interruptSelect = (copy[2] >> 24u) & 7u;
                     if (interruptSelect != 0 && interruptSelect != 3) AgcDriverDeliverEopInterrupt(queueId);
                 };
-                if (device != nullptr) device->AfterBatch(std::move(release));
+                if (device != nullptr) device->AfterBatch(std::move(release), QueueWorkSerial(queueId).load(std::memory_order_acquire));
                 else release();
+            } else if (onGpu) {
             } else {
+                if (opcode == 0x37 && packet.size() >= 4) NoteLabelWriter(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), submission.queue, "WRITE_DATA");
+                if (opcode == 0x50 && packet.size() >= 6) NoteLabelWriter(packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u), submission.queue, "DMA_DATA");
                 try {
-                    if (opcode == 0x50 && Native::NativeDevice::Get() != nullptr && Native::NativeDevice::Get()->DmaGds(packet)) {}
+                    if (opcode == 0x50 && Native::NativeDevice::Get() != nullptr && Native::NativeDevice::Get()->DmaGds(packet)) NoteQueueWork(submission.queue);
                     else if (Pm4::IndirectRegisterOpcode(opcode)) Pm4::ExecuteIndirectRegisters(packet, submission.registerLists.at(cursor), queue);
                     else Pm4::Execute(packet, queue);
                 } catch (const std::runtime_error& error) {
@@ -1357,10 +1755,32 @@ void Driver::executeNative(const Submission& submission) {
         }
         cursor = nextCursor;
     }
-    FlushNative();
+    SubmitNative();
     // A rewindable command buffer: the game writes the rest later and marks it valid; it runs
     // as the continuation of this submission.
     if (submission.rewindTail != nullptr) executeRewindTail(submission);
+}
+
+std::shared_ptr<void> PrepareFrontEndDraw(QueueState& queue, std::span<const std::uint32_t> packet) {
+    auto prepared = std::make_shared<PreparedDraw>();
+    try {
+        if (!DrawNatively(queue, packet, false, prepared.get()) || !prepared->ready) return nullptr;
+    } catch (const std::exception& error) {
+        Native::ReportGraphicsIssue("draw not prepared at the call site", error.what());
+        return nullptr;
+    }
+    return prepared;
+}
+
+std::shared_ptr<void> PrepareFrontEndDispatch(QueueState& queue, std::span<const std::uint32_t> packet, bool indirect) {
+    auto prepared = std::make_shared<PreparedDispatch>();
+    try {
+        if (!DispatchNatively(queue, packet, indirect, prepared.get()) || !prepared->ready) return nullptr;
+    } catch (const std::exception& error) {
+        Native::ReportGraphicsIssue("dispatch not prepared at the call site", error.what());
+        return nullptr;
+    }
+    return prepared;
 }
 
 }

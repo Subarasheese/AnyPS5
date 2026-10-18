@@ -6,7 +6,9 @@
 #endif
 #include <mutex>
 #include <vulkan/vulkan.h>
+#include <array>
 #include <atomic>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -161,6 +163,8 @@ struct Context {
     // Nonzero when VK_EXT_external_memory_host is enabled: the required host pointer alignment.
     VkDeviceSize hostImportAlignment = 0;
     bool dmaBufImport = false;
+    // Nonzero when VK_EXT_map_memory_placed is enabled: the required placed address alignment.
+    VkDeviceSize placedMapAlignment = 0;
     bool sparseBinding = false;
     std::uint32_t queueFamily = 0;
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
@@ -244,10 +248,21 @@ struct Context {
     template<typename TFunction>
     TFunction Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
-        ++DeviceProcLookups();
-        const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
-        if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
-        return function;
+        // Resolved once per thread, device and name: recording calls these per command.
+        struct Resolved {
+            VkDevice device = VK_NULL_HANDLE;
+            const char* name = nullptr;
+            PFN_vkVoidFunction function = nullptr;
+        };
+        thread_local std::array<Resolved, 256> resolved{};
+        auto& entry = resolved[(reinterpret_cast<std::uintptr_t>(name) ^ reinterpret_cast<std::uintptr_t>(device) * 0x9e3779b97f4a7c15ull) >> 56u];
+        if (entry.device != device || entry.name == nullptr || (entry.name != name && std::strcmp(entry.name, name) != 0)) {
+            ++DeviceProcLookups();
+            const auto function = deviceProc(device, name);
+            if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
+            entry = {device, name, function};
+        }
+        return reinterpret_cast<TFunction>(entry.function);
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.

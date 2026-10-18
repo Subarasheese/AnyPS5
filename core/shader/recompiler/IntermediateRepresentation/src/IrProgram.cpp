@@ -872,6 +872,28 @@ PositionExportComponent DecodePositionExportComponent(std::uint32_t control, std
     return result;
 }
 
+std::uint32_t NativeBaseKey(const IrValue* handle) {
+    if (handle == nullptr) return NoNativeBase;
+    const bool vsharp = handle->Opcode() == IrOpcode::GetBufferResource && handle->ArgumentCount() == 4u;
+    if (!vsharp && (handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u)) return NoNativeBase;
+    const auto word = [](const IrValue* value, bool& flat) -> std::uint32_t {
+        if (value->Opcode() == IrOpcode::GetUserData && value->Argument(0)->Type() == IrType::ScalarReg) {
+            flat = false;
+            return value->Argument(0)->Register().index;
+        }
+        if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() == 2u && value->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource && value->Argument(1)->Resolve()->HasImmediate()) {
+            flat = true;
+            return value->Argument(1)->Resolve()->ImmediateU32();
+        }
+        return NoNativeBase;
+    };
+    bool lowFlat = false, highFlat = false;
+    const auto low = word(handle->Argument(0)->Resolve(), lowFlat);
+    const auto high = word(handle->Argument(1)->Resolve(), highFlat);
+    if (low > NativeBaseWordMask || high > NativeBaseWordMask || lowFlat != highFlat) return NoNativeBase;
+    return low | high << NativeBaseHighShift | (vsharp ? NativeBaseVsharp : 0u) | (lowFlat ? NativeBaseFlat : 0u);
+}
+
 std::uint32_t NativeBinding(IrShaderStage stage, DescriptorBindingKind kind) {
     const std::uint32_t group = stage == IrShaderStage::Pixel ? 1u : stage == IrShaderStage::TessellationControl ? 2u : stage == IrShaderStage::TessellationEvaluation ? 3u : 0u;
     return RuntimeAbi::BindingNumber(static_cast<RuntimeAbi::Stage>(group), kind);

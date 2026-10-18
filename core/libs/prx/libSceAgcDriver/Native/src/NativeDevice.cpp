@@ -40,6 +40,7 @@
 #include <optional>
 #include <thread>
 #include <condition_variable>
+#include <deque>
 #include <tuple>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -62,7 +63,7 @@ std::vector<VkDescriptorSetLayoutBinding> NativeGraphicsBindings(const Graphics:
         {Stage::TessellationControl, context.tessellationShader ? VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT : 0u},
         {Stage::TessellationEvaluation, context.tessellationShader ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : 0u}
     }};
-    constexpr std::array roles{Binding::Gds, Binding::BdaPagetable, Binding::FaultBuffer, Binding::ShaderData};
+    constexpr std::array roles{Binding::Gds, Binding::BdaPagetable, Binding::FaultBuffer, Binding::FlattenedSrt, Binding::ShaderData};
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     for (const auto& [stage, flags] : stages) {
         if (flags == 0) continue;
@@ -103,6 +104,9 @@ PFN_vkCmdBindPipeline vkCmdBindPipeline = nullptr;
 PFN_vkBeginCommandBuffer vkBeginCommandBuffer = nullptr;
 PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers = nullptr;
 PFN_vkCmdBindDescriptorSets vkCmdBindDescriptorSets = nullptr;
+PFN_vkMapMemory2KHR vkMapMemory2KHR = nullptr;
+PFN_vkUnmapMemory2KHR vkUnmapMemory2KHR = nullptr;
+PFN_vkUnmapMemory vkUnmapMemory = nullptr;
 
 void LoadDeviceFunctions(const Graphics::Context& context) {
     vkAllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(context.deviceProc(context.device, "vkAllocateMemory"));
@@ -119,6 +123,11 @@ void LoadDeviceFunctions(const Graphics::Context& context) {
     vkResetFences = reinterpret_cast<PFN_vkResetFences>(context.deviceProc(context.device, "vkResetFences"));
     vkResetCommandBuffer = reinterpret_cast<PFN_vkResetCommandBuffer>(context.deviceProc(context.device, "vkResetCommandBuffer"));
     vkGetMemoryFdPropertiesKHR = reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(context.deviceProc(context.device, "vkGetMemoryFdPropertiesKHR"));
+    vkUnmapMemory = reinterpret_cast<PFN_vkUnmapMemory>(context.deviceProc(context.device, "vkUnmapMemory"));
+    if (context.placedMapAlignment != 0) {
+        vkMapMemory2KHR = reinterpret_cast<PFN_vkMapMemory2KHR>(context.deviceProc(context.device, "vkMapMemory2KHR"));
+        vkUnmapMemory2KHR = reinterpret_cast<PFN_vkUnmapMemory2KHR>(context.deviceProc(context.device, "vkUnmapMemory2KHR"));
+    }
     vkEndCommandBuffer = reinterpret_cast<PFN_vkEndCommandBuffer>(context.deviceProc(context.device, "vkEndCommandBuffer"));
     vkDestroyShaderModule = reinterpret_cast<PFN_vkDestroyShaderModule>(context.deviceProc(context.device, "vkDestroyShaderModule"));
     vkDestroyBuffer = reinterpret_cast<PFN_vkDestroyBuffer>(context.deviceProc(context.device, "vkDestroyBuffer"));
@@ -253,6 +262,32 @@ struct NativeDevice::State {
     std::vector<std::string> timedNames;
     std::map<std::string, std::pair<double, std::uint64_t>> gpuTimes;
     std::chrono::steady_clock::time_point timesReported = std::chrono::steady_clock::now();
+    std::array<std::uint64_t, 6> barrierCounts{};
+    std::uint64_t syncPackets = 0;
+    std::uint64_t batchLogSize = 0;
+    double lockWaitMs = 0.0;
+    std::chrono::steady_clock::time_point lockReported = std::chrono::steady_clock::now();
+    void noteLockWait(std::chrono::steady_clock::time_point start) {
+        if (!Native::Logs()) return;
+        const auto now = std::chrono::steady_clock::now();
+        lockWaitMs += std::chrono::duration<double, std::milli>(now - start).count();
+        if (now - lockReported < std::chrono::seconds(5)) return;
+        std::fprintf(stderr, "[native] device lock waits: %.0f ms in %.1f s\n", lockWaitMs, std::chrono::duration<double>(now - lockReported).count());
+        lockWaitMs = 0.0;
+        lockReported = now;
+    }
+    bool passOpen = false;
+    std::vector<std::uint64_t> passKey;
+    std::int32_t passTimed = -1;
+    std::set<std::uint64_t> writtenSinceBarrier;
+    void endPass() {
+        if (!passOpen) return;
+        Graphics::EndRenderPass(context, commands);
+        passOpen = false;
+        passKey.clear();
+        endTimed(passTimed);
+        passTimed = -1;
+    }
     static bool GpuTimes() {
         static const bool enabled = std::getenv("APS5_NATIVE_GPU_TIMES") != nullptr;
         return enabled;
@@ -293,9 +328,51 @@ struct NativeDevice::State {
         double total = 0.0;
         for (const auto& [name, value] : gpuTimes) sorted.push_back({value.first, name + " x" + std::to_string(value.second)}), total += value.first;
         std::sort(sorted.rbegin(), sorted.rend());
-        std::fprintf(stderr, "[native] GPU time over 5 s: %.0f ms; top:\n", total);
+        std::fprintf(stderr, "[native] GPU time over 5 s: %.0f ms; draws %llu in %llu passes, barriers before draws: %llu after GPU writes, %llu target changes, %llu texture uploads, %llu sampled targets; top:\n", total, static_cast<unsigned long long>(barrierCounts[4]), static_cast<unsigned long long>(barrierCounts[5]), static_cast<unsigned long long>(barrierCounts[0]), static_cast<unsigned long long>(barrierCounts[1]), static_cast<unsigned long long>(barrierCounts[2]), static_cast<unsigned long long>(barrierCounts[3]));
+        barrierCounts = {};
         for (std::size_t i = 0; i < std::min<std::size_t>(sorted.size(), 12); ++i) std::fprintf(stderr, "[native]   %8.1f ms  %s\n", sorted[i].first, sorted[i].second.c_str());
         gpuTimes.clear();
+    }
+    VkDeviceSize writeFlattenedSrt(std::span<const std::uint32_t> words, VkDeviceSize bytes) {
+        const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+        const auto offset = (ringOffset + alignment - 1) & ~(alignment - 1);
+        auto* target = static_cast<std::byte*>(ringMapping) + offset;
+        std::memset(target, 0, static_cast<std::size_t>(bytes));
+        std::memcpy(target, words.data(), words.size_bytes());
+        ringOffset = offset + bytes;
+        return offset;
+    }
+    // The image and sampler slots of a shader data block (IrBindingLayout::nativeImageSlots): the heap
+    // indices of the T#s and S#s walked at the call site, unresolved while a resource is not created.
+    void writeSlots(void* shaderData, std::size_t bytes, const ShaderRecompiler::RecompileResult& shader, std::span<const std::uint32_t> words) {
+        const auto images = shader.nativeImageSources.size(), samplers = shader.nativeSamplerSources.size();
+        const auto slots = 4u * (images + samplers + shader.nativeBaseKeys.size());
+        const auto dwords = bytes / sizeof(std::uint32_t);
+        if (images + samplers == 0 || dwords < slots + ShaderRecompiler::RuntimeAbi::NativeHeap::InvocationAddressDwords) return;
+        auto* slot = static_cast<std::uint32_t*>(shaderData) + dwords - ShaderRecompiler::RuntimeAbi::NativeHeap::InvocationAddressDwords - slots;
+        for (std::size_t index = 0; index < images; ++index, slot += 4) {
+            std::uint32_t sampled = 0, storage = 0;
+            const bool resolved = words.size() >= (index + 1) * 8 && this->images->ImageIndices(std::span<const std::uint32_t, 8>(words.data() + index * 8, 8), sampled, storage);
+            slot[0] = sampled;
+            slot[1] = storage;
+            slot[2] = resolved ? 1u : 0u;
+            slot[3] = 0;
+        }
+        for (std::size_t index = 0; index < samplers; ++index, slot += 4) {
+            std::uint32_t sampler = 0;
+            const auto first = images * 8 + index * 4;
+            const bool resolved = words.size() >= first + 4 && this->images->SamplerIndex(std::span<const std::uint32_t, 4>(words.data() + first, 4), sampler);
+            slot[0] = sampler;
+            slot[1] = resolved ? 1u : 0u;
+            slot[2] = slot[3] = 0;
+        }
+    }
+    // Queues the slots' T#s and S#s that have no resource yet, for the Prepare before the work.
+    void queueSlots(const ShaderRecompiler::RecompileResult& shader, std::span<const std::uint32_t> words) {
+        std::uint32_t ignored[4];
+        const auto images = shader.nativeImageSources.size();
+        for (std::size_t index = 0; index < images && words.size() >= (index + 1) * 8; ++index) this->images->ImageIndices(std::span<const std::uint32_t, 8>(words.data() + index * 8, 8), ignored[0], ignored[1]);
+        for (std::size_t index = 0; index < shader.nativeSamplerSources.size() && words.size() >= images * 8 + (index + 1) * 4; ++index) this->images->SamplerIndex(std::span<const std::uint32_t, 4>(words.data() + images * 8 + index * 4, 4), ignored[2]);
     }
     void writeInvocationAddresses(void* shaderData, std::size_t bytes, std::uint64_t program) const {
         constexpr auto tailBytes = ShaderRecompiler::RuntimeAbi::NativeHeap::InvocationAddressDwords * sizeof(std::uint32_t);
@@ -331,6 +408,7 @@ struct NativeDevice::State {
         if (!gds) gds = std::make_unique<Graphics::DeviceBuffer>(context, Pm4::GdsBytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         if (gdsInitialized) return;
+        endPass();
         context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, gds->Handle(), 0, Pm4::GdsBytes, 0);
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -342,7 +420,7 @@ struct NativeDevice::State {
     Import zeroVertex;          // zeros for null vertex descriptors
     void* faultMapping = nullptr;
 
-    Import hostBuffer(VkDeviceSize bytes, VkBufferUsageFlags usage, void*& mapping) {
+    Import hostBuffer(VkDeviceSize bytes, VkBufferUsageFlags usage, void*& mapping, bool gpuRead = false) {
         Import made;
         VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bufferInfo.size = bytes;
@@ -356,7 +434,8 @@ struct NativeDevice::State {
         allocation.pNext = &flags;
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (allocation.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk, &allocation, nullptr, &made.memory) != VK_SUCCESS) throw std::runtime_error("native device: buffer memory");
+        if (gpuRead) made.memory = allocateVram(allocation, requirements.memoryTypeBits);
+        if (made.memory == VK_NULL_HANDLE && (allocation.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk, &allocation, nullptr, &made.memory) != VK_SUCCESS)) throw std::runtime_error("native device: buffer memory");
         vkBindBufferMemory(vk, made.buffer, made.memory, 0);
         vkMapMemory(vk, made.memory, 0, VK_WHOLE_SIZE, 0, &mapping);
         made.begin = 0;
@@ -374,10 +453,17 @@ struct NativeDevice::State {
         bufferInfo.commandPool = commandPool;
         bufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         bufferInfo.commandBufferCount = 1;
-        vkAllocateCommandBuffers(vk, &bufferInfo, &commands);
-        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        vkCreateFence(vk, &fenceInfo, nullptr, &fence);
-        ring = hostBuffer(ringBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ringMapping);
+        for (auto& slot : slots) {
+            vkAllocateCommandBuffers(vk, &bufferInfo, &slot.commands);
+            VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            vkCreateFence(vk, &fenceInfo, nullptr, &slot.fence);
+            slot.ring = hostBuffer(ringBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, slot.ringMapping, true);
+        }
+        commands = slots[0].commands;
+        ring = slots[0].ring;
+        ringMapping = slots[0].ringMapping;
+        context.detiler->SetBatchClock([this] { return openSerial; }, [this] { return completedSerial.load(std::memory_order_acquire); });
+        completer = std::thread([this] { completeBatches(); });
         fault = hostBuffer(ShaderRecompiler::BdaAbi::NativeFaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, faultMapping);
         std::memset(faultMapping, 0, ShaderRecompiler::BdaAbi::NativeFaultBufferBytes);
     }
@@ -433,6 +519,7 @@ struct NativeDevice::State {
                 case ShaderRecompiler::DescriptorRole::Gds:
                 case ShaderRecompiler::DescriptorRole::BdaPagetable:
                 case ShaderRecompiler::DescriptorRole::FaultBuffer:
+                case ShaderRecompiler::DescriptorRole::FlattenedSrt:
                 case ShaderRecompiler::DescriptorRole::ShaderData:
                     bindings.push_back({binding.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, binding.count, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
                     break;
@@ -510,46 +597,103 @@ struct NativeDevice::State {
         return made;
     }
 
-    void flushLocked() {
-        auto& s = *this;
-    if (!s.recording) return;
-        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
-        vkEndCommandBuffer(s.commands);
-        s.recording = false;
-        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &s.commands;
-        {
-            // The driver device's queue is shared with its presentation: submissions hold the GPU lock.
-            std::lock_guard queue(GuestMemory::GpuMutex());
-            if (vkQueueSubmit(s.context.queue, 1, &submit, s.fence) != VK_SUCCESS) throw std::runtime_error("native device: vkQueueSubmit");
+    struct Slot {
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        Import ring;
+        void* ringMapping = nullptr;
+        std::uint64_t serial = 0;
+        bool submitted = false;
+        bool done = false;
+        bool used = false;
+        VkResult result = VK_SUCCESS;
+        std::vector<std::function<void()>> afterBatch;
+        std::vector<std::shared_ptr<void>> kept;
+        std::vector<std::shared_ptr<void>> resources;
+        std::vector<Import> retired;
+        std::vector<std::string> log;
+        std::chrono::steady_clock::time_point submittedAt{};
+    };
+    static constexpr std::size_t SlotCount = 8;
+    std::array<Slot, SlotCount> slots;
+    std::size_t current = 0;
+    std::uint64_t openSerial = 0;
+    std::atomic<std::uint64_t> completedSerial{0};
+    std::deque<std::size_t> submittedOrder;
+    std::mutex completionMutex;
+    std::condition_variable completionChanged;
+    std::deque<std::size_t> completionQueue;
+    bool stopping = false;
+    std::thread completer;
+
+    void completeBatches() {
+        for (;;) {
+            std::size_t index = 0;
+            {
+                std::unique_lock lock(completionMutex);
+                completionChanged.wait(lock, [&] { return stopping || !completionQueue.empty(); });
+                if (completionQueue.empty()) return;
+                index = completionQueue.front();
+            }
+            auto& slot = slots[index];
+            const auto result = vkWaitForFences(vk, 1, &slot.fence, VK_TRUE, 10'000'000'000ull);
+            Native::TimelineEvent("gpu done", slot.serial);
+            if (Native::Logs()) {
+                static std::chrono::steady_clock::time_point lastDone{}, reported = std::chrono::steady_clock::now();
+                static double busyMs = 0.0;
+                const auto done = std::chrono::steady_clock::now();
+                const auto start = std::max(slot.submittedAt, lastDone);
+                busyMs += std::chrono::duration<double, std::milli>(done - start).count();
+                lastDone = done;
+                const auto window = std::chrono::duration<double, std::milli>(done - reported).count();
+                if (window >= 5000.0) {
+                    std::fprintf(stderr, "[native] GPU busy %.0f%% of %.1f s (submit to completion)\n", 100.0 * busyMs / window, window / 1000.0);
+                    busyMs = 0.0;
+                    reported = done;
+                }
+            }
+            for (;;) {
+                std::vector<std::function<void()>> actions;
+                {
+                    std::lock_guard lock(completionMutex);
+                    if (result != VK_SUCCESS || slot.afterBatch.empty()) {
+                        slot.result = result;
+                        slot.done = true;
+                        completionQueue.pop_front();
+                        if (result == VK_SUCCESS) completedSerial.store(slot.serial, std::memory_order_release);
+                        break;
+                    }
+                    actions = std::move(slot.afterBatch);
+                    slot.afterBatch.clear();
+                }
+                for (auto& action : actions) action();
+            }
+            completionChanged.notify_all();
         }
-        const auto waitStart = std::chrono::steady_clock::now();
-        const auto waited = vkWaitForFences(s.vk, 1, &s.fence, VK_TRUE, 10'000'000'000ull);
+    }
+
+    bool reapOldest(bool block) {
+        auto& s = *this;
+        if (s.submittedOrder.empty()) return false;
+        auto& slot = s.slots[s.submittedOrder.front()];
         {
-            // APS5_NATIVE_STATS: batches and the time the executor waits for the GPU on them.
-            static std::uint64_t flushes = 0, recorded = 0;
-            static double waitedMs = 0.0, worstMs = 0.0;
+            std::unique_lock lock(s.completionMutex);
+            if (!slot.done && !block) return false;
+            const auto waitStart = std::chrono::steady_clock::now();
+            s.completionChanged.wait(lock, [&] { return slot.done; });
+            static double waitedMs = 0.0;
+            static std::uint64_t reaped = 0;
             static auto reported = std::chrono::steady_clock::now();
             const auto now = std::chrono::steady_clock::now();
-            const auto ms = std::chrono::duration<double, std::milli>(now - waitStart).count();
-            ++flushes;
-            recorded += s.batchLog.size();
-            waitedMs += ms;
-            worstMs = std::max(worstMs, ms);
+            waitedMs += std::chrono::duration<double, std::milli>(now - waitStart).count();
+            ++reaped;
             if (now - reported > std::chrono::seconds(5)) {
-                if (Native::Logs()) std::fprintf(stderr, "[native] batches: %llu in 5 s, GPU wait %.0f ms total (worst %.1f ms), %.1f entries per batch\n", static_cast<unsigned long long>(flushes), waitedMs, worstMs, flushes ? static_cast<double>(recorded) / flushes : 0.0);
-                flushes = recorded = 0;
-                waitedMs = worstMs = 0.0;
+                if (Native::Logs()) std::fprintf(stderr, "[native] batches: %llu in 5 s, executor waited %.0f ms for the GPU\n", static_cast<unsigned long long>(reaped), waitedMs);
+                waitedMs = 0.0;
+                reaped = 0;
                 reported = now;
             }
         }
-        // Read the first-claim host-visible diagnostics before any failure
-        // throws. On an incomplete/lost batch this is a best-effort snapshot;
-        // leave it untouched rather than racing an outstanding GPU writer.
         for (const auto word : {0u, ShaderRecompiler::BdaAbi::NativeDiagnosticWord}) {
             auto* faultRecord = reinterpret_cast<ShaderRecompiler::BdaAbi::Fault*>(static_cast<std::uint32_t*>(s.faultMapping) + word);
             if (faultRecord->state == ShaderRecompiler::BdaAbi::FaultState::Ready) {
@@ -559,44 +703,109 @@ struct NativeDevice::State {
                 if (faultRecord->reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) std::snprintf(detail, sizeof(detail), "%s in program 0x%llx", Reasons[6], static_cast<unsigned long long>(faultRecord->address));
                 else std::snprintf(detail, sizeof(detail), "%s (stage %u, pc 0x%x, address 0x%llx, %u bytes)", reason < std::size(Reasons) ? Reasons[reason] : Reasons[0], faultRecord->stage, faultRecord->instruction, static_cast<unsigned long long>(faultRecord->address), faultRecord->bytes);
                 ReportGraphicsIssue("GPU fault", detail);
-                if (waited == VK_SUCCESS) std::memset(faultRecord, 0, sizeof(*faultRecord));
+                if (slot.result == VK_SUCCESS) std::memset(faultRecord, 0, sizeof(*faultRecord));
             }
         }
-        if (waited != VK_SUCCESS) {
+        if (slot.result != VK_SUCCESS) {
             if (Native::Logs()) {
-                std::fprintf(stderr, "[native] batch failed (%d); its last work:\n", static_cast<int>(waited));
-                for (const auto& entry : s.batchLog) std::fprintf(stderr, "[native]   %s\n", entry.c_str());
+                std::fprintf(stderr, "[native] batch failed (%d); its last work:\n", static_cast<int>(slot.result));
+                for (const auto& entry : slot.log) std::fprintf(stderr, "[native]   %s\n", entry.c_str());
             }
-            throw std::runtime_error(waited == VK_ERROR_DEVICE_LOST ? std::string("the graphics device was lost (VK_ERROR_DEVICE_LOST)")
-                : "GPU work did not complete (VkResult " + std::to_string(static_cast<int>(waited)) + ")");
+            throw std::runtime_error(slot.result == VK_ERROR_DEVICE_LOST ? std::string("the graphics device was lost (VK_ERROR_DEVICE_LOST)")
+                : "GPU work did not complete (VkResult " + std::to_string(static_cast<int>(slot.result)) + ")");
         }
-        // A timeout does not mean the queue retired: never reset its fence,
-        // release kept resources, or destroy retired imports on that path.
-        vkResetFences(s.vk, 1, &s.fence);
-        if (waited == VK_SUCCESS) s.images->Completed();
-        if (waited == VK_SUCCESS) {
-            auto actions = std::move(s.afterBatch);
-            s.afterBatch.clear();
-            for (auto& action : actions) action();
-        }
-        if (waited == VK_SUCCESS) s.collectTimes();
-        else s.timedNames.clear();
-        if (waited == VK_SUCCESS && s.statisticsUsed != 0) {
+        s.images->Completed();
+        s.collectTimes();
+        if (s.statisticsUsed != 0) {
             std::vector<std::uint64_t> values(s.statisticsUsed * 6u);
             s.context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(s.vk, s.statistics, 0, s.statisticsUsed, values.size() * 8u, values.data(), 48, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             for (std::uint32_t q = 0; q < s.statisticsUsed; ++q) std::fprintf(stderr, "[native] draw stats %s: vertices %llu, VS %llu, clipping in %llu out %llu, FS %llu, TES %llu\n", s.statisticsNames[q].c_str(), static_cast<unsigned long long>(values[q * 6]), static_cast<unsigned long long>(values[q * 6 + 1]), static_cast<unsigned long long>(values[q * 6 + 2]), static_cast<unsigned long long>(values[q * 6 + 3]), static_cast<unsigned long long>(values[q * 6 + 4]), static_cast<unsigned long long>(values[q * 6 + 5]));
             s.statisticsUsed = 0;
             s.statisticsNames.clear();
         }
-        s.kept.clear();
+        slot.kept.clear();
+        slot.resources.clear();
         {
-            // Nothing recorded before this point is in flight any more.
             std::unique_lock imports(s.importsMutex);
-            for (auto& import : s.retired) s.destroy(import);
+            for (auto& import : slot.retired) s.destroy(import);
+            slot.retired.clear();
+        }
+        slot.log.clear();
+        slot.submitted = false;
+        slot.done = false;
+        s.submittedOrder.pop_front();
+        return true;
+    }
+
+    void drain() {
+        while (reapOldest(true)) {}
+    }
+
+    void flushLocked(bool wait = true) {
+        auto& s = *this;
+        if (!s.recording) {
+            if (wait) s.drain();
+            return;
+        }
+        s.endPass();
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        vkEndCommandBuffer(s.commands);
+        s.recording = false;
+        auto& slot = s.slots[s.current];
+        slot.kept = std::move(s.kept);
+        s.kept.clear();
+        slot.resources = s.images->TakeBatchResources();
+        s.batchLogSize = s.batchLog.size();
+        slot.log = std::move(s.batchLog);
+        s.batchLog.clear();
+        {
+            std::unique_lock imports(s.importsMutex);
+            slot.retired = std::move(s.retired);
             s.retired.clear();
         }
-        s.batchLog.clear();
-
+        {
+            std::lock_guard lock(s.completionMutex);
+            slot.afterBatch = std::move(s.afterBatch);
+            slot.done = false;
+        }
+        s.afterBatch.clear();
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &s.commands;
+        {
+            // The driver device's queue is shared with its presentation: submissions hold the GPU lock.
+            const auto lockStart = std::chrono::steady_clock::now();
+            std::lock_guard queue(GuestMemory::GpuMutex());
+            const auto locked = std::chrono::steady_clock::now();
+            if (vkQueueSubmit(s.context.queue, 1, &submit, slot.fence) != VK_SUCCESS) throw std::runtime_error("native device: vkQueueSubmit");
+            if (Native::Logs()) {
+                static double lockMs = 0.0, submitMs = 0.0;
+                static auto reported = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                lockMs += std::chrono::duration<double, std::milli>(locked - lockStart).count();
+                submitMs += std::chrono::duration<double, std::milli>(now - locked).count();
+                if (now - reported > std::chrono::seconds(5)) {
+                    std::fprintf(stderr, "[native] batch submits over 5 s: %.0f ms waiting for the queue lock, %.0f ms in vkQueueSubmit\n", lockMs, submitMs);
+                    lockMs = submitMs = 0.0;
+                    reported = now;
+                }
+            }
+        }
+        slot.submitted = true;
+        slot.used = true;
+        slot.submittedAt = std::chrono::steady_clock::now();
+        Native::TimelineEvent("gpu submit", slot.serial, s.batchLogSize);
+        s.submittedOrder.push_back(s.current);
+        {
+            std::lock_guard lock(s.completionMutex);
+            s.completionQueue.push_back(s.current);
+        }
+        s.completionChanged.notify_all();
+        s.current = (s.current + 1) % SlotCount;
+        if (wait || GpuTimes() || s.statisticsUsed != 0) s.drain();
     }
 
     bool graphicsBarrier = true;
@@ -613,12 +822,27 @@ struct NativeDevice::State {
         const std::pair<std::uint64_t, std::uint64_t> key{identity.low, identity.high};
         if (const auto found = memoryWriters.find(key); found != memoryWriters.end() && !identity.Empty()) return found->second;
         const auto code = std::span(shader.spirv);
-        std::set<std::uint32_t> pointers;
-        bool writes = false;
+        std::set<std::uint32_t> pointers, bookkeeping;
+        for (std::size_t i = 5; i < code.size();) {
+            const auto count = code[i] >> 16u;
+            if (count == 0 || i + count > code.size()) break;
+            if ((code[i] & 0xffffu) == 5u && count >= 3) {
+                const std::string_view name(reinterpret_cast<const char*>(&code[i + 2]), strnlen(reinterpret_cast<const char*>(&code[i + 2]), (count - 2) * 4u));
+                if (name == "native_image_lookup" || name == "native_sampler_lookup" || name == "record_bda_fault") bookkeeping.insert(code[i + 1]);
+            }
+            i += count;
+        }
+        bool writes = false, skipping = false;
         for (std::size_t i = 5; i < code.size() && !writes;) {
             const auto count = code[i] >> 16u;
             const auto opcode = code[i] & 0xffffu;
             if (count == 0 || i + count > code.size()) break;
+            if (opcode == 54u && count >= 5) skipping = bookkeeping.contains(code[i + 2]);
+            else if (opcode == 56u) skipping = false;
+            if (skipping) {
+                i += count;
+                continue;
+            }
             if (opcode == 120u && count >= 4) pointers.insert(code[i + 2]);
             else if ((opcode == 65u || opcode == 66u || opcode == 67u || opcode == 70u || opcode == 124u || opcode == 83u) && count >= 4 && pointers.contains(code[i + 3])) pointers.insert(code[i + 2]);
             else if ((opcode == 62u || opcode == 228u) && count >= 3 && pointers.contains(code[i + 1])) writes = true;
@@ -632,8 +856,15 @@ struct NativeDevice::State {
 
     void begin() {
         if (recording) return;
+        auto& slot = slots[current];
+        while (slot.submitted) reapOldest(true);
+        while (reapOldest(false)) {}
+        if (slot.used) vkResetFences(vk, 1, &slot.fence);
+        slot.serial = ++openSerial;
+        commands = slot.commands;
+        ring = slot.ring;
+        ringMapping = slot.ringMapping;
         graphicsBarrier = true;
-        if (images) images->NewBatch();
         VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandBuffer(commands, 0);
@@ -647,6 +878,23 @@ struct NativeDevice::State {
             if ((bits & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & flags) == flags) return i;
         }
         return UINT32_MAX;
+    }
+
+    VkDeviceMemory allocateVram(VkMemoryAllocateInfo allocation, std::uint32_t bits) const {
+        allocation.memoryTypeIndex = memoryType(bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (allocation.memoryTypeIndex == UINT32_MAX) return VK_NULL_HANDLE;
+        VkDeviceMemory made = VK_NULL_HANDLE;
+        if (vkAllocateMemory(vk, &allocation, nullptr, &made) == VK_SUCCESS) return made;
+        for (std::uint32_t type = 0; type < memory.memoryTypeCount; ++type) {
+            if (memory.memoryTypes[type].propertyFlags != 0) continue;
+            VkMemoryAllocateInfo small{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            small.allocationSize = 65536;
+            small.memoryTypeIndex = type;
+            VkDeviceMemory scratch = VK_NULL_HANDLE;
+            if (vkAllocateMemory(vk, &small, nullptr, &scratch) == VK_SUCCESS) vkFreeMemory(vk, scratch, nullptr);
+            if (vkAllocateMemory(vk, &allocation, nullptr, &made) == VK_SUCCESS) return made;
+        }
+        return VK_NULL_HANDLE;
     }
 
     // Diagnostic: whether the device can still allocate 1 MiB of host-visible memory.
@@ -666,6 +914,110 @@ struct NativeDevice::State {
         if (import.buffer != VK_NULL_HANDLE) vkDestroyBuffer(vk, import.buffer, nullptr);
         if (import.memory != VK_NULL_HANDLE) vkFreeMemory(vk, import.memory, nullptr);
         import = {};
+    }
+
+    // Guest pools in video memory (GuestArena::GpuPlacement), keyed by their begin in `imports`.
+    // Placement and eviction run under the guest memory lock, so they hand their import changes to
+    // SyncGpuMemory (which takes the imports lock first) through `placements`.
+    std::set<std::uint64_t> placed;
+    std::uint64_t placedBytes = 0;
+    std::mutex placementMutex;
+    std::map<std::uint64_t, Import> placedNow;
+    std::vector<std::uint64_t> evictedNow;
+    std::map<std::uint64_t, VkDeviceMemory> placedMemory;
+
+    bool placeVideoMemory(std::uint64_t address, std::uint64_t bytes) {
+        const auto alignment = context.placedMapAlignment;
+        if (alignment == 0 || vkMapMemory2KHR == nullptr || address % alignment != 0 || bytes % alignment != 0) return false;
+        Import made;
+        made.begin = address;
+        made.end = address + bytes;
+        made.permissions = ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write;
+        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufferInfo.size = bytes;
+        bufferInfo.usage = ImportUsage;
+        if (vkCreateBuffer(vk, &bufferInfo, nullptr, &made.buffer) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vkGetBufferMemoryRequirements(vk, made.buffer, &requirements);
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.pNext = &flags;
+        allocation.allocationSize = bytes;
+        if (requirements.size != bytes || (made.memory = allocateVram(allocation, requirements.memoryTypeBits)) == VK_NULL_HANDLE || vkBindBufferMemory(vk, made.buffer, made.memory, 0) != VK_SUCCESS) {
+            destroy(made);
+            return false;
+        }
+        // The pool's contents so far, then the memory mapped in place of the host pages.
+        void* staging = nullptr;
+        if (vkMapMemory(vk, made.memory, 0, VK_WHOLE_SIZE, 0, &staging) != VK_SUCCESS) {
+            destroy(made);
+            return false;
+        }
+        std::memcpy(staging, reinterpret_cast<const void*>(address), bytes);
+        vkUnmapMemory(vk, made.memory);
+        VkMemoryMapPlacedInfoEXT placement{VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT};
+        placement.pPlacedAddress = reinterpret_cast<void*>(address);
+        VkMemoryMapInfoKHR mapInfo{VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, &placement};
+        mapInfo.flags = VK_MEMORY_MAP_PLACED_BIT_EXT;
+        mapInfo.memory = made.memory;
+        mapInfo.size = VK_WHOLE_SIZE;
+        void* mapped = nullptr;
+        if (vkMapMemory2KHR(vk, &mapInfo, &mapped) != VK_SUCCESS || mapped != reinterpret_cast<void*>(address)) {
+            destroy(made);
+            throw std::runtime_error("native device: video memory could not be placed at a guest pool");
+        }
+        VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        addressInfo.buffer = made.buffer;
+        made.address = vkGetBufferDeviceAddress(vk, &addressInfo);
+        std::lock_guard lock(placementMutex);
+        placedMemory[address] = made.memory;
+        placedNow[address] = made;
+        return true;
+    }
+
+    void evictVideoMemory(std::uint64_t address, std::uint64_t) {
+        std::lock_guard lock(placementMutex);
+        const auto memory = placedMemory.find(address);
+        if (memory == placedMemory.end()) return;
+        VkMemoryUnmapInfoKHR unmapInfo{VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR};
+        unmapInfo.flags = VK_MEMORY_UNMAP_RESERVE_BIT_EXT;
+        unmapInfo.memory = memory->second;
+        vkUnmapMemory2KHR(vk, &unmapInfo);
+        placedMemory.erase(memory);
+        evictedNow.push_back(address);
+    }
+
+    // Under the exclusive imports lock: the pools placed and evicted since the last call.
+    bool takePlacements() {
+        std::lock_guard lock(placementMutex);
+        bool changed = false;
+        for (const auto address : evictedNow) {
+            if (const auto placedNowEntry = placedNow.find(address); placedNowEntry != placedNow.end()) {
+                retired.push_back(placedNowEntry->second);
+                placedNow.erase(placedNowEntry);
+                continue;
+            }
+            const auto found = imports.find(address);
+            if (found == imports.end() || !placed.contains(address)) continue;
+            retired.push_back(found->second);
+            importedBytes -= found->second.end - found->second.begin;
+            placedBytes -= found->second.end - found->second.begin;
+            placed.erase(address);
+            imports.erase(found);
+            changed = true;
+        }
+        evictedNow.clear();
+        for (auto& [address, made] : placedNow) {
+            imports[address] = made;
+            placed.insert(address);
+            importedBytes += made.end - made.begin;
+            placedBytes += made.end - made.begin;
+            changed = true;
+            if (Native::Logs()) std::fprintf(stderr, "[native] GPU pool 0x%llx+0x%llx in video memory (%.0f MiB placed)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(made.end - made.begin), placedBytes / 1048576.0);
+        }
+        placedNow.clear();
+        return changed;
     }
 
     static constexpr VkBufferUsageFlags ImportUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -793,15 +1145,16 @@ struct NativeDevice::State {
             allocation.pNext = &flags;
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (allocation.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk, &allocation, nullptr, &tableMemory) != VK_SUCCESS) throw std::runtime_error("native device: page table memory");
+            tableMemory = allocateVram(allocation, requirements.memoryTypeBits);
+            if (tableMemory == VK_NULL_HANDLE && (allocation.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk, &allocation, nullptr, &tableMemory) != VK_SUCCESS)) throw std::runtime_error("native device: page table memory");
             vkBindBufferMemory(vk, table, tableMemory, 0);
             vkMapMemory(vk, tableMemory, 0, VK_WHOLE_SIZE, 0, &tableMapping);
             VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             addressInfo.buffer = table;
             tableAddress = vkGetBufferDeviceAddress(vk, &addressInfo);
         }
-        auto* words = static_cast<std::uint32_t*>(tableMapping);
-        std::memset(words, 0, needed);
+        std::vector<std::uint32_t> built(needed / sizeof(std::uint32_t), 0u);
+        auto* words = built.data();
         words[0] = Table::Magic;
         words[1] = level1Count;
         std::memcpy(words + Table::HeaderWords, level1.data(), level1.size() * sizeof(std::uint32_t));
@@ -822,6 +1175,7 @@ struct NativeDevice::State {
             static std::size_t reported = 0;
             if (reported++ < 4 && Native::Logs()) std::fprintf(stderr, "[native] page table: %zu 64 KiB pages shared by two imports (the later one maps them)\n", shared);
         }
+        std::memcpy(tableMapping, built.data(), needed);
         tableUsedBytes = needed;
         ++tableGeneration;
     }
@@ -832,6 +1186,23 @@ NativeDevice& NativeDevice::Create(std::shared_ptr<VulkanDevice> driverDevice) {
     if (auto* existing = device.load()) return *existing;
     auto* made = new NativeDevice(std::move(driverDevice));
     device.store(made);
+    static const GuestArena::GpuPlacement placement{
+        [](std::uintptr_t address, std::size_t bytes) {
+            auto* native = NativeDevice::Get();
+            return native != nullptr && native->state->placeVideoMemory(address, bytes);
+        },
+        [] {
+            if (auto* native = NativeDevice::Get()) {
+                std::lock_guard lock(native->state->workMutex);
+                native->state->flushLocked(true);
+            }
+        },
+        [](std::uintptr_t address, std::size_t bytes) {
+            if (auto* native = NativeDevice::Get()) native->state->evictVideoMemory(address, bytes);
+        }};
+    // APS5_VIDEO_MEMORY_POOLS=1: whole GPU pools in video memory. GT7 keeps CPU data in the same
+    // pools, which its code then reads uncached, so the default keeps pools in host memory.
+    if (made->state->context.placedMapAlignment != 0 && std::getenv("APS5_VIDEO_MEMORY_POOLS") != nullptr) GuestArena::GuestArenaSetGpuPlacement_nid_postfix(&placement);
     made->SyncGpuMemory();
     const auto stats = made->Stats();
     if (Native::Logs()) std::fprintf(stderr, "[native] device ready: %zu GPU ranges imported (%.1f MiB), %zu failed\n", stats.imports, stats.importedBytes / 1048576.0, stats.failedImports);
@@ -864,6 +1235,7 @@ NativeDevice::NativeDevice(std::shared_ptr<VulkanDevice> driverDevice) : state(s
         offset = address - it->second.begin;
         return it->second.end - address;
     });
+    state->images->BeforeRecording([this] { state->endPass(); });
     VkDescriptorSetLayoutCreateInfo emptyInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     if (vkCreateDescriptorSetLayout(state->vk, &emptyInfo, nullptr, &state->emptyLayout) != VK_SUCCESS) throw std::runtime_error("native device: empty set layout");
     const VkDescriptorSetLayoutBinding workgroupBinding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -884,6 +1256,14 @@ NativeDevice::NativeDevice(std::shared_ptr<VulkanDevice> driverDevice) : state(s
 }
 
 NativeDevice::~NativeDevice() {
+    if (state->completer.joinable()) {
+        {
+            std::lock_guard lock(state->completionMutex);
+            state->stopping = true;
+        }
+        state->completionChanged.notify_all();
+        state->completer.join();
+    }
     for (auto& [begin, import] : state->imports) state->destroy(import);
     for (auto& import : state->retired) state->destroy(import);
 }
@@ -909,10 +1289,17 @@ void NativeDevice::SyncGpuMemory() {
     }
     std::sort(wanted.begin(), wanted.end(), [](const Chunk& a, const Chunk& b) { return a.begin < b.begin; });
     std::unique_lock lock(state->importsMutex);
-    bool changed = false;
+    const bool placements = state->takePlacements();
+    std::erase_if(wanted, [&](const Chunk& chunk) {
+        auto it = state->imports.upper_bound(chunk.begin);
+        if (it == state->imports.begin()) return false;
+        --it;
+        return state->placed.contains(it->first) && chunk.begin < it->second.end;
+    });
+    bool changed = placements;
     for (auto it = state->imports.begin(); it != state->imports.end();) {
         const auto found = std::find_if(wanted.begin(), wanted.end(), [&](const Chunk& chunk) { return chunk.begin == it->second.begin && chunk.begin + chunk.bytes == it->second.end; });
-        if (found != wanted.end()) {
+        if (found != wanted.end() || state->placed.contains(it->first)) {
             ++it;
             continue;
         }
@@ -949,12 +1336,100 @@ std::uint64_t NativeDevice::DeviceAddress(std::uint64_t address, std::uint64_t b
     return it->second.address + (address - it->second.begin);
 }
 
+std::uint64_t NativeDevice::DeviceSpan(std::uint64_t address, std::uint64_t& bytes) const {
+    bytes = 0;
+    std::shared_lock lock(state->importsMutex);
+    auto it = state->imports.upper_bound(address);
+    if (it == state->imports.begin()) return 0;
+    --it;
+    if (address >= it->second.end || (it->second.permissions & ShaderRecompiler::BdaAbi::Read) == 0) return 0;
+    bytes = it->second.end - address;
+    return it->second.address + (address - it->second.begin);
+}
+
 NativeDevice::Statistics NativeDevice::Stats() const {
     std::shared_lock lock(state->importsMutex);
     return {state->imports.size(), state->importedBytes, state->failedImports, state->tableGeneration};
 }
 
-bool NativeDevice::DmaGds(std::span<const std::uint32_t> packet) {
+bool NativeDevice::TransferOnGpu(std::span<const std::uint32_t> packet) {
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    const auto address = [](std::uint32_t low, std::uint32_t high) { return low | (std::uint64_t{high} << 32u); };
+    std::uint64_t destination = 0, source = 0, bytes = 0;
+    bool fill = false, update = false;
+    std::vector<std::uint32_t> words;
+    if (opcode == 0x37u) {
+        if (packet.size() < 5 || ((packet[1] >> 8u) & 0xfu) == 0u) return false;
+        destination = address(packet[2], packet[3]);
+        if ((packet[1] & 0x10000u) != 0u) words.push_back(packet.back());
+        else words.assign(packet.begin() + 4, packet.end());
+        bytes = words.size() * 4u;
+        update = true;
+        if ((destination & 3u) != 0u || bytes > 65536u) return false;
+    } else if (opcode == 0x50u) {
+        if (packet.size() < 7) return false;
+        const auto from = ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
+        const auto to = ((packet[1] >> 20u) & 3u) | ((packet[6] >> 25u) & 4u) | ((packet[6] >> 26u) & 8u);
+        if (from == 1u || to == 1u) return DmaGds(packet, false);
+        bytes = packet[6] & 0x3ffffffu;
+        if (bytes == 0u || to == 2u) return true;
+        if (to != 0u && to != 3u) return false;
+        destination = address(packet[4], packet[5]);
+        if (from == 2u) {
+            fill = true;
+            if ((destination & 3u) != 0u || (bytes & 3u) != 0u) return false;
+        } else if (from == 0u || from == 3u) {
+            source = address(packet[2], packet[3]);
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    auto& s = *state;
+    std::lock_guard lock(s.workMutex);
+    const auto locate = [&](std::uint64_t at, VkDeviceSize& offset) {
+        std::shared_lock imports(s.importsMutex);
+        auto found = s.imports.upper_bound(at);
+        if (found == s.imports.begin() || at > std::prev(found)->second.end || bytes > std::prev(found)->second.end - at) return VkBuffer{VK_NULL_HANDLE};
+        --found;
+        offset = at - found->second.begin;
+        return found->second.buffer;
+    };
+    VkDeviceSize destinationOffset = 0, sourceOffset = 0;
+    const auto destinationBuffer = locate(destination, destinationOffset);
+    if (destinationBuffer == VK_NULL_HANDLE) return false;
+    VkBuffer sourceBuffer = VK_NULL_HANDLE;
+    if (!fill && !update) {
+        sourceBuffer = locate(source, sourceOffset);
+        if (sourceBuffer == VK_NULL_HANDLE || (sourceBuffer == destinationBuffer && source < destination + bytes && destination < source + bytes)) return false;
+    }
+    s.prepareCompute();
+    s.begin();
+    s.endPass();
+    VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    before.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+    if (update) {
+        s.context.Function<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer")(s.commands, destinationBuffer, destinationOffset, bytes, words.data());
+    } else if (fill) {
+        s.context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(s.commands, destinationBuffer, destinationOffset, bytes, packet[2]);
+    } else {
+        const VkBufferCopy copy{sourceOffset, destinationOffset, bytes};
+        s.context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(s.commands, sourceBuffer, destinationBuffer, 1, &copy);
+    }
+    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+    s.graphicsBarrier = true;
+    s.images->MarkGpuWritten(destination, destination + bytes);
+    s.note(std::string(update ? "WRITE_DATA " : fill ? "DMA fill " : "DMA copy ") + std::to_string(bytes) + " bytes");
+    return true;
+}
+
+bool NativeDevice::DmaGds(std::span<const std::uint32_t> packet, bool wait) {
     if (packet.size() < 7) return false;
     const auto source = ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
     const auto destination = ((packet[1] >> 20u) & 3u) | ((packet[6] >> 25u) & 4u) | ((packet[6] >> 26u) & 8u);
@@ -972,6 +1447,7 @@ bool NativeDevice::DmaGds(std::span<const std::uint32_t> packet) {
     std::lock_guard lock(s.workMutex);
     s.prepareCompute();
     s.begin();
+    s.endPass();
     s.prepareGds();
     s.graphicsBarrier = true;
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1012,15 +1488,48 @@ bool NativeDevice::DmaGds(std::span<const std::uint32_t> packet) {
         }
     }
     s.note("GDS DMA " + std::to_string(bytes) + " bytes");
-    // DMA completion makes memory visible to subsequent CPU packet effects as
-    // well as shaders; no GDS data is staged through host memory.
-    s.flushLocked();
+    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+    if (wait) s.flushLocked();
     return true;
 }
 
+// APS5_NATIVE_LOG: where a recorded draw's time goes (lock, state and pipeline, images, commands).
+struct DrawPhases {
+    std::chrono::steady_clock::time_point start, last;
+    explicit DrawPhases(std::chrono::steady_clock::time_point started) : start(started), last(std::chrono::steady_clock::now()) {
+        Mark(0, last);
+    }
+    void Mark(std::size_t phase) {
+        const auto now = std::chrono::steady_clock::now();
+        Mark(phase, now);
+    }
+    void Mark(std::size_t phase, std::chrono::steady_clock::time_point now) {
+        if (!Native::Logs()) return;
+        static std::mutex mutex;
+        static std::array<double, 4> us{};
+        static std::uint64_t draws = 0;
+        static auto reported = std::chrono::steady_clock::now();
+        std::lock_guard lock(mutex);
+        us[phase] += std::chrono::duration<double, std::micro>(phase == 0 ? last - start : now - last).count();
+        last = now;
+        if (phase != 3) return;
+        ++draws;
+        if (now - reported < std::chrono::seconds(5)) return;
+        std::fprintf(stderr, "[native] recorded draws: %llu in 5 s, us per draw: lock %.1f, state and pipeline %.1f, images %.1f, commands %.1f\n", static_cast<unsigned long long>(draws), us[0] / draws, us[1] / draws, us[2] / draws, us[3] / draws);
+        us = {};
+        draws = 0;
+        reported = now;
+    }
+};
+
 bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
     auto& s = *state;
+    const auto lockStart = std::chrono::steady_clock::now();
     std::unique_lock lock(s.workMutex);
+    s.noteLockWait(lockStart);
     s.prepareCompute();
     const auto& shader = *work.shader;
     auto* pipeline = s.pipelineFor(shader, work.pipelineKey, failure, lock);
@@ -1038,14 +1547,18 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
     }
     const auto dataBytes = work.shaderData.size_bytes();
     const bool pushed = shader.pushDataStartDword != ~0u;
-    VkDeviceSize dataOffset = 0;
-    if (!pushed && dataBytes != 0) {
+    const bool flattened = std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt; });
+    const auto flatBytes = flattened ? std::max<VkDeviceSize>(work.flattenedSrt.size_bytes(), 16) : 0;
+    VkDeviceSize dataOffset = 0, flatOffset = 0;
+    if ((!pushed && dataBytes != 0) || flattened) {
         const auto alignment = std::max<VkDeviceSize>(s.context.limits.minStorageBufferOffsetAlignment, 16);
-        if (s.recording && ((s.ringOffset + alignment - 1) & ~(alignment - 1)) + dataBytes > s.ringBytes) s.flushLocked();
+        if (s.recording && s.ringOffset + 2 * alignment + (pushed ? 0 : dataBytes) + flatBytes > s.ringBytes) s.flushLocked(false);
     }
     s.begin();
+    s.endPass();
     {
         const auto uploads = s.beginTimed("image creation and uploads");
+        s.queueSlots(shader, work.slotWords);
         s.images->Prepare(s.commands);
         s.endTimed(uploads);
     }
@@ -1054,8 +1567,10 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
         dataOffset = (s.ringOffset + alignment - 1) & ~(alignment - 1);
         std::memcpy(static_cast<std::byte*>(s.ringMapping) + dataOffset, work.shaderData.data(), dataBytes);
         s.writeInvocationAddresses(static_cast<std::byte*>(s.ringMapping) + dataOffset, dataBytes, work.programAddress);
+        s.writeSlots(static_cast<std::byte*>(s.ringMapping) + dataOffset, dataBytes, shader, work.slotWords);
         s.ringOffset = dataOffset + dataBytes;
     }
+    if (flattened) flatOffset = s.writeFlattenedSrt(work.flattenedSrt, flatBytes);
     std::vector<VkDescriptorBufferInfo> infos;
     std::vector<VkWriteDescriptorSet> writes;
     infos.reserve(shader.bindings.size());
@@ -1069,6 +1584,7 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
             }
             case ShaderRecompiler::DescriptorRole::FaultBuffer: info = {s.fault.buffer, 0, VK_WHOLE_SIZE}; break;
             case ShaderRecompiler::DescriptorRole::ShaderData: info = {s.ring.buffer, dataOffset, std::max<VkDeviceSize>(dataBytes, 16)}; break;
+            case ShaderRecompiler::DescriptorRole::FlattenedSrt: info = {s.ring.buffer, flatOffset, flatBytes}; break;
             case ShaderRecompiler::DescriptorRole::Gds: s.prepareGds(); info = {s.gds->Handle(), 0, Pm4::GdsBytes}; break;
             default: continue;
         }
@@ -1103,6 +1619,7 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
             if (start > push.size() || dataBytes > push.size() - start) throw std::runtime_error("native compute shader data exceeds push block");
             std::memcpy(push.data() + start, work.shaderData.data(), dataBytes);
             s.writeInvocationAddresses(push.data() + start, dataBytes, work.programAddress);
+            s.writeSlots(push.data() + start, dataBytes, shader, work.slotWords);
         }
         vkCmdPushConstants(s.commands, pipeline->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 128, push.data());
     }
@@ -1143,7 +1660,10 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
 
 bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     auto& s = *state;
+    const auto lockStart = std::chrono::steady_clock::now();
     std::unique_lock lock(s.workMutex);
+    s.noteLockWait(lockStart);
+    DrawPhases phases(lockStart);
     s.prepareCompute();
     const auto& graphics = *work.state;
     if (graphics.colors.empty() && !graphics.depth) {
@@ -1159,12 +1679,13 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     std::size_t bufferBindingCount = 0;
     for (const auto& stage : work.stages) {
         if (stage.shader->pushDataStartDword == ~0u) ringBytes += (stage.shaderData.size() * 4u + 255u) & ~std::size_t{255};
+        ringBytes += (std::max<std::size_t>(stage.flattenedSrt.size() * 4u, 16) + 255u) & ~std::size_t{255};
         for (const auto& binding : stage.shader->bindings) {
             if (binding.descriptorSet == ShaderRecompiler::RuntimeAbi::NativeHeap::Set && (binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers)) {
                 heap = true;
                 continue;
             }
-            if (binding.role != ShaderRecompiler::DescriptorRole::BdaPagetable && binding.role != ShaderRecompiler::DescriptorRole::FaultBuffer && binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::Gds) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::BdaPagetable && binding.role != ShaderRecompiler::DescriptorRole::FaultBuffer && binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::Gds && binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt) {
                 failure = "graphics binding role " + std::to_string(static_cast<int>(binding.role)) + " is not native yet";
                 return false;
             }
@@ -1197,6 +1718,7 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
         for (const auto& attribute : attributes) {
             const auto& fields = attribute.resource.fields;
             const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+            NotePoolUse("vertex", address);
             auto it = s.imports.upper_bound(address);
             static int reported = 0;
             if (reported < 24) {
@@ -1266,13 +1788,12 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
         failure = std::string("graphics pipeline: ") + error.what();
         return false;
     }
-    if (s.recording && ringBytes != 0 && s.ringOffset + ringBytes + 256 > s.ringBytes) s.flushLocked();
+    phases.Mark(1);
+    if (s.recording && ringBytes != 0 && s.ringOffset + ringBytes + 256 > s.ringBytes) s.flushLocked(false);
     s.begin();
-    {
-        const auto uploads = s.beginTimed("image creation and uploads");
-        s.images->Prepare(s.commands);
-        s.endTimed(uploads);
-    }
+    for (const auto& stage : work.stages) s.queueSlots(*stage.shader, stage.slotWords);
+    s.images->Prepare(s.commands);
+    phases.Mark(2);
     std::vector<VkImageView> views;
     try {
         for (const auto& color : graphics.colors) {
@@ -1327,12 +1848,17 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
             }
             std::memcpy(block.data() + start, stage.shaderData.data(), dataBytes);
             s.writeInvocationAddresses(block.data() + start, dataBytes, stage.programAddress);
+            s.writeSlots(block.data() + start, dataBytes, *stage.shader, stage.slotWords);
         } else if (dataBytes != 0) {
             dataOffset = (s.ringOffset + alignment - 1) & ~(alignment - 1);
             std::memcpy(static_cast<std::byte*>(s.ringMapping) + dataOffset, stage.shaderData.data(), dataBytes);
             s.writeInvocationAddresses(static_cast<std::byte*>(s.ringMapping) + dataOffset, dataBytes, stage.programAddress);
+            s.writeSlots(static_cast<std::byte*>(s.ringMapping) + dataOffset, dataBytes, *stage.shader, stage.slotWords);
             s.ringOffset = dataOffset + dataBytes;
         }
+        const auto flatBytes = std::max<VkDeviceSize>(stage.flattenedSrt.size() * sizeof(std::uint32_t), 16);
+        VkDeviceSize flatOffset = 0;
+        if (std::any_of(stage.shader->bindings.begin(), stage.shader->bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt; })) flatOffset = s.writeFlattenedSrt(stage.flattenedSrt, flatBytes);
         for (const auto& binding : stage.shader->bindings) {
             VkDescriptorBufferInfo info{};
             switch (binding.role) {
@@ -1343,6 +1869,7 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
                 }
                 case ShaderRecompiler::DescriptorRole::FaultBuffer: info = {s.fault.buffer, 0, VK_WHOLE_SIZE}; break;
                 case ShaderRecompiler::DescriptorRole::ShaderData: info = {s.ring.buffer, dataOffset, std::max<VkDeviceSize>(dataBytes, 16)}; break;
+                case ShaderRecompiler::DescriptorRole::FlattenedSrt: info = {s.ring.buffer, flatOffset, flatBytes}; break;
                 case ShaderRecompiler::DescriptorRole::Gds: s.prepareGds(); info = {s.gds->Handle(), 0, Pm4::GdsBytes}; break;
                 default: continue;
             }
@@ -1361,6 +1888,7 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     VkDeviceSize indexOffset = 0;
     if (work.indexed && !graphics.stages.mesh) {
         std::shared_lock imports(s.importsMutex);
+        NotePoolUse("index", work.indexAddress);
         auto it = s.imports.upper_bound(work.indexAddress);
         if (it == s.imports.begin()) {
             failure = "index buffer outside imported memory";
@@ -1386,7 +1914,17 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
         std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
     }
     const bool targetsChanged = views != s.lastViews || graphics.renderExtent.width != s.lastExtent.width || graphics.renderExtent.height != s.lastExtent.height;
-    const bool barrierNeeded = s.graphicsBarrier || targetsChanged || s.images->Recordings() != s.barrierRecordings || DrawBarriersRequested();
+    const bool uploadsChanged = s.images->Recordings() != s.barrierRecordings;
+    const bool samplesWritten = std::any_of(work.sampled.begin(), work.sampled.end(), [&](std::uint64_t address) { return s.writtenSinceBarrier.contains(address); });
+    const bool barrierNeeded = s.graphicsBarrier || targetsChanged || uploadsChanged || samplesWritten || DrawBarriersRequested();
+    if (barrierNeeded) {
+        ++s.barrierCounts[s.graphicsBarrier ? 0 : targetsChanged ? 1 : uploadsChanged ? 2 : 3];
+        s.endPass();
+        s.writtenSinceBarrier.clear();
+    }
+    ++s.barrierCounts[4];
+    for (const auto& color : graphics.colors) s.writtenSinceBarrier.insert(color.address);
+    if (graphics.depth) s.writtenSinceBarrier.insert(graphics.depth->address);
     s.lastViews = views;
     s.lastExtent = graphics.renderExtent;
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1399,7 +1937,11 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
         s.barrierRecordings = s.images->Recordings();
     }
     for (const auto& stage : work.stages) {
-        if (s.writesGuestMemory(*stage.shader)) s.graphicsBarrier = true;
+        if (s.writesGuestMemory(*stage.shader)) {
+            s.graphicsBarrier = true;
+            static std::set<std::uint64_t> reported;
+            if (Native::Logs() && reported.insert(stage.programAddress).second) std::fprintf(stderr, "[native] draw program 0x%llx (stage %d) stores to memory: barrier before the next draw\n", static_cast<unsigned long long>(stage.programAddress), static_cast<int>(stage.stage));
+        }
     }
     std::int32_t query = -1;
     {
@@ -1413,6 +1955,7 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
         }
         static const std::uint64_t statisticsProgram = [] { const char* text = std::getenv("APS5_NATIVE_DRAW_STATS_PS"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
         if (s.statisticsLeft != 0 && s.statisticsUsed < 64 && (statisticsProgram == 0 || work.programAddresses[1] == statisticsProgram)) {
+            s.endPass();
             --s.statisticsLeft;
             query = static_cast<std::int32_t>(s.statisticsUsed++);
             char name[96];
@@ -1423,13 +1966,22 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     }
     char timedName[96];
     std::snprintf(timedName, sizeof(timedName), "draw vs 0x%llx ps 0x%llx %ux%u", static_cast<unsigned long long>(work.programAddresses[0]), static_cast<unsigned long long>(work.programAddresses[1]), graphics.renderExtent.width, graphics.renderExtent.height);
-    const auto timed = s.beginTimed(timedName);
     if (s.tracing) {
         char line[256];
         std::snprintf(line, sizeof(line), "%s target 0x%llx VkFormat %d count %u x%u heap %d depth %d", timedName, static_cast<unsigned long long>(graphics.colors.empty() ? 0ull : graphics.colors.front().address), static_cast<int>(graphics.colors.empty() ? VK_FORMAT_UNDEFINED : graphics.colors.front().format), work.count, work.instances, static_cast<int>(heap), static_cast<int>(graphics.depth.has_value()));
         s.frameTrace.emplace_back(line);
     }
-    pipeline->Begin(s.commands, *framebuffer, graphics.renderExtent, graphics);
+    auto passKey = pipeline->PassKey(*framebuffer, graphics.renderExtent, graphics);
+    if (s.passOpen && !passKey.empty() && passKey == s.passKey) {
+        pipeline->Continue(s.commands, graphics);
+    } else {
+        s.endPass();
+        s.passTimed = s.beginTimed(std::string("pass from ") + timedName);
+        pipeline->Begin(s.commands, *framebuffer, graphics.renderExtent, graphics);
+        ++s.barrierCounts[5];
+        s.passOpen = true;
+        s.passKey = std::move(passKey);
+    }
     if (query >= 0) s.context.Function<PFN_vkCmdBeginQuery>("vkCmdBeginQuery")(s.commands, s.statistics, static_cast<std::uint32_t>(query), 0);
     if (!writes.empty()) vkCmdPushDescriptorSetKHR(s.commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), 0, static_cast<std::uint32_t>(writes.size()), writes.data());
     if (heap) {
@@ -1455,8 +2007,8 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
         s.context.Function<PFN_vkCmdDraw>("vkCmdDraw")(s.commands, work.count, work.instances, work.firstVertex, work.firstInstance);
     }
     if (query >= 0) s.context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(s.commands, s.statistics, static_cast<std::uint32_t>(query));
-    Graphics::EndRenderPass(s.context, s.commands);
-    s.endTimed(timed);
+    if (query >= 0 || s.passKey.empty()) s.endPass();
+    phases.Mark(3);
     return true;
 }
 
@@ -1518,6 +2070,7 @@ void NativeDevice::NoteFlip() {
         };
         std::vector<Pending> pending;
         s.begin();
+        s.endPass();
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -1625,7 +2178,7 @@ void NativeDevice::NoteSubmission() {
 
 void NativeDevice::RequireBarrier() {
     std::lock_guard lock(state->workMutex);
-    state->graphicsBarrier = true;
+    ++state->syncPackets;
 }
 
 ShaderRecompiler::SpirvTarget NativeDevice::GraphicsTarget() const {
@@ -1647,6 +2200,11 @@ void NativeDevice::Flush() {
     state->flushLocked();
 }
 
+void NativeDevice::Submit() {
+    std::lock_guard lock(state->workMutex);
+    state->flushLocked(false);
+}
+
 void NativeDevice::AfterBatch(std::function<void()> action) {
     {
         std::lock_guard lock(state->workMutex);
@@ -1654,13 +2212,48 @@ void NativeDevice::AfterBatch(std::function<void()> action) {
             state->afterBatch.push_back(std::move(action));
             return;
         }
+        std::lock_guard completion(state->completionMutex);
+        if (!state->completionQueue.empty()) {
+            state->slots[state->completionQueue.back()].afterBatch.push_back(std::move(action));
+            return;
+        }
     }
     action();
 }
 
+void NativeDevice::AfterBatch(std::function<void()> action, std::uint64_t serial) {
+    {
+        std::lock_guard lock(state->workMutex);
+        if (serial > state->completedSerial.load(std::memory_order_acquire)) {
+            if (state->recording && state->openSerial == serial) {
+                state->afterBatch.push_back(std::move(action));
+                return;
+            }
+            std::lock_guard completion(state->completionMutex);
+            for (const auto index : state->completionQueue) {
+                if (state->slots[index].serial < serial) continue;
+                state->slots[index].afterBatch.push_back(std::move(action));
+                return;
+            }
+            if (state->recording) {
+                state->afterBatch.push_back(std::move(action));
+                return;
+            }
+        }
+    }
+    action();
+}
+
+std::uint64_t NativeDevice::RecordingSerial() const {
+    std::lock_guard lock(state->workMutex);
+    return state->openSerial;
+}
+
 bool NativeDevice::Pending() const {
     std::lock_guard lock(state->workMutex);
-    return state->recording;
+    if (state->recording) return true;
+    std::lock_guard completion(state->completionMutex);
+    return !state->completionQueue.empty();
 }
 
 std::shared_ptr<Graphics::PipelineJournalReplay> NativeDevice::ReplayPipelineJournal(bool prepareAll) {
@@ -1679,7 +2272,7 @@ bool NativeDevice::ReplayGraphicsPipeline(const Graphics::GraphicsPipelineRecipe
         for (const auto& binding : shader.program->bindings) {
             if (binding.descriptorSet == ShaderRecompiler::RuntimeAbi::NativeHeap::Set && (binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers)) continue;
             if (binding.descriptorSet != 0 || binding.count != 1) throw std::runtime_error("native pipeline journal has an unsupported buffer set or count");
-            if (binding.role != ShaderRecompiler::DescriptorRole::BdaPagetable && binding.role != ShaderRecompiler::DescriptorRole::FaultBuffer && binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::Gds) throw std::runtime_error("native pipeline journal has an unsupported buffer role");
+            if (binding.role != ShaderRecompiler::DescriptorRole::BdaPagetable && binding.role != ShaderRecompiler::DescriptorRole::FaultBuffer && binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::Gds && binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt) throw std::runtime_error("native pipeline journal has an unsupported buffer role");
             bool found = false;
             for (std::size_t index = 0; index + 1 < s.graphicsLayoutKey.size(); index += 2) {
                 if (s.graphicsLayoutKey[index] == binding.binding && (s.graphicsLayoutKey[index + 1] & Graphics::VulkanStage(shader.stage)) != 0) found = true;
@@ -1702,7 +2295,7 @@ bool NativeDevice::PrebuildGraphicsLibrary(const ShaderRecompiler::RecompileResu
     for (const auto& binding : shader.bindings) {
         if (binding.descriptorSet == ShaderRecompiler::RuntimeAbi::NativeHeap::Set) continue;
         if (binding.descriptorSet != 0) throw std::runtime_error("native graphics preparation requires stage buffers in set 0");
-        if (binding.role != ShaderRecompiler::DescriptorRole::BdaPagetable && binding.role != ShaderRecompiler::DescriptorRole::FaultBuffer && binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::Gds) throw std::runtime_error("unsupported native graphics preparation binding role");
+        if (binding.role != ShaderRecompiler::DescriptorRole::BdaPagetable && binding.role != ShaderRecompiler::DescriptorRole::FaultBuffer && binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::Gds && binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt) throw std::runtime_error("unsupported native graphics preparation binding role");
     }
     const Graphics::PipelineSetLayouts layouts{layout, VK_NULL_HANDLE, false, key, {}, s.images->HeapLayout(), s.emptyLayout};
     lock.unlock();

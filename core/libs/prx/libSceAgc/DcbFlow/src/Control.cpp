@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Native/include/FrontEnd.hpp"
 #include "prx/libSceAgc/DcbFlow/include/Control.hpp"
 
 #include "prx/libSceAgc/Command/include/Control.hpp"
@@ -30,6 +31,7 @@ std::uint32_t APS5_VABI sceAgcDcbJumpGetSize() {
 std::uint32_t* APS5_VABI sceAgcDcbResetQueue(CommandBuffer* buf, std::uint32_t op, std::uint32_t state) {
     Agc::Command::CheckBits(op, 0xfffu, __func__);
     Agc::Command::CheckBits(state, 0xfu, __func__);
+    AgcFrontEndReset_nid_postfix(buf, buf->bottom);
     return Agc::Command::Emit(buf, 0x12u, {state}, __func__);
 }
 

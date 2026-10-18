@@ -169,6 +169,10 @@ struct NativeImages::State {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenQueue;
     std::vector<std::array<std::uint32_t, 8>> sampledQueue;
     std::vector<Surface*> staleSampled;
+    std::function<void()> beforeRecording;
+    void recording() {
+        if (beforeRecording) beforeRecording();
+    }
     bool checkWrites = true;
     std::chrono::steady_clock::time_point checkedWrites{};
     Graphics::Context context;
@@ -197,6 +201,7 @@ struct NativeImages::State {
     std::map<std::uint64_t, Depth> depths;
     struct Registered {
         std::uint32_t index;
+        std::uint32_t storage;
         GuestTextureResource resource;
         Surface* surface = nullptr;
     };
@@ -224,7 +229,18 @@ struct NativeImages::State {
 
     std::unique_ptr<Graphics::Buffer> makeTable(std::uint32_t slots, std::uint32_t entryBytes, std::uint32_t misses, std::uint32_t missBytes) {
         const auto missOffset = Heap::HeaderBytes + slots * entryBytes;
-        auto table = std::make_unique<Graphics::Buffer>(context, missOffset + misses * missBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        constexpr VkMemoryPropertyFlags vram = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const bool writableVram = std::any_of(context.memory.memoryTypes, context.memory.memoryTypes + context.memory.memoryTypeCount, [&](const VkMemoryType& type) { return (type.propertyFlags & vram) == vram; });
+        const auto bytesNeeded = missOffset + misses * missBytes;
+        constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        std::unique_ptr<Graphics::Buffer> table;
+        if (writableVram) {
+            try {
+                table = std::make_unique<Graphics::Buffer>(context, bytesNeeded, usage, vram);
+            } catch (const std::exception&) {
+            }
+        }
+        if (table == nullptr) table = std::make_unique<Graphics::Buffer>(context, bytesNeeded, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         auto bytes = table->Bytes();
         std::memset(bytes.data(), 0, bytes.size());
         auto* header = reinterpret_cast<std::uint32_t*>(bytes.data());
@@ -410,6 +426,7 @@ struct NativeImages::State {
     }
 
     void toGeneral(VkCommandBuffer commands, VkImage target, VkImageLayout from, VkAccessFlags source, VkAccessFlags destination, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT, VkImageLayout to = VK_IMAGE_LAYOUT_GENERAL) {
+        recording();
         VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         barrier.srcAccessMask = source;
         barrier.dstAccessMask = destination;
@@ -424,6 +441,7 @@ struct NativeImages::State {
     // Index 0 of every binding: a 1x1 zero image of the binding's numeric class and dimension, so a
     // lookup miss samples zero (as an unbound PS5 descriptor reads) instead of faulting.
     void makeNullDescriptors(VkCommandBuffer commands) {
+        recording();
         const std::array<VkFormat, 3> formats{VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT};
         for (std::uint32_t numeric = 0; numeric < 3; ++numeric) {
             for (const auto type : {VK_IMAGE_TYPE_1D, VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D}) {
@@ -560,6 +578,7 @@ struct NativeImages::State {
     }
 
     bool gather(VkCommandBuffer commands, std::uint64_t address, std::uint64_t bytes, VkBuffer& source, VkDeviceSize& sourceOffset) {
+        recording();
         std::vector<std::pair<VkBuffer, VkBufferCopy>> pieces;
         for (std::uint64_t at = address; at < address + bytes;) {
             VkBuffer buffer = VK_NULL_HANDLE;
@@ -586,8 +605,9 @@ struct NativeImages::State {
     }
 
     // Detiles the surface from the game's memory: tiled bytes -> linear staging -> image.
-    void upload(VkCommandBuffer commands, Surface& surface) {
+    void upload(VkCommandBuffer commands, Surface& surface, bool gpuWritten = false) {
         surface.uploaded = true;
+        NotePoolUse("texture", surface.resource.baseAddress);
         const auto& resource = surface.resource;
         const auto& geometry = surface.geometry;
         VkBuffer source = VK_NULL_HANDLE;
@@ -598,9 +618,10 @@ struct NativeImages::State {
             return;
         }
         surface.stale = false;
+        recording();
         surface.generation = GuestMemory::WriteWatched() ? GuestMemory::CollectWrites(resource.baseAddress, geometry.guestBytes) : 0;
-        surface.contents = surface.generation != 0 ? ContentHash(resource.baseAddress, geometry.guestBytes) : 0;
-        surface.fingerprint = Fingerprint(resource.baseAddress, geometry.guestBytes);
+        surface.contents = surface.generation != 0 && !gpuWritten ? ContentHash(resource.baseAddress, geometry.guestBytes) : 0;
+        surface.fingerprint = gpuWritten ? 0 : Fingerprint(resource.baseAddress, geometry.guestBytes);
         const auto elementBytes = Graphics::BytesPerElement(resource.format);
         auto linear = std::make_shared<Graphics::DeviceBuffer>(context, static_cast<std::size_t>(geometry.sliceLinearBytes * geometry.layers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         staging.push_back(linear);
@@ -637,7 +658,7 @@ struct NativeImages::State {
             if (initialized) {
                 const auto resource = Graphics::DecodeTextureResource(words);
                 auto& surface = surfaceFor(resource, commands);
-                if (!surface.target && targets.count(resource.baseAddress) == 0 && (surface.fingerprint == 0 || Fingerprint(resource.baseAddress, surface.geometry.guestBytes) != surface.fingerprint)) upload(commands, surface);
+                if (!surface.target && targets.count(resource.baseAddress) == 0 && (surface.fingerprint == 0 || Fingerprint(resource.baseAddress, surface.geometry.guestBytes) != surface.fingerprint)) surface.stale = true;
             }
             return;
         }
@@ -669,7 +690,7 @@ struct NativeImages::State {
             if (const auto depth = depths.find(resource.baseAddress); depth != depths.end()) pointAtDepth(index, resource, depth->second);
             insertGrowing(imageTable, retiredImageTables, words, entry);
             images.emplace(words, index);
-            registered[words] = {index, resource, &surface};
+            registered[words] = {index, entry.storage, resource, &surface};
         } catch (const std::exception& error) {
             failedImages.insert(words);
             Native::ReportGraphicsIssue("texture not created", error.what());
@@ -710,6 +731,7 @@ struct NativeImages::State {
             if (debugClear) zero.float32[0] = zero.float32[2] = zero.float32[3] = 1.0f;
             const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
             ++recordings;
+            recording();
             fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, surface.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
             Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
         }
@@ -908,6 +930,21 @@ std::vector<NativeImages::DrawnTarget> NativeImages::SurfacesAt(std::uint64_t ad
     return found;
 }
 
+std::vector<std::shared_ptr<void>> NativeImages::TakeBatchResources() {
+    auto& s = *state;
+    std::vector<std::shared_ptr<void>> held(s.staging.begin(), s.staging.end());
+    s.staging.clear();
+    for (auto& table : s.retiredImageTables) held.push_back(std::shared_ptr<Graphics::Buffer>(std::move(table)));
+    for (auto& table : s.retiredSamplerTables) held.push_back(std::shared_ptr<Graphics::Buffer>(std::move(table)));
+    s.retiredImageTables.clear();
+    s.retiredSamplerTables.clear();
+    return held;
+}
+
+void NativeImages::BeforeRecording(std::function<void()> close) {
+    state->beforeRecording = std::move(close);
+}
+
 void NativeImages::MarkGpuWritten(std::uint64_t begin, std::uint64_t end) {
     for (auto& [key, surface] : state->surfaces) {
         if (!surface.uploaded || surface.target) continue;
@@ -936,6 +973,36 @@ bool NativeImages::Registered(std::span<const std::uint32_t, 8> words) const {
     return state->images.count(copy) != 0;
 }
 
+bool NativeImages::ImageIndices(std::span<const std::uint32_t, 8> words, std::uint32_t& sampled, std::uint32_t& storage) {
+    auto& s = *state;
+    std::array<std::uint32_t, 8> copy;
+    std::memcpy(copy.data(), words.data(), sizeof(copy));
+    sampled = storage = 0;
+    if (const auto found = s.registered.find(copy); found != s.registered.end()) {
+        if (found->second.surface != nullptr && found->second.surface->stale) s.staleSampled.push_back(found->second.surface);
+        sampled = found->second.index;
+        storage = found->second.storage;
+        return true;
+    }
+    if ((copy[0] | (copy[1] & 0xffu)) == 0 || s.failedImages.count(copy) != 0 || s.nextSampled >= Heap::ImageCapacity) return true;
+    s.sampledQueue.push_back(copy);
+    return false;
+}
+
+bool NativeImages::SamplerIndex(std::span<const std::uint32_t, 4> words, std::uint32_t& sampler) {
+    auto& s = *state;
+    std::array<std::uint32_t, 4> copy;
+    std::memcpy(copy.data(), words.data(), sizeof(copy));
+    sampler = 0;
+    if (const auto found = s.samplers.find(copy); found != s.samplers.end()) {
+        sampler = found->second;
+        return true;
+    }
+    if (s.failedSamplers.count(copy) != 0 || s.nextSampler + 2u > Heap::SamplerCapacity) return true;
+    s.samplerQueue.push_back(copy);
+    return false;
+}
+
 std::uint64_t NativeImages::DrawSerial() const {
     return state->drawSerial;
 }
@@ -948,8 +1015,24 @@ void NativeImages::Prepare(VkCommandBuffer commands) {
     auto& s = *state;
     if (s.checkWrites && GuestMemory::WriteWatched()) {
         s.checkWrites = false;
+        struct ScanTime {
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            ~ScanTime() {
+                if (!Native::Logs()) return;
+                static double ms = 0.0;
+                static std::uint64_t scans = 0;
+                static auto reported = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                ms += std::chrono::duration<double, std::milli>(now - start).count();
+                ++scans;
+                if (now - reported < std::chrono::seconds(5)) return;
+                std::fprintf(stderr, "[native] texture write scans: %llu in 5 s, %.0f ms\n", static_cast<unsigned long long>(scans), ms);
+                ms = 0.0;
+                scans = 0;
+                reported = now;
+            }
+        } scanTime;
         {
-            bool begun = false;
             std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
             for (const auto& [key, surface] : s.surfaces) {
                 if (!surface.uploaded || surface.target || surface.generation == 0) continue;
@@ -971,17 +1054,9 @@ void NativeImages::Prepare(VkCommandBuffer commands) {
                     surface.generation = 0;
                     continue;
                 }
-                const auto generation = GuestMemory::CollectWrites(address, bytes);
-                if (ContentHash(address, bytes) == surface.contents) {
-                    surface.generation = generation;
-                    continue;
-                }
-                if (!begun) {
-                    s.context.detiler->BeginBatch();
-                    ++s.recordings;
-                    begun = true;
-                }
-                s.upload(commands, surface);
+                // New content is uploaded when work samples the surface (a written ring of
+                // transient memory holds many surfaces nothing samples again).
+                surface.stale = true;
                 if (Native::Logs()) {
                     static std::map<std::uint64_t, std::uint64_t> refreshed;
                     static std::map<std::uint64_t, std::string> shapes;
@@ -1037,7 +1112,7 @@ void NativeImages::Prepare(VkCommandBuffer commands) {
         for (auto* surface : dirty) {
             if (!surface->stale) continue;
             surface->stale = false;
-            s.upload(commands, *surface);
+            s.upload(commands, *surface, true);
         }
     }
     if (!s.sampledQueue.empty()) {
@@ -1095,11 +1170,8 @@ std::uint64_t NativeImages::Recordings() const {
 
 void NativeImages::Completed() {
     auto& s = *state;
-    s.staging.clear();
     std::vector<std::array<std::uint32_t, 8>> missed;
     s.takeMisses(*s.imageTable, missed, s.missedImages);
-    for (auto& table : s.retiredImageTables) s.takeMisses(*table, missed, s.missedImages);
-    s.retiredImageTables.clear();
     // A missed T# is registered as a view of an existing (or new) surface; it is not new content.
     for (const auto& words : missed) {
         if (s.images.count(words) == 0) s.textureQueue.push_back(words);
@@ -1113,8 +1185,6 @@ void NativeImages::Completed() {
         }
     }
     s.takeMisses(*s.samplerTable, s.samplerQueue, s.missedSamplers);
-    for (auto& table : s.retiredSamplerTables) s.takeMisses(*table, s.samplerQueue, s.missedSamplers);
-    s.retiredSamplerTables.clear();
     static int batches = 0;
     if (++batches % 600 == 1) {
         const auto* image = reinterpret_cast<const std::uint32_t*>(s.imageTable->Bytes().data());

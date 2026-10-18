@@ -1856,18 +1856,36 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         std::array<std::uint32_t, 8> words{};
         for (std::uint32_t index = 0; index < 8u; ++index) words[index] = ctx.Arg(*handle, index);
         state.gpuImageWords = words;
-        state.gpuImageEntry = EmitNativeImageLookup(state, words);
+        // Slotted resources (IrBindingLayout::nativeImageSlots / nativeSamplerSlots): the heap indices
+        // the driver wrote at record time; the table lookup only while the resource did not exist yet.
+        const auto& layout = state.program.Metadata().bindings;
+        const auto slotDword = [&](const std::vector<std::uint32_t>& slots, std::uint32_t resource, std::uint32_t first) -> std::uint32_t {
+            const auto found = std::find(slots.begin(), slots.end(), resource);
+            return found == slots.end() ? ~0u : first + static_cast<std::uint32_t>(found - slots.begin()) * 4u;
+        };
+        const auto lookupUnless = [&](std::uint32_t resolved, auto&& lookup) {
+            return resolved == 0u ? lookup() : EmitValueOrZeroIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), resolved), lookup);
+        };
+        state.gpuImageSlot = {};
+        if (const auto first = slotDword(layout.nativeImageSlots, memory.resource, layout.NativeSlotDword()); first != ~0u) {
+            state.gpuImageSlot = {Binary(state, spv::OpINotEqual, TypeBool(state), EmitShaderDataDwordLoad(state, first + 2u), ConstantU32(state, 0u)), EmitShaderDataDwordLoad(state, first), EmitShaderDataDwordLoad(state, first + 1u)};
+        }
+        state.gpuImageEntry = lookupUnless(state.gpuImageSlot[0], [&] { return EmitNativeImageLookup(state, words); });
         if (ImageOpcodeInfoOf(inst.Opcode()).needsSampler && inst.ArgumentCount() >= 2u) {
             const auto* sampler = inst.Argument(1)->Resolve();
             if (sampler->Opcode() != IrOpcode::GetSamplerResource || sampler->ArgumentCount() < 4u) ctx.Fail(inst, "has no four-dword S# for a GPU-resolved sampler");
             const std::array<std::uint32_t, 4> samplerWords{ctx.Arg(*sampler, 0u), ctx.Arg(*sampler, 1u), ctx.Arg(*sampler, 2u), ctx.Arg(*sampler, 3u)};
-            state.gpuSamplerIndex = EmitNativeSamplerLookup(state, samplerWords);
+            const auto first = slotDword(layout.nativeSamplerSlots, memory.sampler, layout.NativeSlotDword() + static_cast<std::uint32_t>(layout.nativeImageSlots.size()) * 4u);
+            const auto resolved = first == ~0u ? 0u : Binary(state, spv::OpINotEqual, TypeBool(state), EmitShaderDataDwordLoad(state, first + 1u), ConstantU32(state, 0u));
+            const auto looked = lookupUnless(resolved, [&] { return EmitNativeSamplerLookup(state, samplerWords); });
+            state.gpuSamplerIndex = resolved == 0u ? looked : Select(state, TypeU32(state), resolved, EmitShaderDataDwordLoad(state, first), looked);
             state.gpuSamplerWord0 = samplerWords[0];
         }
         state.runtimeImage = &modes.front();
         EmitImageMode(ctx, inst, modes.front());
         state.runtimeImage = nullptr;
         state.gpuImageEntry = 0u;
+        state.gpuImageSlot = {};
         state.gpuSamplerIndex = 0u;
         state.gpuSamplerWord0 = 0u;
         return;

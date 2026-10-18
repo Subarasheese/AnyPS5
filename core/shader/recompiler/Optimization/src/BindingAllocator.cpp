@@ -1,5 +1,6 @@
 #include "Optimization/BindingAllocator.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
+#include "Optimization/SrtWalker.hpp"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -38,6 +39,21 @@ std::vector<std::uint32_t> collectUserData(const IrProgram& program) {
         }
     }
     return result;
+}
+
+std::vector<std::uint32_t> collectNativeBaseKeys(const IrProgram& program) {
+    std::vector<std::uint32_t> keys;
+    if (!program.Metadata().descriptorSlots) return keys;
+    for (const auto& block : program.Blocks()) {
+        for (const IrValue* inst : block->Instructions()) {
+            if ((inst->Opcode() != IrOpcode::LoadAddressU32 && inst->Opcode() != IrOpcode::ReadConstBuffer) || inst->ArgumentCount() == 0u) continue;
+            const auto memory = inst->Flags<MemoryFlags>().index;
+            if (memory < program.Resources().memoryInfo.size() && program.Resources().memoryInfo[memory].planningOnly) continue;
+            const auto key = NativeBaseKey(inst->Argument(0)->Resolve());
+            if (key != NoNativeBase && std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+        }
+    }
+    return keys;
 }
 
 void addBinding(IrBindingLayout& layout, DescriptorBindingKind kind, std::vector<std::uint32_t> resources = {}) {
@@ -113,6 +129,25 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
         }
         next.runtimeStateDwords = (attributes + RuntimeAbi::VertexSelectorsPerDword - 1u) / RuntimeAbi::VertexSelectorsPerDword;
     }
+    next.nativeBaseKeys = collectNativeBaseKeys(program);
+    if (program.Metadata().descriptorSlots) {
+        const auto evaluable = [&](std::uint32_t source) {
+            const auto& sources = program.Resources().descriptorSources;
+            if (source >= sources.size()) return false;
+            constexpr SrtWalker walker;
+            for (std::uint32_t dword = 0; dword < sources[source].dwordCount; ++dword) {
+                if (sources[source].dwords[dword] == nullptr || !walker.ValidateRuntimeValue(program.Resources(), sources[source].dwords[dword])) return false;
+            }
+            return sources[source].dwordCount != 0;
+        };
+        for (std::uint32_t image = 0; image < info.images.size(); ++image) {
+            if (evaluable(info.images[image].source)) next.nativeImageSlots.push_back(image);
+        }
+        for (std::uint32_t sampler = 0; sampler < info.samplers.size(); ++sampler) {
+            if (evaluable(info.samplers[sampler].source)) next.nativeSamplerSlots.push_back(sampler);
+        }
+    }
+    next.runtimeStateDwords += next.NativeSlotDwords();
     if (program.Metadata().gpuResolvedResources) next.runtimeStateDwords += RuntimeAbi::NativeHeap::InvocationAddressDwords;
     const auto pushSize = layout.pushConstantSizeBytes / 4u;
     next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;

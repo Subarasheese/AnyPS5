@@ -628,9 +628,6 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             physical.guestDescriptor = tables->map;
             break;
         case DescriptorRole::FlattenedSrt:
-            if (snapshot.flattenedSrt.empty()) {
-                fail("DescriptorBindingBuilder::Populate flattened SRT snapshot is empty");
-            }
             physical.guestDescriptor = snapshot.flattenedSrt;
             break;
         case DescriptorRole::ShaderData:

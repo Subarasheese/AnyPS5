@@ -247,6 +247,7 @@ function(add_shader_recompiler target runtimeTarget)
             RecompileResult
             PrepareShader
             GetPreparedCode
+            GetResourcePlan
             PreparedShaderInvocation::TryCreate
             MatchesPreparedShader
             GetPreparedArtifact

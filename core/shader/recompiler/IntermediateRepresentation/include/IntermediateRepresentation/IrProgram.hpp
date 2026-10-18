@@ -55,6 +55,16 @@ IrValue* ResolveInvariantPhi(const IrResourcePlan& program, IrValue* value);
 bool IsAddressResourceKind(ResourceKind kind);
 PositionExportComponent DecodePositionExportComponent(std::uint32_t control, std::uint32_t positionIndex, std::uint32_t component);
 std::uint32_t NativeBinding(IrShaderStage stage, DescriptorBindingKind kind);
+// The key of an address or buffer handle whose base words a driver can translate at the call site
+// (IrBindingLayout::nativeBaseKeys): both words user-data registers or both flattened SRT slots,
+// low | high << NativeBaseHighShift, with NativeBaseFlat for slots and NativeBaseVsharp for a V#
+// (whose high word holds 16 address bits); NoNativeBase otherwise.
+inline constexpr std::uint32_t NativeBaseHighShift = 15u;
+inline constexpr std::uint32_t NativeBaseWordMask = (1u << NativeBaseHighShift) - 1u;
+inline constexpr std::uint32_t NativeBaseVsharp = 1u << 30u;
+inline constexpr std::uint32_t NativeBaseFlat = 1u << 31u;
+inline constexpr std::uint32_t NoNativeBase = ~0u;
+std::uint32_t NativeBaseKey(const IrValue* handle);
 ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind);
 std::uint32_t ImageBindingIndex(DescriptorBindingKind kind);
 DescriptorBindingKind DescriptorBindingForImage(const ImageResource& image);

@@ -75,6 +75,7 @@ void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, st
 }
 
 bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget) {
+    Native::NotePoolUse("pm4", reinterpret_cast<std::uintptr_t>(guest));
     require(words <= budget, "command buffer jumps exceed the copy limit (a jump loop?)");
     budget -= words;
     std::vector<std::pair<std::size_t, std::size_t>> guarded;
@@ -272,6 +273,11 @@ void Driver::executeRewindTail(const Submission& stalled) {
             ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
         } blocked{*this, stalled.queue};
         StallWatch stall(stalled.queue);
+        Native::TimelineEvent("rewind tail wait", stalled.queue);
+        struct WaitEnd {
+            std::uint32_t queue;
+            ~WaitEnd() { Native::TimelineEvent("rewind tail ready", queue); }
+        } waitEnd{stalled.queue};
         while ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
             CheckFailure();
             checkStopping();
@@ -296,7 +302,9 @@ void Driver::executeRewindTail(const Submission& stalled) {
     validate(tail, stalled.rewindTail);
     readRegisterLists(tail);
     if (APS5_ENABLE_TIMING_LOG) tail.validatedAt = std::chrono::steady_clock::now();
+    Native::TimelineEvent("flip room wait", tail.queue);
     waitForFlipRoom(tail);
+    Native::TimelineEvent("flip room ready", tail.queue);
     if (APS5_ENABLE_TIMING_LOG) tail.roomReadyAt = std::chrono::steady_clock::now();
     auto* const capture = SubmissionCapture::Active();
     auto captured = capture != nullptr ? SubmissionCapture::Prepare(tail.queue, SubmissionKind::Rewind, tail.commands, tail.conditionalEnds) : CapturedSubmission{};
@@ -319,6 +327,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
 }
 
 void Driver::Submit(const Packet* packet, std::uint32_t queue) {
+    Native::TimelineEvent("game submit", queue);
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CheckFailure();
     require(queue == 0 || (queue >= 0x20 && queue < SubmissionQueueEnd), "unsupported compute queue");

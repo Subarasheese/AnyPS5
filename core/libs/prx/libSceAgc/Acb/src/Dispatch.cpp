@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Native/include/FrontEnd.hpp"
 #include "prx/libSceAgc/Acb/include/Dispatch.hpp"
 
 #include "prx/libSceAgc/Command/include/Memory.hpp"
@@ -14,7 +15,15 @@ uint32_t* APS5_VABI sceAgcAcbDispatchIndirect(CommandBuffer* buf, const volatile
     const auto address = reinterpret_cast<std::uintptr_t>(indirect_args);
     Agc::Command::CheckAddress(address, 4, __func__);
     Agc::Command::CheckBits(modifier, 0xa038u | 0x41u, __func__);
-    return Agc::Command::Emit(buf, 0x16u, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), modifier | 0x41u}, __func__);
+    const auto id = AgcFrontEndDraw_nid_postfix(buf, buf->bottom);
+    if (id != 0) {
+        auto* marker = Agc::Command::WriteNop(buf, 3u, __func__);
+        marker[1] = AgcDriver::Native::FrontEndDrawMarker;
+        marker[2] = id;
+    }
+    auto* packet = Agc::Command::Emit(buf, 0x16u, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), modifier | 0x41u}, __func__);
+    AgcFrontEndPrepareDispatch_nid_postfix(buf, buf->bottom, id, packet, 4u, true);
+    return packet;
 }
 
 std::uint32_t APS5_VABI sceAgcAcbDispatchIndirectGetSize() {

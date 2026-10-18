@@ -196,7 +196,10 @@ std::uint32_t NativeImageField(SpirvEmitterState& state, std::uint32_t field) {
     const auto slot = Select(state, u32, hit, Binary(state, spv::OpISub, u32, id, ConstantU32(state, 1u)), ConstantU32(state, 0u));
     const auto offset = Binary(state, spv::OpIAdd, u32, ConstantU32(state, RuntimeAbi::NativeHeap::HeaderBytes + field * 4u), Binary(state, spv::OpIMul, u32, slot, ConstantU32(state, sizeof(RuntimeAbi::NativeHeap::ImageEntry))));
     const auto value = PhysicalLoadU32(state, Binary(state, spv::OpIAdd, u64, NativeTableAddress(state, false), Unary(state, spv::OpUConvert, u64, offset)));
-    return Select(state, u32, hit, value, ConstantU32(state, 0u));
+    const auto looked = Select(state, u32, hit, value, ConstantU32(state, 0u));
+    if (state.gpuImageSlot[0] == 0u) return looked;
+    const auto slotted = field == offsetof(RuntimeAbi::NativeHeap::ImageEntry, storage) / 4u ? state.gpuImageSlot[2] : field == offsetof(RuntimeAbi::NativeHeap::ImageEntry, sampled) / 4u ? state.gpuImageSlot[1] : ConstantU32(state, 0u);
+    return Select(state, u32, state.gpuImageSlot[0], slotted, looked);
 }
 
 std::uint32_t NonUniformIndex(SpirvEmitterState& state, std::uint32_t index) {

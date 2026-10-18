@@ -14,12 +14,16 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
 #include <link.h>
 #include <map>
+#include <set>
 
 
 namespace AgcDriver::Native {
@@ -131,6 +135,59 @@ void WriteGraphicsIssues(GraphicsIssues& issues) {
     issues.written = std::chrono::steady_clock::now();
 }
 
+}
+
+void NotePoolUse(const char* use, std::uint64_t address) {
+    static const char* path = std::getenv("APS5_POOL_AUDIT");
+    if (path == nullptr || address == 0) return;
+    static std::mutex mutex;
+    static std::map<std::string, std::set<std::uint64_t>> pages;
+    static auto written = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    pages[use].insert(address >> 16u);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - written < std::chrono::seconds(10)) return;
+    written = now;
+    if (std::FILE* file = std::fopen(path, "w")) {
+        for (const auto& [name, set] : pages) {
+            for (const auto page : set) std::fprintf(file, "%s %llx\n", name.c_str(), static_cast<unsigned long long>(page << 16u));
+        }
+        std::fclose(file);
+    }
+}
+
+void TimelineEvent(const char* what, std::uint64_t a, std::uint64_t b) {
+    static const double startAt = [] { const char* text = std::getenv("APS5_NATIVE_TIMELINE"); return text != nullptr ? std::atof(text) : -1.0; }();
+    if (startAt < 0) return;
+    struct Event {
+        double ms;
+        const char* what;
+        std::uint64_t a, b;
+        long thread;
+    };
+    static const auto started = std::chrono::steady_clock::now();
+    static std::mutex mutex;
+    static std::vector<Event> events;
+    static bool written = false;
+    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    if (seconds < startAt || written) return;
+    std::lock_guard lock(mutex);
+    if (written) return;
+    if (seconds < startAt + 2.0) {
+        events.push_back({seconds * 1000.0, what, a, b, static_cast<long>(gettid())});
+        return;
+    }
+    written = true;
+    const char* directory = std::getenv("APS5_NATIVE_DUMP_DIR");
+    const auto path = std::filesystem::path(directory != nullptr ? directory : ".") / "native-timeline.txt";
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream file(path);
+    for (const auto& event : events) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "%10.3f t%ld %s 0x%llx 0x%llx\n", event.ms, event.thread, event.what, static_cast<unsigned long long>(event.a), static_cast<unsigned long long>(event.b));
+        file << line;
+    }
+    std::fprintf(stderr, "[native] timeline: %zu events written to %s\n", events.size(), path.string().c_str());
 }
 
 void ReportGraphicsIssue(const std::string& category, const std::string& detail) {

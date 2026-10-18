@@ -234,7 +234,9 @@ void Driver::run(std::uint32_t id) noexcept {
                 pending.pop_front();
                 if (APS5_ENABLE_TIMING_LOG) submission.dequeuedAt = std::chrono::steady_clock::now();
                 if (id == 0) queue0Executing = submission.suspend ? 0 : submission.received;
-                if (submission.waitFree) {
+                // The native renderer runs GT7's async queues as the GPU does, concurrently with
+                // queue 0: their order against it is only what labels and waits impose.
+                if (submission.waitFree && !Native::GpuNative()) {
                     {
                         struct OrderHold {
                             std::atomic<std::uint32_t>& holders;

@@ -67,7 +67,13 @@ public:
     std::vector<DrawnTarget> SurfacesAt(std::uint64_t address) const;
     std::string DescribeUploadedOverlap(std::uint64_t begin, std::uint64_t end) const;
     void MarkGpuWritten(std::uint64_t begin, std::uint64_t end);
+    void BeforeRecording(std::function<void()> close);
+    std::vector<std::shared_ptr<void>> TakeBatchResources();
     bool Registered(std::span<const std::uint32_t, 8> words) const;
+    // The heap indices a draw's image and sampler slots hold (IrBindingLayout::nativeImageSlots):
+    // false while the descriptor's resource does not exist yet, which queues it for the next Prepare.
+    bool ImageIndices(std::span<const std::uint32_t, 8> words, std::uint32_t& sampled, std::uint32_t& storage);
+    bool SamplerIndex(std::span<const std::uint32_t, 4> words, std::uint32_t& sampler);
     std::uint64_t DrawSerial() const;
     void NewBatch();
     void Prepare(VkCommandBuffer commands);

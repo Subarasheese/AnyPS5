@@ -292,6 +292,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     }
 
     program.Metadata().gpuResolvedResources = request.target.gpuResolvedResources;
+    program.Metadata().descriptorSlots = request.target.gpuResolvedResources && std::getenv("APS5_NATIVE_SLOT_SRT") != nullptr;
     program.Metadata().hostFloat = translateOptions.hostFloat;
     constexpr SrtWalker srtWalker;
     srtWalker.BuildPlan(program);
@@ -583,6 +584,9 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.runtimeImageCount = bindings.layout.runtimeImageCount;
     result.hostSubgroupSize = HostSubgroupSize(request);
     result.shaderDataUserRegisters = bindings.layout.userDataRegisters;
+    result.nativeBaseKeys = bindings.layout.nativeBaseKeys;
+    for (const auto image : bindings.layout.nativeImageSlots) result.nativeImageSources.push_back(program.Info().images[image].source);
+    for (const auto sampler : bindings.layout.nativeSamplerSlots) result.nativeSamplerSources.push_back(program.Info().samplers[sampler].source);
     result.pushDataStartDword = bindings.layout.UsesPushData() ? bindings.layout.pushDataStartDword : ~0u;
     result.dispatchThreadLimitDword = bindings.layout.dispatchThreadLimit ? bindings.layout.DispatchThreadLimitDword() : ~0u;
     result.fullSubgroups = emitted.fullSubgroups;
@@ -994,6 +998,9 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .instanceOffsetConflict = artifact.instanceOffsetConflict,
         .hostSubgroupSize = artifact.hostSubgroupSize,
         .shaderDataUserRegisters = artifact.shaderDataUserRegisters,
+        .nativeBaseKeys = artifact.nativeBaseKeys,
+        .nativeImageSources = artifact.nativeImageSources,
+        .nativeSamplerSources = artifact.nativeSamplerSources,
         .pushDataStartDword = artifact.pushDataStartDword,
         .dispatchThreadLimitDword = artifact.dispatchThreadLimitDword,
         .fullSubgroups = artifact.fullSubgroups,
@@ -1112,16 +1119,17 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.pushConstants.resize(result.pushConstants.size() + sizeof(std::uint32_t));
     }
     const auto& layout = variant.bindings.layout;
-    if (artifact.registrationModule && request.shader.stage != ShaderStage::Fragment && layout.runtimeStateDwords != 0u) {
+    const auto selectorDwords = layout.runtimeStateDwords - layout.NativeSlotDwords();
+    if (artifact.registrationModule && request.shader.stage != ShaderStage::Fragment && selectorDwords != 0u) {
         const auto first = layout.RuntimeStateDword() + RuntimeAbi::StateVertexSelectors;
-        if (layout.runtimeStateDwords > runtimeSelectors.size()) throw std::runtime_error("vertex selector state exceeds its capacity");
+        if (selectorDwords > runtimeSelectors.size()) throw std::runtime_error("vertex selector state exceeds its capacity");
         if (layout.UsesPushData()) {
-            if ((first + layout.runtimeStateDwords) * sizeof(std::uint32_t) > result.pushConstants.size()) throw std::runtime_error("vertex selector state lies outside the push data");
-            std::memcpy(result.pushConstants.data() + first * sizeof(std::uint32_t), runtimeSelectors.data(), layout.runtimeStateDwords * sizeof(std::uint32_t));
+            if ((first + selectorDwords) * sizeof(std::uint32_t) > result.pushConstants.size()) throw std::runtime_error("vertex selector state lies outside the push data");
+            std::memcpy(result.pushConstants.data() + first * sizeof(std::uint32_t), runtimeSelectors.data(), selectorDwords * sizeof(std::uint32_t));
         } else {
             const auto data = std::ranges::find_if(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::ShaderData; });
-            if (data == result.bindings.end() || first + layout.runtimeStateDwords > data->guestDescriptor.size()) throw std::runtime_error("vertex selector state lies outside the shader data");
-            std::copy_n(runtimeSelectors.begin(), layout.runtimeStateDwords, data->guestDescriptor.begin() + first);
+            if (data == result.bindings.end() || first + selectorDwords > data->guestDescriptor.size()) throw std::runtime_error("vertex selector state lies outside the shader data");
+            std::copy_n(runtimeSelectors.begin(), selectorDwords, data->guestDescriptor.begin() + first);
         }
     }
     result.shaderDataUserWords = std::move(bindings.shaderDataUserWords);

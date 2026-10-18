@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Native/include/FrontEnd.hpp"
 #include "prx/libSceAgc/Command/include/Draw.hpp"
 #include "prx/libSceAgc/DcbDraw/include/DrawIndexed.hpp"
 
@@ -12,7 +13,15 @@ extern "C" {
 std::uint32_t* APS5_VABI sceAgcDcbDrawIndex(CommandBuffer* buf, std::uint32_t indexCount, const volatile void* indexAddress, std::uint64_t modifier) {
     const auto address = reinterpret_cast<std::uintptr_t>(indexAddress);
     Agc::Command::CheckAddress(address, 1, __func__);
-    return Agc::Command::Emit(buf, 0x27u, {indexCount, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), indexCount, Agc::Command::DrawInitiator(modifier, true, __func__)}, __func__);
+    const auto id = AgcFrontEndDraw_nid_postfix(buf, buf->bottom);
+    if (id != 0) {
+        auto* marker = Agc::Command::WriteNop(buf, 3u, __func__);
+        marker[1] = AgcDriver::Native::FrontEndDrawMarker;
+        marker[2] = id;
+    }
+    auto* packet = Agc::Command::Emit(buf, 0x27u, {indexCount, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), indexCount, Agc::Command::DrawInitiator(modifier, true, __func__)}, __func__);
+    AgcFrontEndPrepareDraw_nid_postfix(buf, buf->bottom, id, packet, 6u);
+    return packet;
 }
 
 std::uint32_t APS5_VABI sceAgcDcbDrawIndexGetSize() {
@@ -20,7 +29,15 @@ std::uint32_t APS5_VABI sceAgcDcbDrawIndexGetSize() {
 }
 
 std::uint32_t* APS5_VABI sceAgcDcbDrawIndexAuto(CommandBuffer* buf, std::uint32_t indexCount, std::uint64_t modifier) {
-    return Agc::Command::Emit(buf, 0x2du, {indexCount, Agc::Command::DrawInitiator(modifier, false, __func__)}, __func__);
+    const auto id = AgcFrontEndDraw_nid_postfix(buf, buf->bottom);
+    if (id != 0) {
+        auto* marker = Agc::Command::WriteNop(buf, 3u, __func__);
+        marker[1] = AgcDriver::Native::FrontEndDrawMarker;
+        marker[2] = id;
+    }
+    auto* packet = Agc::Command::Emit(buf, 0x2du, {indexCount, Agc::Command::DrawInitiator(modifier, false, __func__)}, __func__);
+    AgcFrontEndPrepareDraw_nid_postfix(buf, buf->bottom, id, packet, 3u);
+    return packet;
 }
 
 std::uint32_t APS5_VABI sceAgcDcbDrawIndexAutoGetSize() {
@@ -38,6 +55,11 @@ uint32_t APS5_VABI sceAgcDcbDrawIndexOffsetGetSize(void) {
 uint32_t* APS5_VABI sceAgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes, uint64_t modifier) {
     Agc::Command::Require((data_offset_in_bytes & 3u) == 0, __func__, "misaligned indirect argument offset");
     const auto offsets = Agc::Command::DrawPatchOffsets(modifier, __func__);
+    if (const auto id = AgcFrontEndDraw_nid_postfix(buf, buf->bottom); id != 0) {
+        auto* marker = Agc::Command::WriteNop(buf, 3u, __func__);
+        marker[1] = AgcDriver::Native::FrontEndDrawMarker;
+        marker[2] = id;
+    }
     return Agc::Command::Emit(buf, 0x25u, {data_offset_in_bytes, static_cast<std::uint32_t>(offsets), static_cast<std::uint32_t>(offsets >> 32u), Agc::Command::DrawInitiator(modifier, true, __func__)}, __func__);
 }
 

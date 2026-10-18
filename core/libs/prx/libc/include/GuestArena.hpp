@@ -53,6 +53,17 @@ void GuestArenaSetSharedBackingWriter_nid_no_patch(SharedBackingWriter writer);
 bool GuestArenaWriteSharedBacking_nid_no_patch(std::uintptr_t address, const void* source, std::size_t bytes);
 bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
 #endif
+// Device memory a GPU driver maps over a guest range, as a PC port keeps its GPU resources in video
+// memory: `place` maps it at the range with the range's contents (false: the range stays host
+// memory); before the range is unmapped or remapped, `settle` waits for the GPU's work on it and
+// `evict` unmaps it (once its contents are copied out), leaving the range reserved.
+struct GpuPlacement {
+    bool (*place)(std::uintptr_t address, std::size_t bytes);
+    void (*settle)();
+    void (*evict)(std::uintptr_t address, std::size_t bytes);
+};
+void GuestArenaSetGpuPlacement_nid_postfix(const GpuPlacement* placement);
+const GpuPlacement* GuestArenaGpuPlacement_nid_postfix();
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 

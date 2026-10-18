@@ -218,6 +218,16 @@ std::uint32_t UserDataBaseKey(const IrValue* handle) {
 void emitNativeBasePrologue(SpirvEmitterState& state) {
     namespace Table = RuntimeAbi::NativePageTable;
     if (state.bdaPagetableVariable == 0u) return;
+    const auto& layout = state.program.Metadata().bindings;
+    if (state.program.Metadata().descriptorSlots) {
+        const auto first = layout.NativeSlotDword() + static_cast<std::uint32_t>(layout.nativeImageSlots.size() + layout.nativeSamplerSlots.size()) * 4u;
+        for (std::uint32_t index = 0; index < layout.nativeBaseKeys.size(); ++index) {
+            const auto word = [&](std::uint32_t offset) { return Unary(state, spv::OpUConvert, TypeScalarU64(state), EmitShaderDataDwordLoad(state, first + index * 4u + offset)); };
+            const auto device = Binary(state, spv::OpBitwiseOr, TypeScalarU64(state), word(0u), Binary(state, spv::OpShiftLeftLogical, TypeScalarU64(state), word(1u), ConstantDeviceAddress(state, 32u)));
+            state.nativeBases.push_back({layout.nativeBaseKeys[index], {device, word(2u)}});
+        }
+        return;
+    }
     std::vector<std::uint32_t> keys;
     for (const auto& block : state.program.Blocks()) {
         for (const auto* value : block->Instructions()) {
@@ -319,8 +329,9 @@ std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const Mem
     // GPU-resolved programs reading through a user-data pointer translated in the prologue: a
     // direct load when the dword lies in the pointer's mapped extent, the table lookup otherwise.
     static const bool direct = std::getenv("APS5_NATIVE_DIRECT_BASES") != nullptr;
-    if (direct && bits == 32u && mem.kind == ResourceKind::ScalarAddress && !mem.addressIsFull && !state.nativeBases.empty()) {
-        const auto key = UserDataBaseKey(inst.Argument(0) != nullptr ? inst.Argument(0)->Resolve() : nullptr);
+    if ((direct || state.program.Metadata().descriptorSlots) && bits == 32u && mem.kind == ResourceKind::ScalarAddress && !mem.addressIsFull && !state.nativeBases.empty()) {
+        const auto* handle = inst.Argument(0) != nullptr ? inst.Argument(0)->Resolve() : nullptr;
+        const auto key = state.program.Metadata().descriptorSlots ? NativeBaseKey(handle) : UserDataBaseKey(handle);
         const auto found = std::find_if(state.nativeBases.begin(), state.nativeBases.end(), [&](const auto& entry) { return entry.first == key; });
         if (found != state.nativeBases.end()) {
             return EmitValueOrZeroIfCondition(state, ActiveArgument(ctx, inst), [&]() {

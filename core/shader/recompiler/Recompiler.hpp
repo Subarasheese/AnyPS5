@@ -618,6 +618,12 @@ struct CompiledShaderArtifact {
     // constants when that is not ~0u, else bound as the ShaderData buffer; with dispatchThreadLimitDword
     // not ~0u a partial-group dispatch's thread counts go there.
     std::vector<std::uint32_t> shaderDataUserRegisters;
+    // IrBindingLayout::nativeBaseKeys: the user-data pointers the driver translates into the block.
+    std::vector<std::uint32_t> nativeBaseKeys;
+    // IrBindingLayout::nativeImageSlots / nativeSamplerSlots: the descriptor sources (IrResourcePlan)
+    // a driver evaluates at the call site for those slots, in slot order.
+    std::vector<std::uint32_t> nativeImageSources;
+    std::vector<std::uint32_t> nativeSamplerSources;
     std::uint32_t pushDataStartDword = ~0u;
     std::uint32_t dispatchThreadLimitDword = ~0u;
     bool fullSubgroups = false;

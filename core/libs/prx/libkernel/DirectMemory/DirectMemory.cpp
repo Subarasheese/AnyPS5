@@ -599,6 +599,63 @@ void AddMapping(std::uintptr_t address, std::size_t len, std::uint64_t phys, int
 #endif
 }
 
+#if defined(__linux__)
+// GPU pools the CPU cannot read, mapped in video memory by the GPU driver (GuestArena::GpuPlacement)
+// as a PC port allocates its GPU resources; small pools stay host memory (the title's per-frame
+// command, constant and label rings). Guarded by g_directLock.
+constexpr std::size_t GpuPlacementMinimum = std::size_t{8} << 20u;
+struct PlacedRange {
+    std::uintptr_t end;
+    std::uint64_t phys;
+    int nativeProt;
+};
+std::map<std::uintptr_t, PlacedRange> g_placed;
+
+void PlaceInVideoMemory(std::uintptr_t address, std::size_t len, std::uint64_t phys, int prot) {
+    const auto* placement = GuestArena::GuestArenaGpuPlacement_nid_postfix();
+    if (placement == nullptr || len < GpuPlacementMinimum || (prot & GuestProtGpuReadWrite) == 0 || (prot & 1) != 0) return;
+    for (const auto base : MappingsSharingPhys(phys, phys + len)) {
+        if (base < address || base >= address + len) return;
+    }
+    if (!placement->place(address, len)) return;
+    g_placed[address] = {address + len, phys, LinuxProtFromSce(prot)};
+    if (::mprotect(reinterpret_cast<void*>(address), len, LinuxProtFromSce(prot)) != 0) throw std::system_error(errno, std::generic_category(), "protect video memory");
+    WatchMapping(address, len);
+    Trace("placed %p+0x%zx in video memory", reinterpret_cast<void*>(address), len);
+}
+
+// Returns placed ranges overlapping [start, end) (or, with `physical`, sharing those physical
+// addresses) to their host backing, contents included, before the range changes.
+void EvictPlaced(std::uintptr_t start, std::uintptr_t end, bool physical = false) {
+    for (auto it = g_placed.begin(); it != g_placed.end();) {
+        const auto address = it->first;
+        const auto placed = it->second;
+        const auto bytes = placed.end - address;
+        const bool overlaps = physical ? placed.phys < end && placed.phys + bytes > start : address < end && placed.end > start;
+        if (!overlaps) {
+            ++it;
+            continue;
+        }
+        GuestArena::GuestArenaGpuPlacement_nid_postfix()->settle();
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes);
+        if (::mprotect(reinterpret_cast<void*>(address), bytes, PROT_READ | PROT_WRITE) != 0) throw std::system_error(errno, std::generic_category(), "unprotect video memory");
+        for (auto mapping = g_directMappings.lower_bound(address); mapping != g_directMappings.end() && mapping->first < placed.end; ++mapping) {
+            const auto& page = g_physPages.at(mapping->second.phys);
+            const auto pieceBytes = mapping->second.end - mapping->first;
+            std::memcpy(mapping->second.backing->HostWriteData(page.offset, pieceBytes), reinterpret_cast<const void*>(mapping->first), pieceBytes);
+        }
+        GuestArena::GuestArenaGpuPlacement_nid_postfix()->evict(address, bytes);
+        for (auto mapping = g_directMappings.lower_bound(address); mapping != g_directMappings.end() && mapping->first < placed.end; ++mapping) {
+            const auto& page = g_physPages.at(mapping->second.phys);
+            mapping->second.backing->Map(mapping->first, mapping->second.end - mapping->first, page.offset, placed.nativeProt);
+        }
+        WatchMapping(address, bytes);
+        Trace("evicted %p+0x%zx from video memory", reinterpret_cast<void*>(address), bytes);
+        it = g_placed.erase(it);
+    }
+}
+#endif
+
 void RequireResidentUnpinned(GuestAllocations::Mutation& mutation, std::uintptr_t address, std::size_t len) {
 #ifdef _WIN32
     std::uintptr_t start = 0;
@@ -642,6 +699,10 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
     mutation.Protect(addr, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
         const auto address = reinterpret_cast<std::uintptr_t>(addr);
         std::lock_guard lock(g_directLock);
+#if defined(__linux__)
+        EvictPlaced(address, address + len);
+        if (physStart >= 0) EvictPlaced(static_cast<std::uint64_t>(physStart), static_cast<std::uint64_t>(physStart) + len, true);
+#endif
         if (physStart >= 0) {
             AddMapping(address, len, static_cast<std::uint64_t>(physStart), nativeProtection);
         } else {
@@ -869,6 +930,12 @@ bool Reserved(const void* addr, size_t len) {
 
 void UnmapRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t len) {
     RequireResidentUnpinned(mutation, reinterpret_cast<std::uintptr_t>(addr), len);
+#if defined(__linux__)
+    {
+        std::lock_guard lock(g_directLock);
+        EvictPlaced(reinterpret_cast<std::uintptr_t>(addr), reinterpret_cast<std::uintptr_t>(addr) + len);
+    }
+#endif
     mutation.Unmap(addr, len, [&](const void* piece, std::size_t pieceBytes, const void* allocation, bool last) {
         auto* pieceAddress = const_cast<void*>(piece);
         std::lock_guard lock(g_directLock);
@@ -921,9 +988,15 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     RequireAliasesUnpinned(mutation, static_cast<std::uint64_t>(physStart), len);
     std::lock_guard lock(g_directLock);
     ValidatePhysicalRange(static_cast<std::uint64_t>(physStart), len);
+#if defined(__linux__)
+    EvictPlaced(static_cast<std::uint64_t>(physStart), static_cast<std::uint64_t>(physStart) + len, true);
+#endif
     void* mapped = MapAligned(*addr, len, PROT_NONE, flags, alignment);
     try {
         AddMapping(reinterpret_cast<std::uintptr_t>(mapped), len, static_cast<std::uint64_t>(physStart), LinuxProtFromSce(prot));
+#if defined(__linux__)
+        PlaceInVideoMemory(reinterpret_cast<std::uintptr_t>(mapped), len, static_cast<std::uint64_t>(physStart), prot);
+#endif
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0);
         if ((prot & GuestProtGpuReadWrite) != 0) mutation.NoteGpuMapping(mapped, len);
     } catch (...) {
@@ -1217,7 +1290,7 @@ void CreateDirectMemoryBacking(int64_t start, size_t len, int memoryType) {
     std::map<std::uint64_t, PhysicalPage> pages;
     for (std::size_t offset = 0; offset < len; offset += PS5_PAGE_SIZE) pages.emplace(first + offset, PhysicalPage{backing, offset});
     g_physPages.merge(pages);
-    Trace("allocate physical 0x%llx+0x%zx", static_cast<unsigned long long>(first), len);
+    Trace("allocate physical 0x%llx+0x%zx type %d", static_cast<unsigned long long>(first), len, memoryType);
 }
 
 void ForgetDirectMemory(int64_t start, size_t len) {

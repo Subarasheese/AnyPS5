@@ -522,4 +522,16 @@ bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t byt
 }
 #endif
 
+namespace {
+std::atomic<const GpuPlacement*> gpuPlacement{nullptr};
+}
+
+void GuestArenaSetGpuPlacement_nid_postfix(const GpuPlacement* placement) {
+    gpuPlacement.store(placement, std::memory_order_release);
+}
+
+const GpuPlacement* GuestArenaGpuPlacement_nid_postfix() {
+    return gpuPlacement.load(std::memory_order_acquire);
+}
+
 }

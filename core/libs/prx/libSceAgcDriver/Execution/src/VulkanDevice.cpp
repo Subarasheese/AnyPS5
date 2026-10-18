@@ -323,6 +323,8 @@ struct VulkanDevice::State {
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
     bool maintenance8 = false;
+    // VK_EXT_map_memory_placed: device memory mapped at a chosen host address (0: unavailable).
+    VkDeviceSize placedMapAlignment = 0;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
@@ -1450,6 +1452,21 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     maintenance8Features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     maintenance8Features.maintenance8 = VK_TRUE;
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placedFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+    if (hasExtension(VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) && hasExtension(VK_KHR_MAP_MEMORY_2_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &placedFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        if (placedFeatures.memoryMapPlaced == VK_TRUE) {
+            VkPhysicalDeviceMapMemoryPlacedPropertiesEXT placedProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &placedProperties};
+            state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
+            state->placedMapAlignment = std::max<VkDeviceSize>(placedProperties.minPlacedMemoryMapAlignment, 1);
+            deviceExtensions.push_back(VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
+            deviceExtensions.push_back(VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME);
+        }
+    }
+    placedFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+    placedFeatures.memoryMapPlaced = VK_TRUE;
     VkPhysicalDeviceDepthClipControlFeaturesEXT depthClipFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &depthClipFeatures};
@@ -1739,6 +1756,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->maintenance8) {
         maintenance8Features.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &maintenance8Features;
+    }
+    if (state->placedMapAlignment != 0) {
+        placedFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
+        deviceInfo.pNext = &placedFeatures;
     }
     if (state->nonSeamlessCubeMap) {
         nonSeamlessCubeFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
@@ -3635,6 +3656,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     };
     context.pipelineCacheSynchronization = state->pipelineCache ? &state->pipelineCache->Synchronization() : nullptr;
     context.dmaBufImport = state->dmaBufImport;
+    context.placedMapAlignment = state->placedMapAlignment;
     context.sparseBinding = state->sparseBinding;
     context.queueFamily = state->queueFamily;
     context.sparseFamily = state->sparseFamily;

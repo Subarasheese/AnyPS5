@@ -34,6 +34,10 @@ public:
 };
 bool Logs();
 void ReportGraphicsIssue(const std::string& category, const std::string& detail);
+void TimelineEvent(const char* what, std::uint64_t a = 0, std::uint64_t b = 0);
+// Debug aid: APS5_POOL_AUDIT=<file> lists, per 64 KiB page of GT7's memory, what uses it (command
+// buffers, CPU descriptor walks, labels, vertex and index data, translated bases, textures).
+void NotePoolUse(const char* use, std::uint64_t address);
 // Per-frame statistics (APS5_NATIVE_STATS=1), counted at each presented frame.
 void NotePresent();
 

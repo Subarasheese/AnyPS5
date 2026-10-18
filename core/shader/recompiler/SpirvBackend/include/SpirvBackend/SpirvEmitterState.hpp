@@ -114,6 +114,8 @@ struct SpirvEmitterState {
     std::uint32_t nativeSamplerLookupFunction = 0;
     std::vector<std::uint32_t> nonUniformIds;   // ids already decorated NonUniform
     std::uint32_t gpuImageEntry = 0;
+    // An image slot's {resolved, sampled, storage} from the shader data (IrBindingLayout::nativeImageSlots).
+    std::array<std::uint32_t, 3> gpuImageSlot{};
     std::uint32_t gpuSamplerIndex = 0;
     std::uint32_t gpuSamplerWord0 = 0;
     // GPU-resolved programs: user-data pointers translated once in main's entry block, keyed by

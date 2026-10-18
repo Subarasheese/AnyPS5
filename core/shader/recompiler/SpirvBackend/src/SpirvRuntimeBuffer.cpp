@@ -817,7 +817,42 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     const auto offset = Unary(state, spv::OpUConvert, u64, byte);
     const auto inBounds = both(state, noCarry, both(state, resource.valid, Binary(state, spv::OpULessThanEqual, TypeBool(state), Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, 4u)), size)));
     if (!context.Memory(instruction).gpuDescriptor) return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, byte, 32u); });
-    return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
+    // A V# translated at the call site (IrBindingLayout::nativeBaseKeys): a direct load when the
+    // dword lies in the base's mapped extent, the table lookup otherwise.
+    const auto key = state.program.Metadata().descriptorSlots ? NativeBaseKey(instruction.Argument(0)->Resolve()) : NoNativeBase;
+    const auto found = std::find_if(state.nativeBases.begin(), state.nativeBases.end(), [&](const auto& entry) { return entry.first == key; });
+    if (key == NoNativeBase || found == state.nativeBases.end()) return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
+    return EmitValueOrZeroIfCondition(state, inBounds, [&] {
+        const auto u32 = TypeU32(state);
+        const auto boolean = TypeBool(state);
+        const auto [device, extent] = found->second;
+        const auto offsetInRange = Binary(state, spv::OpULessThanEqual, boolean, offset, extent);
+        const auto hasDword = Binary(state, spv::OpUGreaterThanEqual, boolean, Binary(state, spv::OpISub, u64, extent, offset), BdaConstant(state, 4u));
+        const auto physical = Binary(state, spv::OpIAdd, u64, device, offset);
+        const auto aligned = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u64, physical, BdaConstant(state, 3u)), BdaConstant(state, 0u));
+        const auto inside = both(state, both(state, offsetInRange, hasDword), aligned);
+        const auto direct = state.module.AllocateId(), slow = state.module.AllocateId(), merge = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, inside, direct, slow);
+        EmitLabel(state, direct);
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, physical);
+        const auto directValue = state.module.AllocateId();
+        if (context.Memory(instruction).coherent) {
+            state.module.AddFunction(spv::OpAtomicLoad, u32, directValue, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone));
+        } else {
+            state.module.AddFunction(spv::OpLoad, u32, directValue, pointer, spv::MemoryAccessAlignedMask, 4u);
+        }
+        state.module.AddFunction(spv::OpBranch, merge);
+        EmitLabel(state, slow);
+        const auto slowValue = readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u);
+        const auto slowEnd = state.currentLabel;
+        state.module.AddFunction(spv::OpBranch, merge);
+        EmitLabel(state, merge);
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, u32, value, directValue, direct, slowValue, slowEnd);
+        return value;
+    });
 }
 
 std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t bits, std::uint32_t active, const std::function<std::uint32_t(std::uint32_t)>& operation) {

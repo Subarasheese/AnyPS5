@@ -171,6 +171,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/ResourceAudit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/NativeDevice.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/NativeImages.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/FrontEnd.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Native/src/CompileStatus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp

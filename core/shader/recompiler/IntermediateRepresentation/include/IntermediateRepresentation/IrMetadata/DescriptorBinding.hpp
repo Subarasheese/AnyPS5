@@ -46,6 +46,15 @@ struct IrBindingLayout {
     std::uint32_t runtimeImageCount = 0;
     std::uint32_t runtimeStateDwords = 0;
     std::vector<std::uint32_t> userDataRegisters;
+    // ProgramMetadata::descriptorSlots: the user-data pointer pairs (low | high << 16) the driver
+    // translates at the call site, each four dwords {device address, extent, 0} placed before the
+    // invocation addresses at the end of the shader data block.
+    std::vector<std::uint32_t> nativeBaseKeys;
+    // ProgramMetadata::descriptorSlots: the image and sampler resources (ShaderInfo indices) whose
+    // heap indices the driver writes at record time, four dwords each before the base pointers:
+    // {sampled, storage, resolved, 0} per image and {sampler, resolved, 0, 0} per sampler.
+    std::vector<std::uint32_t> nativeImageSlots;
+    std::vector<std::uint32_t> nativeSamplerSlots;
     std::vector<IrDescriptorBinding> descriptors;
 
     [[nodiscard]] std::uint32_t DispatchThreadLimitDword() const {
@@ -59,6 +68,12 @@ struct IrBindingLayout {
     }
     [[nodiscard]] std::uint32_t ShaderDataDwords() const {
         return RuntimeStateDword() + runtimeStateDwords;
+    }
+    [[nodiscard]] std::uint32_t NativeSlotDwords() const {
+        return 4u * static_cast<std::uint32_t>(nativeImageSlots.size() + nativeSamplerSlots.size() + nativeBaseKeys.size());
+    }
+    [[nodiscard]] std::uint32_t NativeSlotDword() const {
+        return ShaderDataDwords() - RuntimeAbi::NativeHeap::InvocationAddressDwords - NativeSlotDwords();
     }
     [[nodiscard]] bool UsesPushData() const {
         return pushDataStartDword != PushData::NoStart;

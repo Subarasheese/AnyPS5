@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Native/include/FrontEnd.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 
 #include <algorithm>
@@ -103,6 +104,7 @@ std::uint32_t* WriteRegisterRange(CommandBuffer* buffer, std::uint32_t opcode, s
     packet[0] = Header(opcode, count + 2u);
     packet[1] = offset;
     std::copy(snapshot.begin(), snapshot.end(), packet + 2);
+    AgcFrontEndRegisterRange_nid_postfix(buffer, buffer->bottom, opcode, offset, packet + 2, count);
     return packet;
 }
 
@@ -144,6 +146,7 @@ std::uint32_t* WriteIndirectRegisters(CommandBuffer* buffer, std::uint32_t opcod
     const auto address = reinterpret_cast<std::uintptr_t>(registers);
     if (address != 0 || count != 0) CheckAddress(address, 4, function);
     CheckBits(count, 0x3fffu, function);
+    AgcFrontEndRegisters_nid_postfix(buffer, buffer->bottom, opcode, registers, count);
     return Emit(buffer, opcode, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0x80000000u, count}, function);
 }
 

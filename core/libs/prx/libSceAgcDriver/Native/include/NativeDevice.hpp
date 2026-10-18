@@ -54,6 +54,8 @@ public:
     void SyncGpuMemory();
     // The device address of guest address `address`, 0 when no import covers [address, +bytes).
     std::uint64_t DeviceAddress(std::uint64_t address, std::uint64_t bytes = 1) const;
+    // The device address of readable guest memory at `address` and the bytes mapped contiguously from it.
+    std::uint64_t DeviceSpan(std::uint64_t address, std::uint64_t& bytes) const;
     Statistics Stats() const;
 
     // The recompiler target for this device's shaders, with resources resolved on the GPU
@@ -71,13 +73,15 @@ public:
         std::span<const std::uint32_t> shaderData;
         std::uint64_t programAddress = 0;   // GT7's program (diagnostics)
         std::uint64_t indirectArguments = 0;   // DISPATCH_INDIRECT: the group counts' address in GT7's memory (read by the GPU)
+        std::span<const std::uint32_t> flattenedSrt;   // The descriptor words walked at the call site (DescriptorRole::FlattenedSrt).
+        std::span<const std::uint32_t> slotWords;   // The T#s (8 words) then S#s (4) of the shader's image and sampler slots.
     };
     bool Dispatch(const ComputeWork& work, std::string& failure);
     std::shared_ptr<Graphics::PipelineJournalReplay> ReplayPipelineJournal(bool prepareAll = false);
     bool PrebuildGraphicsLibrary(const ShaderRecompiler::RecompileResult& shader, ShaderRecompiler::ShaderStage stage, std::uint32_t wave, std::uint32_t pushOffset, const std::optional<ShaderRecompiler::MeshConfiguration>& mesh);
     bool PrebuildCompute(const ShaderRecompiler::RecompileResult& shader, std::string& failure);
     // DMA_DATA to/from the persistent device-local GDS; false for other DMA.
-    bool DmaGds(std::span<const std::uint32_t> packet);
+    bool DmaGds(std::span<const std::uint32_t> packet, bool wait = true);
 
     // One draw of GT7's: its decoded pipeline state, the compiled stages (compiled for
     // GraphicsTarget) with each stage's shader data block, and the draw's parameters. Recorded into
@@ -88,6 +92,8 @@ public:
         ShaderRecompiler::ShaderStage stage{};
         std::uint32_t pushOffset = 0;
         std::vector<std::uint32_t> shaderData;
+        std::vector<std::uint32_t> flattenedSrt;
+        std::vector<std::uint32_t> slotWords;
         // A vertex stage's fixed-function attributes with this draw's vertex buffer descriptors.
         std::vector<ShaderRecompiler::VertexAttribute> attributes;
     };
@@ -102,6 +108,7 @@ public:
         std::uint32_t firstVertex = 0;
         std::uint32_t firstInstance = 0;
         std::array<std::uint64_t, 2> programAddresses{};   // vertex and pixel programs (diagnostics)
+        std::vector<std::uint64_t> sampled;
     };
     bool Draw(const DrawWork& work, std::string& failure);
     ShaderRecompiler::SpirvTarget GraphicsTarget() const;
@@ -109,9 +116,15 @@ public:
     bool DisplayImage(std::uint64_t address, VkImage& image, VkExtent2D& extent, VkFormat& format);
     // Submits the open batch and waits until the GPU finished it.
     void Flush();
+    void Submit();
+    bool TransferOnGpu(std::span<const std::uint32_t> packet);
     // Runs `action` once the open batch's work has completed (at its flush), or now when no batch
     // is open: GT7's end-of-pipe events (RELEASE_MEM label writes and interrupts).
     void AfterBatch(std::function<void()> action);
+    // After the batch `serial` (RecordingSerial when work was recorded) completes; at once if it has.
+    void AfterBatch(std::function<void()> action, std::uint64_t serial);
+    // The batch work recorded now lands in (or a later one).
+    std::uint64_t RecordingSerial() const;
     bool Pending() const;
     void RequireBarrier();
     void NoteFlip();

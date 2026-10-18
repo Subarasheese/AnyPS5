@@ -116,10 +116,13 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         if (presentable && !syncFlip) {
             if (inFlight != 0) {
 
+                Native::TimelineEvent("present retire wait");
                 waitedMs = presenting->RetirePresents(presenting->PresentWaitsForSlots(buffer) ? 0 : inFlight);
+                Native::TimelineEvent("present retired");
                 timing.Mark("inflight_wait");
             }
             presentable = presenting->AcquireImage();
+            Native::TimelineEvent("present acquired");
             timing.Mark("acquire_image");
         }
         if (presentable) {
