@@ -385,14 +385,28 @@ private:
 
 // Debug aid: APS5_PROBE=<pc hex>:<vgpr>[:<shift>] copies VGPR <vgpr> into v255 right after the
 // instruction at <pc> is translated, and every image store then writes (v255 >> shift) instead of its
-// data, so a dumped output image is a per-lane trace of that register.
+// data, so a dumped output image is a per-lane trace of that register. A pixel program writes it
+// instead to the raw 32-bit color target APS5_PROBE_MRT names (default 2), so the dumped target holds
+// the register's exact bits per pixel. APS5_PROBE_CODE=<hash> limits the probe to the one program
+// whose first 64 code bytes hash to it (ShaderRecompiler::ProbeCodeHash), since a program's address
+// changes between runs.
 struct DebugProbe {
     bool enabled = false;
     std::uint32_t programCounter = 0;
     std::uint32_t vgpr = 0;
     std::uint32_t shift = 0;
+    std::uint32_t mrt = 2;
+    std::uint32_t mark = 0x100;
 };
 [[nodiscard]] DebugProbe DebugProbeConfig();
+// The code hash the probe wants (0: no program filter), and this thread's current program's hash.
+[[nodiscard]] std::uint64_t DebugProbeCodeHash();
+void SetDebugProbeProgramHash(std::uint64_t hash);
+[[nodiscard]] std::uint64_t DebugProbeProgramHash();
+// APS5_PROBE_MARK_ALL=<mrt>: every pixel program writes its own identity (the low 11 bits of its code
+// hash, exact in a half float) to that color target, so a dumped frame says which program drew each
+// pixel. 0x100: off.
+[[nodiscard]] std::uint32_t DebugProbeMarkAllTarget();
 
 }
 

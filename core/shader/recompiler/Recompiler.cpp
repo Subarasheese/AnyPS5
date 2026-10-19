@@ -14,6 +14,7 @@
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
 #include "ShaderCacheDirectory.hpp"
+#include "Translation/TranslationContext.hpp"
 #include <list>
 #include <functional>
 #include <map>
@@ -220,6 +221,11 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     if ((stageKind == ShaderStageKind::Vertex || stageKind == ShaderStageKind::Local) && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded) {
         embeddedFetch = EmbeddedVertexFetchAnalyzer{}.Analyze(decoded, inputInfo.vertex->fetchAttribReg, inputInfo.vertex->fetchBufferReg, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), request.context.waveSize);
         translateOptions.embeddedFetch = &embeddedFetch;
+    }
+    // A program-filtered probe (APS5_PROBE_CODE) matches on the code itself: addresses move between runs.
+    if (DebugProbeCodeHash() != 0 || DebugProbeMarkAllTarget() != 0x100u) {
+        const auto head = request.shader.code.subspan(0, std::min<std::size_t>(16u, request.shader.code.size()));
+        SetDebugProbeProgramHash(HashBytes(std::as_bytes(head)));
     }
     auto program = translator.Translate(decoded, cfg, translateOptions);
     // Debug aid: APS5_DUMP_IR=<hex code address> (or "all") prints the program after each front-end pass.

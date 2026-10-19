@@ -5,12 +5,14 @@
 #include "stb_truetype.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -153,6 +155,26 @@ CompileWait::~CompileWait() {
     auto& state = State();
     std::lock_guard lock(state.mutex);
     if (--state.waiters == 0) state.unblockedAt = std::chrono::steady_clock::now();
+}
+
+std::chrono::milliseconds CompileWaitLimit() {
+    static const std::chrono::milliseconds limit{[] { const char* text = std::getenv("APS5_COMPILE_WAIT_MS"); return text != nullptr ? std::strtoll(text, nullptr, 10) : 2000ll; }()};
+    return limit;
+}
+
+namespace {
+std::atomic<std::int64_t> lastTimeout{std::numeric_limits<std::int64_t>::min()};
+std::int64_t NowMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+}
+
+std::chrono::milliseconds CompileWaitNow() {
+    const auto last = lastTimeout.load(std::memory_order_relaxed);
+    if (last != std::numeric_limits<std::int64_t>::min() && NowMs() - last < 3000) return std::chrono::milliseconds{1};
+    return CompileWaitLimit();
+}
+
+void NoteCompileWaitTimedOut() {
+    lastTimeout.store(NowMs(), std::memory_order_relaxed);
 }
 
 CompileProgress CurrentCompileProgress() {

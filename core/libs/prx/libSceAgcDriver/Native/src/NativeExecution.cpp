@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Native/include/FrontEnd.hpp"
 #include "prx/libSceAgcDriver/Native/include/CompileStatus.hpp"
 #include "prx/libSceAgcDriver/Native/include/NativeImages.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "ShaderDiskCache.hpp"
@@ -188,11 +189,40 @@ std::vector<std::uint32_t> FlattenedSrt(const ShaderRecompiler::IrResourcePlan* 
         constexpr ShaderRecompiler::SrtWalker walker;
         std::vector<ShaderRecompiler::DescriptorValue> descriptors;
         std::vector<std::uint8_t> active;
+        // Images read from a descriptor table at a run-time key (TableColumn: GT7's MakeLightProbeTex
+        // takes its store targets from a buffer row picked by the workgroup) have no single T# at the
+        // call site: the shader reads the row's T# and finds it in the image heap. Each row's T# is
+        // registered here so that lookup succeeds; the table's buffer is evaluated with the slots.
+        std::vector<std::pair<std::size_t, const ShaderRecompiler::TableColumn*>> tables;
+        for (std::size_t index = 0; index < result.nativeImageSources.size(); ++index) {
+            const auto source = result.nativeImageSources[index];
+            if (source >= plan->descriptorSources.size() || !plan->descriptorSources[source].tableColumn.has_value()) continue;
+            const auto& column = *plan->descriptorSources[source].tableColumn;
+            if (column.sampler || column.address || column.indirect || column.dwordCount != 8u || column.stride == 0u) continue;
+            tables.emplace_back(sources.size(), &column);
+            sources.push_back(column.heapSource);
+        }
         walker.EvaluateRuntimeSources(*plan, sources, runtime, descriptors, flat, {}, active);
         slotWords.reserve(result.nativeImageSources.size() * 8 + result.nativeSamplerSources.size() * 4);
-        for (std::size_t index = 0; index < descriptors.size(); ++index) {
+        const auto slots = std::min(descriptors.size(), result.nativeImageSources.size() + result.nativeSamplerSources.size());
+        for (std::size_t index = 0; index < slots; ++index) {
             const auto width = index < result.nativeImageSources.size() ? 8u : 4u;
             slotWords.insert(slotWords.end(), descriptors[index].dwords.begin(), descriptors[index].dwords.begin() + width);
+        }
+        for (const auto& [heap, column] : tables) {
+            if (heap >= descriptors.size()) continue;
+            const auto& buffer = descriptors[heap].dwords;
+            const auto base = buffer[0] | (static_cast<std::uint64_t>(buffer[1] & 0xffffu) << 32u);
+            const auto stride = (buffer[1] >> 16u) & 0x3fffu;
+            const std::uint64_t size = stride == 0u ? buffer[2] : static_cast<std::uint64_t>(stride) * buffer[2];
+            const std::uint64_t keys = column->maxKey == 0xffffffffu ? 4096u : std::min<std::uint64_t>(4096u, column->maxKey / column->stride + 1u);
+            for (std::uint64_t key = 0; key < keys; ++key) {
+                const auto position = static_cast<std::uint64_t>(column->addend) + key * column->stride + column->offset;
+                if (position + 32u > size || !GuestRangeAccessible(nullptr, base + position, 32u)) break;
+                std::array<std::uint32_t, 8> words{};
+                std::memcpy(words.data(), reinterpret_cast<const void*>(base + position), sizeof(words));
+                if ((words[0] | (words[1] & 0xffu)) != 0u) Native::NoteSampledDescriptor(std::span<const std::uint32_t, 8>(words));
+            }
         }
     } catch (const std::exception& error) {
         Native::ReportGraphicsIssue("descriptor words not walked at the call site", error.what());
@@ -200,6 +230,13 @@ std::vector<std::uint32_t> FlattenedSrt(const ShaderRecompiler::IrResourcePlan* 
         slotWords.clear();
     }
     return flat;
+}
+
+// APS5_NATIVE_SLOT_SRT: translations take their descriptors from call-site slots, which also give
+// the draw's textures (no CPU capture of the classic translation per draw).
+bool SlotDescriptors() {
+    static const bool enabled = std::getenv("APS5_NATIVE_SLOT_SRT") != nullptr;
+    return enabled;
 }
 
 ShaderRecompiler::RecompileRequest ClassicRequest(ShaderRecompiler::RecompileRequest request) {
@@ -462,6 +499,7 @@ struct NativeGraphicsStage {
     std::string failure;
     std::shared_ptr<const ShaderRecompiler::SourceHandle> descriptors;
     std::shared_ptr<const ShaderRecompiler::IrResourcePlan> flattened;
+    bool waitedOut = false;
 };
 
 struct NativeGraphics {
@@ -530,6 +568,14 @@ void ReportGraphics() {
     if (Native::Logs()) std::fprintf(stderr, "[native] last 5 s: %llu draws prepared at the game's call site, %llu decoded by the executor\n", static_cast<unsigned long long>(graphics.frontEnd - lastFrontEnd), static_cast<unsigned long long>((graphics.native - lastNative) - (graphics.frontEnd - lastFrontEnd)));
     lastFrontEnd = graphics.frontEnd;
     lastNative = graphics.native;
+    if (Native::Logs() && skipped != 0) {
+        std::vector<std::pair<std::uint64_t, std::string>> reasons;
+        for (const auto& [reason, count] : graphics.fallbacks) reasons.emplace_back(count, reason);
+        std::sort(reasons.rbegin(), reasons.rend());
+        std::string line;
+        for (std::size_t i = 0; i < reasons.size() && i < 6; ++i) line += " " + std::to_string(reasons[i].first) + " " + reasons[i].second.substr(0, 90) + ";";
+        std::fprintf(stderr, "[native] skipped draws by reason:%s\n", line.c_str());
+    }
     lastDraws = graphics.native + skipped;
     lastPhases = graphics.phaseUs;
 }
@@ -541,6 +587,8 @@ struct PreparedDraw {
     std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
     std::shared_ptr<const ShaderRecompiler::RectListShaders> rectangle;
     Native::NativeDevice::DrawWork work;
+    // The packet as GT7's call wrote it: a draw whose packet changed before it ran is reported.
+    std::vector<std::uint32_t> packet;
     bool ready = false;
 };
 
@@ -566,7 +614,14 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
         const auto id = frontEndDraw;
         frontEndDraw = 0;
         if (Native::FrontEndValidating()) Native::CompareFrontEndDraw(id, queue);
-        if (auto prepared = std::static_pointer_cast<PreparedDraw>(Native::TakeFrontEndDraw(id)); prepared != nullptr && prepared->ready) return RecordPreparedDraw(*prepared);
+        if (auto prepared = std::static_pointer_cast<PreparedDraw>(Native::TakeFrontEndDraw(id)); prepared != nullptr && prepared->ready) {
+            if (!std::equal(prepared->packet.begin(), prepared->packet.end(), packet.begin(), packet.end())) {
+                char detail[160];
+                std::snprintf(detail, sizeof(detail), "opcode 0x%x: words 1..%zu %08x %08x %08x %08x", (packet[0] >> 8u) & 0xffu, packet.size() - 1, packet.size() > 1 ? packet[1] : 0u, packet.size() > 2 ? packet[2] : 0u, packet.size() > 3 ? packet[3] : 0u, packet.size() > 4 ? packet[4] : 0u);
+                Native::ReportGraphicsIssue("draw packet changed after its call (prepared values used)", detail);
+            }
+            return RecordPreparedDraw(*prepared);
+        }
     }
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
@@ -595,15 +650,88 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
     Graphics::State state{};
     try {
         draw = Pm4::ResolveDraw(packet, queue);
-        if (draw.indirect) {
-            CountDrawFallback("indirect draw");
-            return false;
-        }
-        if (draw.indexCount == 0 || draw.instanceCount == 0) return true;
+        // Indirect draws run on the GPU from the records GT7's earlier work wrote (vkCmdDrawIndexed
+        // Indirect[Count]); the index buffer is the declared INDEX_BUFFER_SIZE range.
+        if (!draw.indirect && (draw.indexCount == 0 || draw.instanceCount == 0)) return true;
         state = Graphics::DecodeState(queue, false, true);
+        // Debug aid: APS5_DEBUG_DEPTH_ALWAYS=<color target address> draws into that target without
+        // depth testing or writing (separates depth rejection from shading in a black pass).
+        static const std::uint64_t depthAlways = [] { const char* text = std::getenv("APS5_DEBUG_DEPTH_ALWAYS"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+        if (depthAlways != 0 && !state.colors.empty() && state.colors.front().address == depthAlways) {
+            state.depthCompare = VK_COMPARE_OP_ALWAYS;
+            state.depthWrite = false;
+        }
     } catch (const std::exception& error) {
+        static const bool debugReject = std::getenv("APS5_DEBUG_DEPTH_REJECT") != nullptr;
+        static std::atomic<int> rejectLogs{0};
+        if (debugReject && std::strstr(error.what(), "register 0x200") != nullptr && rejectLogs.fetch_add(1) < 60) std::fprintf(stderr, "[native] state rejected (%s): %s\n", prepareOnly != nullptr ? "call site" : prefetch ? "lookahead" : "executor", error.what());
         CountDrawFallback(std::string("state: ") + error.what());
         return false;
+    }
+    // Debug aid: APS5_DEBUG_WATCH_TARGET=<address,...> logs draws rendering into a color or depth
+    // target within 256 MB above a listed address (before any skip), with the time since the first such draw.
+    {
+        static const auto watched = AddressList("APS5_DEBUG_WATCH_TARGET");
+        static const auto started = std::chrono::steady_clock::now();
+        static std::atomic<int> logged{0};
+        const auto listed = [&](std::uint64_t address) { return std::any_of(watched.begin(), watched.end(), [&](std::uint64_t base) { return address >= base && address - base < (std::uint64_t{1} << 28u); }); };
+        bool hit = state.depth && listed(state.depth->address);
+        for (const auto& color : state.colors) hit = hit || listed(color.address);
+        // APS5_DEBUG_WATCH_TARGET=all: each distinct depth target once.
+        static const bool all = [] { const char* text = std::getenv("APS5_DEBUG_WATCH_TARGET"); return text != nullptr && std::strcmp(text, "all") == 0; }();
+        static std::mutex seenMutex;
+        static std::set<std::uint64_t> seen;
+        if (all && state.depth) {
+            std::lock_guard lock(seenMutex);
+            hit = seen.insert(state.depth->address ^ (static_cast<std::uint64_t>(prepareOnly != nullptr) << 63u)).second;
+        }
+        // APS5_DEBUG_PROGRAM_HEADS=<dir>: each watched draw's pixel program's first 64 code bytes,
+        // written once as <dir>/<address>.bin (named offline by tools/name_programs.py), and up to
+        // 64 KiB of its code as <address>.code.
+        static const char* heads = std::getenv("APS5_DEBUG_PROGRAM_HEADS");
+        if (heads != nullptr && hit) {
+            const auto ps = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x8)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x9) & 0xffu) << 40u);
+            static std::mutex headsMutex;
+            static std::set<std::uint64_t> written;
+            std::lock_guard lock(headsMutex);
+            if (ps != 0 && written.insert(ps).second && GuestMemory::Accessible(reinterpret_cast<const void*>(ps), 64)) {
+                std::filesystem::create_directories(heads);
+                char name[32];
+                std::snprintf(name, sizeof(name), "%llx.bin", static_cast<unsigned long long>(ps));
+                std::ofstream(std::filesystem::path(heads) / name, std::ios::binary).write(reinterpret_cast<const char*>(ps), 64);
+                // The whole program too (up to 64 KiB of readable code), for offline disassembly.
+                std::size_t bytes = 64;
+                while (bytes < 65536 && GuestMemory::Accessible(reinterpret_cast<const void*>(ps), bytes * 2)) bytes *= 2;
+                std::snprintf(name, sizeof(name), "%llx.code", static_cast<unsigned long long>(ps));
+                std::ofstream(std::filesystem::path(heads) / name, std::ios::binary).write(reinterpret_cast<const char*>(ps), static_cast<std::streamsize>(bytes));
+            }
+        }
+        if ((all || !watched.empty()) && hit && logged.fetch_add(1) < 300) {
+            std::string masks;
+            for (std::size_t i = 0; i < state.colors.size(); ++i) {
+                char item[48];
+                std::snprintf(item, sizeof(item), " mrt%zu 0x%llx mask %x blend %u", i, static_cast<unsigned long long>(state.colors[i].address), i < state.blends.size() ? state.blends[i].colorWriteMask : 0u, i < state.blends.size() ? state.blends[i].blendEnable : 0u);
+                masks += item;
+            }
+            std::fprintf(stderr, "[native] watch targets:%s\n", masks.c_str());
+            std::fprintf(stderr, "[native] watch target (%s): color 0x%llx depth 0x%llx %ux%u count %u x%u path %d pixelless %d test %d write %d compare %d clear %g vs 0x%llx ps 0x%llx at %.2f s\n", prepareOnly != nullptr ? "call site" : "executor", static_cast<unsigned long long>(state.colors.empty() ? 0ull : state.colors.front().address), static_cast<unsigned long long>(state.depth ? state.depth->address : 0ull),
+                state.renderExtent.width, state.renderExtent.height, draw.indexCount, draw.instanceCount, static_cast<int>(state.stages.path), Graphics::PixelProgramSkipped(queue) ? 1 : 0, state.depthTest, state.depthWrite, static_cast<int>(state.depthCompare), state.depth ? state.depth->clearDepth : -1.0f,
+                static_cast<unsigned long long>((static_cast<std::uint64_t>(readRegister(queue.shader, 0xc8)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0xc9) & 0xffu) << 40u)), static_cast<unsigned long long>((static_cast<std::uint64_t>(readRegister(queue.shader, 0x8)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x9) & 0xffu) << 40u)), std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+        }
+    }
+    // Debug experiment: APS5_DEBUG_SKIP_DEPTH=<low>-<high> drops draws whose depth target lies in that
+    // range (shadow casters, to tell shadowing apart from other lighting inputs). Not a fix.
+    {
+        static const std::pair<std::uint64_t, std::uint64_t> skipDepth = [] {
+            std::pair<std::uint64_t, std::uint64_t> range{0, 0};
+            if (const char* text = std::getenv("APS5_DEBUG_SKIP_DEPTH")) {
+                char* end = nullptr;
+                range.first = std::strtoull(text, &end, 0);
+                if (*end == '-') range.second = std::strtoull(end + 1, nullptr, 0);
+            }
+            return range;
+        }();
+        if (skipDepth.second != 0 && state.depth && state.depth->address >= skipDepth.first && state.depth->address < skipDepth.second) return true;
     }
     if (state.stages.path == Graphics::ShaderPath::Tessellation || state.stages.path == Graphics::ShaderPath::TessellationGeometry) {
         CountDrawFallback("tessellation");
@@ -771,10 +899,11 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
         std::vector<ShaderRecompiler::MemoryRegion> memory{{program.recorded.codeAddress, std::as_bytes(std::span(*program.recorded.code))}, {program.recorded.headerAddress, std::span(*program.recorded.header)}};
         const ShaderRecompiler::ShaderFloatMode floatMode{NativeFloatMode((program.rsrc1 >> 12u) & 0xffu), ((program.rsrc1 >> 21u) & 1u) != 0u, ((program.rsrc1 >> 23u) & 1u) != 0u, ((program.rsrc1 >> 26u) & 1u) != 0u};
         const ShaderRecompiler::RecompileRequest request{program.binary, {wave, program.firstUserSgpr, program.userData, std::nullopt, fragment ? std::optional(pixel) : std::nullopt, vertex, memory, floatMode}, target, {0, 0, pushOffset, room}, ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, state.stages.mesh, state.stages.tessellation, {}}};
+        // The translation's key within this device: the request without the device's own target.
+        static const ShaderRecompiler::SpirvTarget keyTarget{};
         std::vector<std::uint64_t> key;
         {
-            auto keyed = request;
-            keyed.context.vertex = vertexKey;
+            const ShaderRecompiler::RecompileRequest keyed{program.binary, {wave, program.firstUserSgpr, program.userData, std::nullopt, fragment ? std::optional(pixel) : std::nullopt, vertexKey, {}, floatMode}, keyTarget, {0, 0, pushOffset, room}, ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, state.stages.mesh, state.stages.tessellation, {}}};
             ShaderRecompiler::BuildPreparedShaderKey(keyed, key);
         }
         key.push_back(program.binary.codeAddress);
@@ -804,15 +933,20 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
                 CaptureNativeRequest(request, key);
                 if (!TranslationCached(request)) job->Compiling();
                 try {
+                    const auto began = std::chrono::steady_clock::now();
                     made.result = std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
                     made.flattened = FlattenedPlan(request, *made.result);
                     made.descriptors = ResolveDescriptors(ClassicRequest(request));
+                    const auto recompiled = std::chrono::steady_clock::now();
                     if (auto* native = Native::NativeDevice::Get(); native != nullptr) {
                         try {
                             static_cast<void>(native->PrebuildGraphicsLibrary(*made.result, own.stage, wave, pushOffset, mesh));
                         } catch (const std::exception&) {
                         }
                     }
+                    const auto ms = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
+                    const auto finished = std::chrono::steady_clock::now();
+                    if (Native::Logs() && ms(began, finished) >= 500.0) std::fprintf(stderr, "[native] slow draw stage %llx (stage %d, %zu SPIR-V words): translate %.0f ms, library %.0f ms\n", static_cast<unsigned long long>(own.binary.codeAddress), static_cast<int>(own.stage), made.result->spirv.size(), ms(began, recompiled), ms(recompiled, finished));
                 } catch (const std::exception& error) {
                     std::string text = error.what();
                     std::replace(text.begin(), text.end(), '\n', '|');
@@ -846,7 +980,15 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
         if (launchOnly) continue;
         {
             const Native::CompileWait waiting;
-            graphics.ready.wait(lock, [&] { return graphics.stages.at(digest).failure != "draw stage still translating"; });
+            const auto translated = [&] { return graphics.stages.at(digest).failure != "draw stage still translating"; };
+            if (Native::CompileWaitLimit().count() == 0) graphics.ready.wait(lock, translated);
+            else if (graphics.stages.at(digest).waitedOut ? !translated() : !graphics.ready.wait_for(lock, Native::CompileWaitNow(), translated)) {
+                graphics.stages.at(digest).waitedOut = true;
+                Native::NoteCompileWaitTimedOut();
+                lock.unlock();
+                CountDrawFallback("draw stage still compiling");
+                return false;
+            }
         }
         found = graphics.stages.find(digest);
         if (!found->second.failure.empty()) {
@@ -855,7 +997,7 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
             CountDrawFallback(failure);
             return false;
         }
-        if (found->second.descriptors != nullptr) {
+        if (found->second.descriptors != nullptr && !SlotDescriptors()) {
             const auto descriptors = found->second.descriptors;
             lock.unlock();
             RegisterSampledDescriptors(request, true, *descriptors, state.colors.empty() ? 0ull : state.colors.front().address, false, &sampled);
@@ -879,6 +1021,10 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
         stage.programAddress = programs[i].binary.codeAddress;
         stage.flattenedSrt = FlattenedSrt(flattenedPlans[i].get(), shader, programs[i].userData, programs[i].binary.codeAddress, stage.slotWords);
         stage.shaderData = ShaderDataFor(shader, offsets[i], programs[i].userData, programs[i].firstUserSgpr, stage.flattenedSrt);
+        for (std::size_t image = 0; image < shader.nativeImageSources.size() && stage.slotWords.size() >= (image + 1) * 8; ++image) {
+            const auto* words = stage.slotWords.data() + image * 8;
+            if (const auto base = (words[0] | (static_cast<std::uint64_t>(words[1] & 0xffu) << 32u)) << 8u; base != 0) sampled.push_back(base);
+        }
         // Fixed-function vertex fetch: the compiled attributes with this draw's buffers.
         if (liveVertex && !shader.vertexAttributes.empty()) {
             for (auto attribute : shader.vertexAttributes) {
@@ -926,6 +1072,163 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
         work.stages.insert(work.stages.begin() + 1, {std::move(control), std::move(evaluation)});
     }
     {
+        // Debug aid: APS5_DEBUG_PS_DATA=<pixel program address> prints, for its first two draws, the
+        // pixel stage's user data and flattened SRT, and 48 floats behind every user-data pointer pair.
+        static const std::uint64_t debugPixel = [] { const char* text = std::getenv("APS5_DEBUG_PS_DATA"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+        // APS5_DEBUG_PS_DATA_TARGET=<color target>: the first pixel program loaded above the eboot
+        // bundles (a course material) drawing into that target from APS5_DEBUG_CS_DATA_AT seconds instead.
+        static const std::uint64_t debugTarget = [] { const char* text = std::getenv("APS5_DEBUG_PS_DATA_TARGET"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+        static const double debugAt = [] { const char* text = std::getenv("APS5_DEBUG_CS_DATA_AT"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto debugStarted = std::chrono::steady_clock::now();
+        static std::uint64_t chosenPixel = 0;
+        static int debugLeft = 2;
+        // APS5_DEBUG_PS_EXPOSURE=<color target>: for each distinct pixel program drawing into it, the
+        // exposure triple its pass block carries (block +0x440), which scales everything it writes.
+        {
+            static const std::uint64_t exposureTarget = [] { const char* text = std::getenv("APS5_DEBUG_PS_EXPOSURE"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+            static std::mutex exposureMutex;
+            static std::set<std::uint64_t> exposureSeen;
+            if (exposureTarget != 0 && !state.colors.empty() && state.colors.front().address == exposureTarget && !programs.empty() && programs.back().stage == Stage::Fragment) {
+                const auto& pixelProgram = programs.back();
+                std::lock_guard lock(exposureMutex);
+                if (exposureSeen.size() < 24 && exposureSeen.insert(pixelProgram.binary.codeAddress).second && pixelProgram.userData.size() >= 2) {
+                    const auto block = pixelProgram.userData[0] | (static_cast<std::uint64_t>(pixelProgram.userData[1] & 0xffffu) << 32u);
+                    float exposure[4] = {-1, -1, -1, -1};
+                    const bool readable = block >= 0x1000000000ull && block <= 0xffffffffffull && GuestMemory::Accessible(reinterpret_cast<const void*>(block + 0x440), 16);
+                    if (readable) std::memcpy(exposure, reinterpret_cast<const void*>(block + 0x440), sizeof(exposure));
+                    std::fprintf(stderr, "[native] ps 0x%llx block 0x%llx exposure %g %g %g (w %g)%s\n", static_cast<unsigned long long>(pixelProgram.binary.codeAddress),
+                        static_cast<unsigned long long>(block), exposure[0], exposure[1], exposure[2], exposure[3], readable ? "" : " (block unreadable)");
+                }
+            }
+        }
+        // Debug experiment: APS5_DEBUG_SKIP_PROGRAM=<code hash,...> drops the draws of those pixel
+        // programs, to see what a pass contributes. Not a fix.
+        {
+            static const std::vector<std::uint64_t> skipped = [] {
+                std::vector<std::uint64_t> values;
+                if (const char* text = std::getenv("APS5_DEBUG_SKIP_PROGRAM")) {
+                    while (*text != '\0') {
+                        char* end = nullptr;
+                        const auto value = std::strtoull(text, &end, 16);
+                        if (end == text) break;
+                        values.push_back(value);
+                        text = *end == ',' ? end + 1 : end;
+                    }
+                }
+                return values;
+            }();
+            if (!skipped.empty() && !programs.empty() && programs.back().stage == Stage::Fragment) {
+                const auto code = programs.back().binary.code;
+                const auto head = code.subspan(0, std::min<std::size_t>(std::size_t{16}, code.size()));
+                if (std::find(skipped.begin(), skipped.end(), ShaderRecompiler::HashBytes(std::as_bytes(head))) != skipped.end()) return true;
+            }
+        }
+        // Debug experiment: APS5_DEBUG_SKIP_DST_ALPHA=<color target> drops the draws into that target
+        // that multiply the destination by the source alpha (blend ZERO, SRC_ALPHA), to see whether
+        // such a pass is what erases the target. Not a fix.
+        {
+            static const std::uint64_t wanted = [] { const char* text = std::getenv("APS5_DEBUG_SKIP_DST_ALPHA"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+            if (wanted != 0 && !state.colors.empty() && state.colors.front().address == wanted && !state.blends.empty()) {
+                const auto& blend = state.blends.front();
+                if (blend.blendEnable && blend.srcColorBlendFactor == VK_BLEND_FACTOR_ZERO && blend.dstColorBlendFactor == VK_BLEND_FACTOR_SRC_ALPHA) {
+                    static std::atomic<int> noted{0};
+                    if (noted.fetch_add(1) < 4) std::fprintf(stderr, "[native] skipping a destination-alpha multiply into 0x%llx (ps 0x%llx)\n", static_cast<unsigned long long>(wanted), static_cast<unsigned long long>(programs.empty() ? 0ull : programs.back().binary.codeAddress));
+                    return true;
+                }
+            }
+        }
+        // APS5_DEBUG_PROGRAM_IDS=1: the identity APS5_PROBE_MARK_ALL writes for each pixel program,
+        // with its address, so a dumped identity map can be read back to programs.
+        {
+            static const bool wantIds = std::getenv("APS5_DEBUG_PROGRAM_IDS") != nullptr;
+            if (wantIds && !programs.empty() && programs.back().stage == Stage::Fragment) {
+                const auto& pixelProgram = programs.back();
+                static std::mutex idMutex;
+                static std::set<std::uint64_t> idSeen;
+                std::lock_guard lock(idMutex);
+                if (idSeen.size() < 400 && idSeen.insert(pixelProgram.binary.codeAddress).second) {
+                    const auto code = pixelProgram.binary.code;
+                    const auto head = code.subspan(0, std::min<std::size_t>(std::size_t{16}, code.size()));
+                    const auto hash = ShaderRecompiler::HashBytes(std::as_bytes(head));
+                    const auto& blend = state.blends.empty() ? Graphics::State{}.blends.emplace_back() : state.blends.front();
+                    std::fprintf(stderr, "[native] program id %llu: ps 0x%llx hash %016llx target 0x%llx mrt0 mask %x blend %d (src %d dst %d op %d) targets %zu depth test %d write %d\n",
+                        static_cast<unsigned long long>(hash & 0x7ffull), static_cast<unsigned long long>(pixelProgram.binary.codeAddress), static_cast<unsigned long long>(hash),
+                        static_cast<unsigned long long>(state.colors.empty() ? 0ull : state.colors.front().address), blend.colorWriteMask, blend.blendEnable ? 1 : 0,
+                        static_cast<int>(blend.srcColorBlendFactor), static_cast<int>(blend.dstColorBlendFactor), static_cast<int>(blend.colorBlendOp),
+                        state.colors.size(), state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0);
+                    std::string mapping;
+                    for (const auto& color : state.colors) {
+                        char item[72];
+                        std::snprintf(item, sizeof(item), " export%u->0x%llx(fmt %d mask %x)", color.exportIndex, static_cast<unsigned long long>(color.address), static_cast<int>(color.format),
+                            color.exportIndex < state.blends.size() ? state.blends[color.exportIndex].colorWriteMask : 0u);
+                        mapping += item;
+                    }
+                    std::fprintf(stderr, "[native]   id %llu targets:%s\n", static_cast<unsigned long long>(hash & 0x7ffull), mapping.c_str());
+                }
+            }
+        }
+        static int seenTarget = 0;
+        if (debugTarget != 0 && !state.colors.empty() && state.colors.front().address == debugTarget && seenTarget < 3) {
+            ++seenTarget;
+            std::fprintf(stderr, "[native] ps data target draw: %zu programs, last stage %d, last program 0x%llx, %.1f s\n", programs.size(), programs.empty() ? -1 : static_cast<int>(programs.back().stage), programs.empty() ? 0ull : static_cast<unsigned long long>(programs.back().binary.codeAddress), std::chrono::duration<double>(std::chrono::steady_clock::now() - debugStarted).count());
+        }
+        if (debugTarget != 0 && chosenPixel == 0 && !programs.empty() && programs.back().stage == Stage::Fragment && !state.colors.empty() && state.colors.front().address == debugTarget && programs.back().binary.codeAddress >= 0x1259000000ull && programs.back().binary.codeAddress < 0x2000000000ull && std::chrono::duration<double>(std::chrono::steady_clock::now() - debugStarted).count() >= debugAt) chosenPixel = programs.back().binary.codeAddress;
+        if ((debugPixel != 0 || chosenPixel != 0) && debugLeft > 0 && !programs.empty() && programs.back().stage == Stage::Fragment && programs.back().binary.codeAddress == (debugPixel != 0 ? debugPixel : chosenPixel)) {
+            --debugLeft;
+            const auto& pixelProgram = programs.back();
+            std::string words;
+            for (const auto word : pixelProgram.userData) {
+                char item[12];
+                std::snprintf(item, sizeof(item), " %08x", word);
+                words += item;
+            }
+            std::fprintf(stderr, "[native] ps 0x%llx user data (first sgpr %u):%s\n", static_cast<unsigned long long>(pixelProgram.binary.codeAddress), pixelProgram.firstUserSgpr, words.c_str());
+            for (const auto& stage : work.stages) {
+                if (stage.stage != Stage::Fragment) continue;
+                std::string flat;
+                for (const auto word : stage.flattenedSrt) {
+                    char item[12];
+                    std::snprintf(item, sizeof(item), " %08x", word);
+                    flat += item;
+                }
+                std::fprintf(stderr, "[native] ps flattened srt (%zu words):%s\n", stage.flattenedSrt.size(), flat.c_str());
+            }
+            for (std::size_t i = 0; i + 1 < pixelProgram.userData.size(); ++i) {
+                const auto address = pixelProgram.userData[i] | (static_cast<std::uint64_t>(pixelProgram.userData[i + 1] & 0xffffu) << 32u);
+                static const int words = [] { const char* text = std::getenv("APS5_DEBUG_PS_DATA_WORDS"); return text != nullptr ? std::max(48, std::atoi(text)) : 48; }();
+                if (address < 0x1000000000ull || address > 0xffffffffffull || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(words) * 4u)) continue;
+                std::string values;
+                for (int k = 0; k < words; ++k) {
+                    std::uint32_t word;
+                    std::memcpy(&word, reinterpret_cast<const void*>(address + k * 4), 4);
+                    char item[16];
+                    std::snprintf(item, sizeof(item), " %08x", word);
+                    values += item;
+                }
+                std::fprintf(stderr, "[native] ps user pointer [%zu] 0x%llx:%s\n", i, static_cast<unsigned long long>(address), values.c_str());
+                // The V#s in the block: up to 64 dwords of each buffer (hex, then the float value).
+                for (int k = 0; k + 3 < 48; k += 4) {
+                    std::array<std::uint32_t, 4> v{};
+                    std::memcpy(v.data(), reinterpret_cast<const void*>(address + k * 4), sizeof(v));
+                    const auto base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xffffu) << 32u);
+                    const auto count = std::min<std::uint32_t>(64u, std::max<std::uint32_t>(1u, ((v[1] >> 16u) & 0x3fffu) * v[2] / 4u));
+                    if (v[2] == 0 || (v[3] & 0xfffu) == 0 || base < 0x1000000000ull || base > 0xffffffffffull || !GuestMemory::Accessible(reinterpret_cast<const void*>(base), count * 4u)) continue;
+                    std::string buffer;
+                    for (std::uint32_t w = 0; w < count; ++w) {
+                        std::uint32_t word;
+                        std::memcpy(&word, reinterpret_cast<const void*>(base + w * 4), 4);
+                        float value;
+                        std::memcpy(&value, &word, 4);
+                        char item[32];
+                        std::snprintf(item, sizeof(item), " %08x(%g)", word, value);
+                        buffer += item;
+                    }
+                    std::fprintf(stderr, "[native]   ps V# at [%zu]+0x%x 0x%llx:%s\n", i, k * 4, static_cast<unsigned long long>(base), buffer.c_str());
+                }
+            }
+        }
+    }
+    {
         // Debug aid: APS5_NATIVE_DRAW_DUMP=<n> prints the first n draws' vertex data and vertex
         // stage user V#s' first words.
         static int left = [] { const char* text = std::getenv("APS5_NATIVE_DRAW_DUMP"); return text != nullptr ? std::atoi(text) : 0; }();
@@ -957,6 +1260,45 @@ bool DrawNatively(QueueState& queue, std::span<const std::uint32_t> packet, bool
     }
     work.sampled = std::move(sampled);
     work.programAddresses = {programs.front().binary.codeAddress, programs.back().stage == Stage::Fragment ? programs.back().binary.codeAddress : 0u};
+    // The vertex fetch folds its base-vertex and base-instance user data into the draw (the
+    // recompiler subtracts them from the vertex and instance index): the draw adds them, as the CP
+    // adds the draw offsets it writes to those SGPRs. An indirect record supplies them instead.
+    const auto& front = programs.front();
+    const auto userWord = [&](std::int32_t sgpr) -> std::optional<std::uint32_t> {
+        if (sgpr < static_cast<std::int32_t>(front.firstUserSgpr)) return std::nullopt;
+        const auto index = static_cast<std::size_t>(sgpr) - front.firstUserSgpr;
+        return index < front.userData.size() ? std::optional(front.userData[index]) : std::nullopt;
+    };
+    const auto& fetch = *results.front();
+    if (draw.indirect) {
+        // The record's vertexOffset and firstInstance reach the shader as the GPU's base vertex and
+        // base instance: correct when the SGPRs the CP would write are the ones the fetch folds.
+        const auto& indirect = *draw.indirect;
+        const auto sgprOf = [&](std::uint32_t location) -> std::int32_t {
+            if (location == 0x280u || location < front.userDataBase) return -1;
+            const auto word = location - front.userDataBase + (8u - front.firstUserSgpr);
+            return word < front.userData.size() ? static_cast<std::int32_t>(front.firstUserSgpr + word) : -1;
+        };
+        const auto vertexSgpr = sgprOf(indirect.baseVertexLocation), instanceSgpr = sgprOf(indirect.startInstanceLocation);
+        const char* unsupported = nullptr;
+        if (!draw.indexed) unsupported = "indirect draw: non-indexed";
+        else if (indirect.recordBytes != 20) unsupported = "indirect draw: record layout";
+        else if (vertexSgpr != fetch.vertexOffsetSgpr) unsupported = "indirect draw: base vertex reaches the shader outside its vertex fetch";
+        else if (instanceSgpr != fetch.instanceOffsetSgpr) unsupported = "indirect draw: start instance reaches the shader outside its vertex fetch";
+        else if (indirect.drawIndexEnabled && sgprOf(indirect.drawIndexLocation) >= 0) unsupported = "indirect draw: draw index";
+        else if (state.stages.mesh || state.stages.tessellation) unsupported = "indirect draw: mesh or tessellation path";
+        if (unsupported != nullptr) {
+            CountDrawFallback(unsupported);
+            return false;
+        }
+        work.indirectArguments = indirect.arguments;
+        work.indirectCount = indirect.count;
+        work.indirectStride = indirect.stride;
+        work.indirectCountAddress = indirect.countIndirect ? indirect.countAddress : 0u;
+    } else {
+        if (fetch.vertexOffsetSgpr >= 0) draw.firstVertex += userWord(fetch.vertexOffsetSgpr).value_or(0u);
+        if (fetch.instanceOffsetSgpr >= 0) draw.firstInstance = userWord(fetch.instanceOffsetSgpr).value_or(0u);
+    }
     work.indexed = draw.indexed;
     work.indexAddress = draw.indexAddress;
     work.indexSize = draw.indexSize;
@@ -1002,9 +1344,11 @@ struct PreparedDispatch {
     bool ready = false;
     std::vector<std::uint32_t> flattenedSrt;
     std::vector<std::uint32_t> slotWords;
+    bool skip = false;
 };
 
 bool RecordPreparedDispatch(PreparedDispatch& prepared) {
+    if (prepared.skip) return true;
     auto* device = Native::NativeDevice::Get();
     std::string failure;
     if (device == nullptr || !device->Dispatch({prepared.result.get(), prepared.key, prepared.groups, prepared.shaderData, prepared.address, prepared.indirectArguments, prepared.flattenedSrt, prepared.slotWords}, failure)) {
@@ -1038,12 +1382,121 @@ bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, 
         CountFallback("unregistered compute program");
         return false;
     }
+    // Debug experiment: APS5_DEBUG_SKIP_DISPATCH=<code hash or address,...> drops those compute
+    // dispatches, to see what a pass contributes to the frame. Not a fix.
+    {
+        static const std::vector<std::uint64_t> skipped = [] {
+            std::vector<std::uint64_t> values;
+            if (const char* text = std::getenv("APS5_DEBUG_SKIP_DISPATCH")) {
+                while (*text != '\0') {
+                    char* end = nullptr;
+                    const auto value = std::strtoull(text, &end, 16);
+                    if (end == text) break;
+                    values.push_back(value);
+                    text = *end == ',' ? end + 1 : end;
+                }
+            }
+            return values;
+        }();
+        if (!skipped.empty() && program.code != nullptr) {
+            const std::span<const std::uint32_t> code{*program.code};
+            const auto head = code.subspan(0, std::min<std::size_t>(std::size_t{16}, code.size()));
+            const auto hash = ShaderRecompiler::HashBytes(std::as_bytes(head));
+            if (std::find(skipped.begin(), skipped.end(), hash) != skipped.end() || std::find(skipped.begin(), skipped.end(), address) != skipped.end()) {
+                static std::mutex skipMutex;
+                static std::set<std::uint64_t> skipSeen;
+                std::lock_guard lock(skipMutex);
+                if (skipSeen.insert(address).second) std::fprintf(stderr, "[native] skipping dispatches of cs 0x%llx (hash %016llx)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(hash));
+                if (prepareOnly != nullptr) {
+                    prepareOnly->skip = true;
+                    prepareOnly->ready = true;
+                }
+                return true;
+            }
+        }
+    }
+    // Debug aid: APS5_DEBUG_CS_DATA=<compute program address> prints, for its first two dispatches
+    // from APS5_DEBUG_CS_DATA_AT seconds, the user data, 64 words behind each user-data pointer, and 32 floats behind each V# found there.
+    {
+        static const std::uint64_t debugCompute = [] { const char* text = std::getenv("APS5_DEBUG_CS_DATA"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+        // APS5_DEBUG_CS_POKE=<program>:<srt byte offset of a V#>:<byte offset>:<word> writes that word into
+        // the buffer before each of the program's dispatches (a debug experiment, not a fix).
+        static const std::array<std::uint64_t, 4> poke = [] {
+            std::array<std::uint64_t, 4> values{};
+            if (const char* text = std::getenv("APS5_DEBUG_CS_POKE")) {
+                char* end = nullptr;
+                for (auto& value : values) {
+                    value = std::strtoull(text, &end, 0);
+                    if (*end != ':') break;
+                    text = end + 1;
+                }
+            }
+            return values;
+        }();
+        if (poke[0] != 0 && address == poke[0]) {
+            const auto srt = DriverDetail::readUserData(queue.shader, 0x24cu) | (static_cast<std::uint64_t>(DriverDetail::readUserData(queue.shader, 0x24du) & 0xffffu) << 32u);
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(srt + poke[1]), 16)) {
+                const auto* v = reinterpret_cast<const std::uint32_t*>(srt + poke[1]);
+                const auto base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xffffu) << 32u);
+                if (GuestMemory::Accessible(reinterpret_cast<const void*>(base + poke[2]), 4)) *reinterpret_cast<std::uint32_t*>(base + poke[2]) = static_cast<std::uint32_t>(poke[3]);
+            }
+        }
+        static std::atomic<int> debugLeft{2};
+        static const double debugAt = [] { const char* text = std::getenv("APS5_DEBUG_CS_DATA_AT"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto debugStarted = std::chrono::steady_clock::now();
+        if (debugCompute != 0 && address == debugCompute && std::chrono::duration<double>(std::chrono::steady_clock::now() - debugStarted).count() >= debugAt && debugLeft.fetch_sub(1) > 0) {
+            std::array<std::uint32_t, 16> user{};
+            std::string words;
+            for (std::uint32_t i = 0; i < user.size(); ++i) {
+                user[i] = DriverDetail::readUserData(queue.shader, 0x240u + i);
+                char item[12];
+                std::snprintf(item, sizeof(item), " %08x", user[i]);
+                words += item;
+            }
+            std::fprintf(stderr, "[native] cs 0x%llx user data:%s\n", static_cast<unsigned long long>(address), words.c_str());
+            const auto dumpFloats = [](const char* label, std::uint64_t at, int count) {
+                if (at < 0x1000000000ull || at > 0xffffffffffull || !GuestMemory::Accessible(reinterpret_cast<const void*>(at), static_cast<std::size_t>(count) * 4u)) return false;
+                std::string values;
+                for (int k = 0; k < count; ++k) {
+                    std::uint32_t word;
+                    std::memcpy(&word, reinterpret_cast<const void*>(at + k * 4), 4);
+                    float value;
+                    std::memcpy(&value, &word, 4);
+                    char item[32];
+                    std::snprintf(item, sizeof(item), " %08x(%g)", word, value);
+                    values += item;
+                }
+                std::fprintf(stderr, "[native]   %s 0x%llx:%s\n", label, static_cast<unsigned long long>(at), values.c_str());
+                return true;
+            };
+            for (std::size_t i = 0; i + 1 < user.size(); ++i) {
+                const auto pointer = user[i] | (static_cast<std::uint64_t>(user[i + 1] & 0xffffu) << 32u);
+                if (!dumpFloats("pointer", pointer, 128)) continue;
+                for (int k = 0; k + 3 < 128; k += 4) {
+                    std::array<std::uint32_t, 4> v{};
+                    std::memcpy(v.data(), reinterpret_cast<const void*>(pointer + k * 4), sizeof(v));
+                    const auto base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xffffu) << 32u);
+                    char label[48];
+                    std::snprintf(label, sizeof(label), "V# at +0x%x", k * 4);
+                    if (v[2] != 0 && (v[3] & 0xfffu) != 0) dumpFloats(label, base, static_cast<int>(std::min<std::uint32_t>(128u, std::max<std::uint32_t>(1u, ((v[1] >> 16u) & 0x3fffu) * v[2] / 4u))));
+                }
+            }
+        }
+    }
     // DCB indirect packets carry an offset from SET_BASE; ACB packets
     // carry address low/high. In both layouts the initiator is last.
     const auto initiator = packet.back();
-    if (indirect && (initiator & 0x20u) != 0) {
-        CountFallback("indirect dispatch of thread counts");
-        return false;
+    // DISPATCH_INDIRECT with thread dimensions: the arguments are thread counts written by earlier
+    // GPU work. They are read once that work has completed, and the dispatch then runs as a direct
+    // thread-count dispatch (partial last groups included). Call-site preparation cannot read them
+    // yet, so that dispatch is resolved when the executor reaches it.
+    std::array<std::uint32_t, 3> indirectThreads{};
+    const bool threadArguments = indirect && (initiator & 0x20u) != 0;
+    if (threadArguments) {
+        if (prepareOnly != nullptr) return false;
+        device->Flush();
+        GuestMemory::Read(Pm4::DispatchArgumentAddress(packet, queue), std::as_writable_bytes(std::span(indirectThreads)), 4);
+        indirect = false;
     }
     const std::uint64_t indirectArguments = indirect ? Pm4::DispatchArgumentAddress(packet, queue) : 0u;
     const auto wave = (initiator & 0x8000u) != 0 ? 32u : 64u;
@@ -1053,7 +1506,7 @@ bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::array<std::uint32_t, 3> partial{};
     const std::array<std::uint32_t, 3> numThreadRegisters{readRegister(queue.shader, 0x207), readRegister(queue.shader, 0x208), readRegister(queue.shader, 0x209)};
     if (!indirect && (initiator & 0x20u) != 0) {
-        const std::array<std::uint32_t, 3> threads{packet[1], packet[2], packet[3]};
+        const std::array<std::uint32_t, 3> threads = threadArguments ? indirectThreads : std::array<std::uint32_t, 3>{packet[1], packet[2], packet[3]};
         for (std::uint32_t axis = 0; axis < 3; ++axis) {
             const auto perGroup = std::max(numThreadRegisters[axis] & 0xffffu, 1u);
             if (threads[axis] % perGroup != 0) partial = threads;
@@ -1099,7 +1552,7 @@ bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, 
             const ShaderRecompiler::ShaderFloatMode floatMode{NativeFloatMode((rsrc1 >> 12u) & 0xffu), ((rsrc1 >> 21u) & 1u) != 0u, ((rsrc1 >> 23u) & 1u) != 0u, ((rsrc1 >> 26u) & 1u) != 0u};
             const auto target = device->ComputeTarget(wave);
             std::thread([program, info, userData, floatMode, target, address, wave, key, trace, decodeFailure, job = std::make_shared<Native::CompileJob>()] {
-                Native::BackgroundSlot slot;
+                Native::BackgroundSlot slot(true);
                 NativeProgram made;
                 made.failure = decodeFailure;
                 if (made.failure.empty()) {
@@ -1120,10 +1573,23 @@ bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, 
                     } catch (const std::exception& error) {
                         std::string text = error.what();
                         if (const auto newline = text.find('\n'); newline != std::string::npos) text.resize(newline);
-                        made.failure = "translation failed: " + text.substr(0, 1500);
+                        char program[48];
+                        std::snprintf(program, sizeof(program), "program 0x%llx: ", static_cast<unsigned long long>(address));
+                        made.failure = "translation failed: " + std::string(program) + text.substr(0, 1500);
                     }
                 }
                 if (trace && Native::Logs()) std::fprintf(stderr, "[native] translated 0x%llx: %s\n", static_cast<unsigned long long>(address), made.failure.empty() ? "ok" : made.failure.c_str());
+                if (made.result != nullptr) {
+                    static const char* directory = std::getenv("APS5_NATIVE_SPV_DIR");
+                    if (directory != nullptr) {
+                        char name[512];
+                        std::snprintf(name, sizeof(name), "%s/compute_%llx.spv", directory, static_cast<unsigned long long>(address));
+                        if (std::FILE* file = std::fopen(name, "wb")) {
+                            std::fwrite(made.result->spirv.data(), 4, made.result->spirv.size(), file);
+                            std::fclose(file);
+                        }
+                    }
+                }
                 auto& compute = Compute();
                 std::lock_guard done(compute.mutex);
                 compute.programs[key] = std::move(made);
@@ -1145,7 +1611,7 @@ bool DispatchNatively(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         result = found->second.result;
         flattened = found->second.flattened;
-        if (found->second.descriptors != nullptr && found->second.classic.has_value()) {
+        if (found->second.descriptors != nullptr && found->second.classic.has_value() && !SlotDescriptors()) {
             auto classic = *found->second.classic;
             const auto descriptors = found->second.descriptors;
             lock.unlock();
@@ -1765,6 +2231,7 @@ std::shared_ptr<void> PrepareFrontEndDraw(QueueState& queue, std::span<const std
     auto prepared = std::make_shared<PreparedDraw>();
     try {
         if (!DrawNatively(queue, packet, false, prepared.get()) || !prepared->ready) return nullptr;
+        prepared->packet.assign(packet.begin(), packet.end());
     } catch (const std::exception& error) {
         Native::ReportGraphicsIssue("draw not prepared at the call site", error.what());
         return nullptr;

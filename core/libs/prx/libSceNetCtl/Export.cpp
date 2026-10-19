@@ -85,6 +85,10 @@ static int UnregisterCallback(NetCtlCallback (&callbacks)[MAX_CALLBACKS], int ci
     return 0;
 }
 
+// Offline, as a console without a network: GT7's online clients (TinyWeb over SSL) assume a
+// connected network can reach its servers, and sceNetConnect refuses stream connects.
+constexpr bool Offline = true;
+
 static bool HostHasAddress(int family) {
 #ifdef _WIN32
     static const int socket_status = [] {
@@ -329,7 +333,7 @@ int APS5_VABI sceNetCtlCheckCallback(void) {
 
 int APS5_VABI sceNetCtlGetIfStat(NetCtlIfStat* stat) {
     if (!stat) return SCE_NET_CTL_ERROR_INVALID_ADDR;
-    if (!HostHasAddress(AF_UNSPEC)) return SCE_NET_CTL_ERROR_NOT_CONNECTED;
+    if (Offline || !HostHasAddress(AF_UNSPEC)) return SCE_NET_CTL_ERROR_NOT_CONNECTED;
     *stat = {};
     HostTraffic(stat->tx_bytes, stat->rx_bytes);
     return 0;
@@ -338,6 +342,7 @@ int APS5_VABI sceNetCtlGetIfStat(NetCtlIfStat* stat) {
 int APS5_VABI sceNetCtlGetInfo(int code, NetCtlInfo* info) {
     if (!info) return SCE_NET_CTL_ERROR_INVALID_ADDR;
     if (code < NET_CTL_INFO_DEVICE || code > NET_CTL_INFO_HTTP_PROXY_PORT) return SCE_NET_CTL_ERROR_INVALID_CODE;
+    if (Offline) return SCE_NET_CTL_ERROR_NOT_CONNECTED;
     HostIpv4Interface host;
     if (!FindHostIpv4Interface(host)) return SCE_NET_CTL_ERROR_NOT_CONNECTED;
     switch (code) {
@@ -374,13 +379,13 @@ int APS5_VABI sceNetCtlGetResult(int event_type, int* error_code) {
 
 int APS5_VABI sceNetCtlGetState(int* state) {
     if (!state) return SCE_NET_CTL_ERROR_INVALID_ADDR;
-    *state = HostHasAddress(AF_UNSPEC) ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED;
+    *state = !Offline && HostHasAddress(AF_UNSPEC) ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED;
     return 0;
 }
 
 int APS5_VABI sceNetCtlGetStateV6(int* state) {
     if (!state) return SCE_NET_CTL_ERROR_INVALID_ADDR;
-    *state = HostHasAddress(AF_INET6) ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED;
+    *state = !Offline && HostHasAddress(AF_INET6) ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED;
     return 0;
 }
 

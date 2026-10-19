@@ -49,6 +49,12 @@ namespace AgcDriver::Native {
 
 namespace {
 
+// Bumped by every GPU mapping change; SyncChangedMappings imports up to it.
+std::atomic<std::uint64_t>& MappingGeneration() {
+    static std::atomic<std::uint64_t> generation{0};
+    return generation;
+}
+
 bool DrawBarriersRequested() {
     static const bool requested = std::getenv("APS5_NATIVE_DRAW_BARRIERS") != nullptr;
     return requested;
@@ -177,6 +183,10 @@ struct NativeDevice::State {
     std::vector<Import> retired;
     std::size_t failedImports = 0;
     std::set<std::pair<std::uint64_t, std::uint64_t>> failed;
+    // Chunks whose import failed whole: they are imported in SplitBytes pieces, so pages the driver
+    // cannot pin cost only their own piece. Failed pieces are retried at each sync.
+    static constexpr std::uint64_t SplitBytes = std::uint64_t{2} << 20u;
+    std::set<std::uint64_t> split;
     std::uint64_t importedBytes = 0;
 
     // Page table: BdaAbi::Header + sorted BdaAbi::Range records, host visible.
@@ -486,7 +496,7 @@ struct NativeDevice::State {
         }
         if (building.insert(key).second) {
             std::thread([this, &shader, key] {
-                BackgroundSlot slot;
+                BackgroundSlot slot(true);
                 std::string reason;
                 std::optional<ComputePipeline> made;
                 try { made = buildPipeline(shader, reason); }
@@ -574,6 +584,7 @@ struct NativeDevice::State {
         if (shader.hostSubgroupSize == 32u) info.stage.pNext = &subgroupSize;
         if (shader.fullSubgroups) info.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
         info.layout = made.layout;
+        if (context.pipelineExecutableInfo) info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
         const auto started = std::chrono::steady_clock::now();
         if (Native::Logs()) std::fprintf(stderr, "[native] building compute pipeline: %zu SPIR-V words, %zu bindings\n", shader.spirv.size(), shader.bindings.size());
         VkResult result;
@@ -589,6 +600,10 @@ struct NativeDevice::State {
             result = Graphics::CreateWithEntryCache(context, entryKey, [&](VkPipelineCache entry) { return vkCreateComputePipelines(vk, entry, 1, &info, nullptr, &made.pipeline); });
         }
         if (Native::Logs()) std::fprintf(stderr, "[native] compute pipeline built in %.0f ms (%d)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), static_cast<int>(result));
+        if (result == VK_SUCCESS && context.pipelineExecutableInfo) {
+            std::fprintf(stderr, "[pipeline-stats] native compute pipeline, %zu SPIR-V words\n", shader.spirv.size());
+            Graphics::LogPipelineStatistics_nid_no_patch(context, made.pipeline);
+        }
         vkDestroyShaderModule(vk, module, nullptr);
         if (result != VK_SUCCESS) {
             failure = "vkCreateComputePipelines " + std::to_string(static_cast<int>(result));
@@ -854,8 +869,20 @@ struct NativeDevice::State {
         return writes;
     }
 
+    // Work recorded into the open batch; the batch is submitted every RecordedPerBatch items so the
+    // GPU runs the frame's earlier passes while later ones are recorded.
+    std::uint32_t recordedInBatch = 0;
+    bool frameScanPending = true;
+    // Graphics pipelines whose build outlasted CompileWaitLimit: their draws are skipped until built.
+    std::set<std::uint64_t> slowGraphics;
+    void noteRecorded() {
+        static const std::uint32_t perBatch = [] { const char* text = std::getenv("APS5_NATIVE_BATCH_WORK"); return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0)) : 192u; }();
+        if (perBatch != 0 && ++recordedInBatch >= perBatch) flushLocked(false);
+    }
+
     void begin() {
         if (recording) return;
+        recordedInBatch = 0;
         auto& slot = slots[current];
         while (slot.submitted) reapOldest(true);
         while (reapOldest(false)) {}
@@ -1181,6 +1208,48 @@ struct NativeDevice::State {
     }
 };
 
+std::vector<std::uint64_t> AddressList(const char* name) {
+    std::vector<std::uint64_t> addresses;
+    if (const char* text = std::getenv(name)) {
+        while (*text) {
+            char* end = nullptr;
+            const auto address = std::strtoull(text, &end, 0);
+            if (end == text) break;
+            addresses.push_back(address);
+            text = *end == ',' ? end + 1 : end;
+        }
+    }
+    return addresses;
+}
+
+template <typename StateType>
+void DumpTargetSurfaces(StateType& s, const std::filesystem::path& root, const std::vector<NativeImages::DrawnTarget>& targets, const std::string& prefix);
+
+// Debug aid: the per-image draw census APS5_DEBUG_TARGET_CENSUS fills, keyed by (target address,
+// VkImage), holding the draw count and the first pixel program that drew into it.
+// Debug aid: draws into the APS5_NATIVE_DUMP_ADDRESSES targets since the last flip, so
+// APS5_DEBUG_DUMP_AT_COUNT can read a target back at chosen points inside one frame.
+std::atomic<std::uint64_t>& FrameTargetDraws() {
+    static std::atomic<std::uint64_t> draws{0};
+    return draws;
+}
+
+// Set at a flip once APS5_NATIVE_DUMP_TARGETS_AT has passed, so a count-based dump always counts
+// from the start of a frame.
+std::atomic<bool>& FrameCountGate() {
+    static std::atomic<bool> open{false};
+    return open;
+}
+
+std::mutex& TargetCensusMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+std::map<std::pair<std::uint64_t, std::uintptr_t>, std::pair<std::uint64_t, std::uint64_t>>& TargetCensus() {
+    static std::map<std::pair<std::uint64_t, std::uintptr_t>, std::pair<std::uint64_t, std::uint64_t>> census;
+    return census;
+}
+
 NativeDevice& NativeDevice::Create(std::shared_ptr<VulkanDevice> driverDevice) {
     std::lock_guard lock(CreateMutex());
     if (auto* existing = device.load()) return *existing;
@@ -1188,6 +1257,8 @@ NativeDevice& NativeDevice::Create(std::shared_ptr<VulkanDevice> driverDevice) {
     device.store(made);
     static const GuestArena::GpuPlacement placement{
         [](std::uintptr_t address, std::size_t bytes) {
+            static const std::vector<std::uint64_t> pools = AddressList("APS5_VIDEO_MEMORY_POOLS");
+            if (!pools.empty() && pools.front() > 1 && std::find(pools.begin(), pools.end(), address) == pools.end()) return false;
             auto* native = NativeDevice::Get();
             return native != nullptr && native->state->placeVideoMemory(address, bytes);
         },
@@ -1273,22 +1344,38 @@ void NativeDevice::SyncGpuMemory() {
     struct Chunk {
         std::uint64_t begin, bytes;
         bool writable;
+        // The registry range the chunk came from (diagnostics).
+        std::uint64_t range = 0, rangeBytes = 0, allocation = 0;
     };
     std::vector<Chunk> wanted;
     {
         const auto lease = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
         for (const auto& range : lease) {
-            if (range == nullptr || !range->gpu || !range->readable || range->bytes == 0) continue;
+            // GPU-only memory (no CPU access, e.g. GT7's tile-mapped textures) is imported too:
+            // `readable` is the CPU's view; the host mapping of GPU memory is always readable.
+            if (range == nullptr || !range->gpu || range->bytes == 0) continue;
             // Committed runs only: reserved pages of heaps the game commits on demand cannot be pinned.
             for (const auto& [runBegin, runEnd] : GuestMemory::CommittedRanges(range->address, range->bytes)) {
                 const auto begin = runBegin & ~(state->importAlignment - 1);
                 const auto end = runEnd & ~(state->importAlignment - 1);
-                for (auto at = begin; at < end; at += State::ChunkBytes) wanted.push_back({at, std::min(State::ChunkBytes, end - at), range->writable});
+                for (auto at = begin; at < end; at += State::ChunkBytes) wanted.push_back({at, std::min(State::ChunkBytes, end - at), range->writable, range->address, range->bytes, range->allocationAddress});
             }
         }
     }
     std::sort(wanted.begin(), wanted.end(), [](const Chunk& a, const Chunk& b) { return a.begin < b.begin; });
     std::unique_lock lock(state->importsMutex);
+    if (!state->split.empty()) {
+        std::vector<Chunk> pieces;
+        for (const auto& chunk : wanted) {
+            if (!state->split.contains(chunk.begin)) {
+                pieces.push_back(chunk);
+                continue;
+            }
+            for (auto at = chunk.begin; at < chunk.begin + chunk.bytes; at += State::SplitBytes) pieces.push_back({at, std::min(State::SplitBytes, chunk.begin + chunk.bytes - at), chunk.writable, chunk.range, chunk.rangeBytes, chunk.allocation});
+        }
+        wanted = std::move(pieces);
+    }
+    state->failed.clear();
     const bool placements = state->takePlacements();
     std::erase_if(wanted, [&](const Chunk& chunk) {
         auto it = state->imports.upper_bound(chunk.begin);
@@ -1298,8 +1385,8 @@ void NativeDevice::SyncGpuMemory() {
     });
     bool changed = placements;
     for (auto it = state->imports.begin(); it != state->imports.end();) {
-        const auto found = std::find_if(wanted.begin(), wanted.end(), [&](const Chunk& chunk) { return chunk.begin == it->second.begin && chunk.begin + chunk.bytes == it->second.end; });
-        if (found != wanted.end() || state->placed.contains(it->first)) {
+        const auto found = std::lower_bound(wanted.begin(), wanted.end(), it->second.begin, [](const Chunk& chunk, std::uint64_t begin) { return chunk.begin < begin; });
+        if ((found != wanted.end() && found->begin == it->second.begin && found->begin + found->bytes == it->second.end) || state->placed.contains(it->first)) {
             ++it;
             continue;
         }
@@ -1309,25 +1396,89 @@ void NativeDevice::SyncGpuMemory() {
         it = state->imports.erase(it);
         changed = true;
     }
+    // Debug aid: APS5_DEBUG_IMPORT_AT=<address> reports whether the registry offers that address and
+    // whether an import covers it after this sync, for memory a texture upload could not read.
+    static const std::uint64_t watchImport = [] { const char* text = std::getenv("APS5_DEBUG_IMPORT_AT"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+    if (watchImport != 0) {
+        static int reports = 0;
+        const auto covering = std::find_if(wanted.begin(), wanted.end(), [&](const Chunk& chunk) { return watchImport >= chunk.begin && watchImport < chunk.begin + chunk.bytes; });
+        if (reports < 12) {
+            ++reports;
+            if (covering == wanted.end()) {
+                const auto after = std::find_if(wanted.begin(), wanted.end(), [&](const Chunk& chunk) { return chunk.begin > watchImport; });
+                std::fprintf(stderr, "[native] import watch 0x%llx: the registry offers no chunk for it (%zu chunks; nearest above 0x%llx)\n", static_cast<unsigned long long>(watchImport), wanted.size(),
+                    static_cast<unsigned long long>(after == wanted.end() ? 0ull : after->begin));
+            } else {
+                std::fprintf(stderr, "[native] import watch 0x%llx: registry chunk 0x%llx+0x%llx writable %d; already imported %d; failed %d\n", static_cast<unsigned long long>(watchImport),
+                    static_cast<unsigned long long>(covering->begin), static_cast<unsigned long long>(covering->bytes), covering->writable ? 1 : 0,
+                    state->imports.count(covering->begin) != 0 ? 1 : 0, state->failed.count({covering->begin, covering->bytes}) != 0 ? 1 : 0);
+            }
+        }
+    }
     for (const auto& chunk : wanted) {
         if (const auto it = state->imports.find(chunk.begin); it != state->imports.end() && it->second.end == chunk.begin + chunk.bytes) continue;
         if (state->failed.count({chunk.begin, chunk.bytes}) != 0) continue;
-        Import made;
-        if (!state->importChunk(chunk.begin, chunk.bytes, chunk.writable, made)) {
-            ++state->failedImports;
-            state->probe("failed import");
-            state->failed.insert({chunk.begin, chunk.bytes});
-            std::fprintf(stderr, "[native] GPU memory 0x%llx+0x%llx could not be imported: %s\n", static_cast<unsigned long long>(chunk.begin), static_cast<unsigned long long>(chunk.bytes), state->lastFailure);
-            continue;
+        const auto import = [&](std::uint64_t begin, std::uint64_t bytes) {
+            Import made;
+            if (!state->importChunk(begin, bytes, chunk.writable, made)) return false;
+            state->imports[begin] = made;
+            state->importedBytes += bytes;
+            changed = true;
+            return true;
+        };
+        if (import(chunk.begin, chunk.bytes)) continue;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> unpinned{{chunk.begin, chunk.bytes}};
+        if (chunk.bytes > State::SplitBytes) {
+            state->split.insert(chunk.begin);
+            unpinned.clear();
+            for (auto at = chunk.begin; at < chunk.begin + chunk.bytes; at += State::SplitBytes) {
+                const auto bytes = std::min(State::SplitBytes, chunk.begin + chunk.bytes - at);
+                if (!import(at, bytes)) unpinned.push_back({at, bytes});
+            }
         }
-        state->imports[chunk.begin] = made;
-        state->importedBytes += chunk.bytes;
-        changed = true;
+        for (const auto& piece : unpinned) {
+            ++state->failedImports;
+            state->failed.insert(piece);
+            static std::set<std::uint64_t> reported;
+            if (!reported.insert(piece.first).second) continue;
+            state->probe("failed import");
+            // The host mapping holding the piece: its kind decides which import path can pin it.
+            std::string mapping = "not in /proc/self/maps";
+            if (std::FILE* maps = std::fopen("/proc/self/maps", "r")) {
+                char line[512];
+                while (std::fgets(line, sizeof(line), maps) != nullptr) {
+                    unsigned long long low = 0, high = 0;
+                    if (std::sscanf(line, "%llx-%llx", &low, &high) == 2 && piece.first >= low && piece.first < high) {
+                        mapping = line;
+                        if (!mapping.empty() && mapping.back() == '\n') mapping.pop_back();
+                        break;
+                    }
+                }
+                std::fclose(maps);
+            }
+            std::fprintf(stderr, "[native] GPU memory 0x%llx+0x%llx could not be imported: %s; mapping %s; registry range 0x%llx+0x%llx (allocation 0x%llx)\n", static_cast<unsigned long long>(piece.first), static_cast<unsigned long long>(piece.second), state->lastFailure, mapping.c_str(), static_cast<unsigned long long>(chunk.range), static_cast<unsigned long long>(chunk.rangeBytes), static_cast<unsigned long long>(chunk.allocation));
+        }
     }
     if (changed || state->table == VK_NULL_HANDLE) state->rebuildTable();
 }
 
+void NativeDevice::SyncChangedMappings() const {
+    static std::mutex syncing;
+    static std::uint64_t synced = 0;
+    if (MappingGeneration().load(std::memory_order_acquire) == synced) return;
+    std::lock_guard lock(syncing);
+    const auto generation = MappingGeneration().load(std::memory_order_acquire);
+    if (generation == synced) return;
+    try {
+        const_cast<NativeDevice*>(this)->SyncGpuMemory();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[native] GPU memory import failed: %s\n", error.what());
+    }
+    synced = generation;
+}
+
 std::uint64_t NativeDevice::DeviceAddress(std::uint64_t address, std::uint64_t bytes) const {
+    SyncChangedMappings();
     std::shared_lock lock(state->importsMutex);
     auto it = state->imports.upper_bound(address);
     if (it == state->imports.begin()) return 0;
@@ -1338,6 +1489,7 @@ std::uint64_t NativeDevice::DeviceAddress(std::uint64_t address, std::uint64_t b
 
 std::uint64_t NativeDevice::DeviceSpan(std::uint64_t address, std::uint64_t& bytes) const {
     bytes = 0;
+    SyncChangedMappings();
     std::shared_lock lock(state->importsMutex);
     auto it = state->imports.upper_bound(address);
     if (it == state->imports.begin()) return 0;
@@ -1353,6 +1505,7 @@ NativeDevice::Statistics NativeDevice::Stats() const {
 }
 
 bool NativeDevice::TransferOnGpu(std::span<const std::uint32_t> packet) {
+    SyncChangedMappings();
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     const auto address = [](std::uint32_t low, std::uint32_t high) { return low | (std::uint64_t{high} << 32u); };
     std::uint64_t destination = 0, source = 0, bytes = 0;
@@ -1430,6 +1583,7 @@ bool NativeDevice::TransferOnGpu(std::span<const std::uint32_t> packet) {
 }
 
 bool NativeDevice::DmaGds(std::span<const std::uint32_t> packet, bool wait) {
+    SyncChangedMappings();
     if (packet.size() < 7) return false;
     const auto source = ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
     const auto destination = ((packet[1] >> 20u) & 3u) | ((packet[6] >> 25u) & 4u) | ((packet[6] >> 26u) & 8u);
@@ -1525,8 +1679,13 @@ struct DrawPhases {
     }
 };
 
+namespace {
+std::uint32_t TexelBytes(VkFormat format);
+}
+
 bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
     auto& s = *state;
+    SyncChangedMappings();
     const auto lockStart = std::chrono::steady_clock::now();
     std::unique_lock lock(s.workMutex);
     s.noteLockWait(lockStart);
@@ -1557,7 +1716,7 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
     s.begin();
     s.endPass();
     {
-        const auto uploads = s.beginTimed("image creation and uploads");
+        const auto uploads = State::GpuTimes() ? s.beginTimed("image creation and uploads") : -1;
         s.queueSlots(shader, work.slotWords);
         s.images->Prepare(s.commands);
         s.endTimed(uploads);
@@ -1569,6 +1728,76 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
         s.writeInvocationAddresses(static_cast<std::byte*>(s.ringMapping) + dataOffset, dataBytes, work.programAddress);
         s.writeSlots(static_cast<std::byte*>(s.ringMapping) + dataOffset, dataBytes, shader, work.slotWords);
         s.ringOffset = dataOffset + dataBytes;
+    }
+    // Debug aid: APS5_DEBUG_PROGRAM_IMAGES=<program address> lists the image slots of that compute
+    // program's first dispatches: T# base, format words, size, and the resolved heap indices.
+    // Debug aid: APS5_DEBUG_DUMP_PROGRAM_IMAGES=<program,...> dumps every image a listed compute
+    // program binds, once per program, at the first flip after APS5_NATIVE_DUMP_TARGETS_AT seconds.
+    {
+        static const std::vector<std::uint64_t> dumpPrograms = AddressList("APS5_DEBUG_DUMP_PROGRAM_IMAGES");
+        static const double dumpAfter = [] { const char* text = std::getenv("APS5_NATIVE_DUMP_TARGETS_AT"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto started = std::chrono::steady_clock::now();
+        static std::set<std::uint64_t> dumpedPrograms;
+        if (!dumpPrograms.empty() && std::find(dumpPrograms.begin(), dumpPrograms.end(), work.programAddress) != dumpPrograms.end() && std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= dumpAfter && dumpedPrograms.insert(work.programAddress).second) {
+            for (std::size_t index = 0; index < shader.nativeImageSources.size() && work.slotWords.size() >= (index + 1) * 8; ++index) {
+                const auto* t = work.slotWords.data() + index * 8;
+                const auto base = (static_cast<std::uint64_t>(t[0]) | (static_cast<std::uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+                if (base != 0) s.requestedDumps.push_back(base);
+                std::fprintf(stderr, "[native] dump request: program 0x%llx image slot %zu base 0x%llx\n", static_cast<unsigned long long>(work.programAddress), index, static_cast<unsigned long long>(base));
+            }
+        }
+    }
+    // Debug aid: APS5_DEBUG_WATCH_IMAGE=<address,...> logs each compute dispatch (program, slot)
+    // binding an image within 256 MB above a listed address (once per program and base), with the time since the first such dispatch.
+    {
+        static const std::vector<std::uint64_t> watched = AddressList("APS5_DEBUG_WATCH_IMAGE");
+        static const auto started = std::chrono::steady_clock::now();
+        static int logged = 0;
+        for (std::size_t index = 0; (!watched.empty() || std::getenv("APS5_DEBUG_WATCH_RANGE") != nullptr) && logged < 400 && index < shader.nativeImageSources.size() && work.slotWords.size() >= (index + 1) * 8; ++index) {
+            const auto* t = work.slotWords.data() + index * 8;
+            const auto base = (static_cast<std::uint64_t>(t[0]) | (static_cast<std::uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+            // APS5_DEBUG_WATCH_IMAGE=<a>,<b>,...: exact bases; a pair written <low>-<high> watches a range.
+            static const std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges = [] {
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> found;
+                if (const char* text = std::getenv("APS5_DEBUG_WATCH_RANGE")) {
+                    char* end = nullptr;
+                    const auto low = std::strtoull(text, &end, 0);
+                    if (*end == '-') found.emplace_back(low, std::strtoull(end + 1, nullptr, 0));
+                }
+                return found;
+            }();
+            const bool inRange = std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return base >= range.first && base < range.second; });
+            if (!inRange && std::none_of(watched.begin(), watched.end(), [&](std::uint64_t first) { return base == first; })) continue;
+            static std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
+            if (!seen.insert({work.programAddress ^ (static_cast<std::uint64_t>(index) << 56u), base}).second && logged > 40) continue;
+            ++logged;
+            std::fprintf(stderr, "[native] watch 0x%llx: dispatch 0x%llx slot %zu groups %ux%ux%u at %.2f s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(work.programAddress), index, work.groups[0], work.groups[1], work.groups[2], std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+        }
+    }
+    // Debug experiment: APS5_DEBUG_SKIP_DISPATCH_TO=<address,...> drops every dispatch that binds an
+    // image at one of those addresses, to see which compute pass owns the content there. Not a fix.
+    {
+        static const std::vector<std::uint64_t> skipTo = AddressList("APS5_DEBUG_SKIP_DISPATCH_TO");
+        for (std::size_t index = 0; !skipTo.empty() && index < shader.nativeImageSources.size() && work.slotWords.size() >= (index + 1) * 8; ++index) {
+            const auto* t = work.slotWords.data() + index * 8;
+            const auto base = (static_cast<std::uint64_t>(t[0]) | (static_cast<std::uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+            if (std::none_of(skipTo.begin(), skipTo.end(), [&](std::uint64_t first) { return base == first; })) continue;
+            static std::set<std::uint64_t> skipSeen;
+            if (skipSeen.insert(work.programAddress).second)
+                std::fprintf(stderr, "[native] skipping dispatches of cs 0x%llx (binds 0x%llx at slot %zu)\n", static_cast<unsigned long long>(work.programAddress), static_cast<unsigned long long>(base), index);
+            return true;
+        }
+    }
+    static const std::uint64_t debugProgram = [] { const char* text = std::getenv("APS5_DEBUG_PROGRAM_IMAGES"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+    static int debugDispatches = 0;
+    if (debugProgram != 0 && work.programAddress == debugProgram && debugDispatches++ < 3) {
+        for (std::size_t index = 0; index < shader.nativeImageSources.size() && work.slotWords.size() >= (index + 1) * 8; ++index) {
+            const auto* t = work.slotWords.data() + index * 8;
+            std::uint32_t sampled = 0, storage = 0;
+            const bool resolved = s.images->ImageIndices(std::span<const std::uint32_t, 8>(t, 8), sampled, storage);
+            const auto base = (static_cast<std::uint64_t>(t[0]) | (static_cast<std::uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+            std::fprintf(stderr, "[native] program 0x%llx image slot %zu: base 0x%llx T# %08x %08x %08x %08x %08x %08x %08x %08x -> sampled %u storage %u resolved %d\n", static_cast<unsigned long long>(work.programAddress), index, static_cast<unsigned long long>(base), t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], sampled, storage, resolved);
+        }
     }
     if (flattened) flatOffset = s.writeFlattenedSrt(work.flattenedSrt, flatBytes);
     std::vector<VkDescriptorBufferInfo> infos;
@@ -1623,14 +1852,14 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
         }
         vkCmdPushConstants(s.commands, pipeline->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 128, push.data());
     }
-    {
+    if (Native::Logs()) {
         char entry[96];
         std::snprintf(entry, sizeof(entry), "dispatch 0x%llx %ux%ux%u", static_cast<unsigned long long>(work.programAddress), work.groups[0], work.groups[1], work.groups[2]);
         s.note(entry);
     }
-    char timedName[64];
-    std::snprintf(timedName, sizeof(timedName), "dispatch 0x%llx", static_cast<unsigned long long>(work.programAddress));
-    const auto timed = s.beginTimed(timedName);
+    char timedName[64] = "";
+    if (State::GpuTimes() || s.tracing) std::snprintf(timedName, sizeof(timedName), "dispatch 0x%llx", static_cast<unsigned long long>(work.programAddress));
+    const auto timed = State::GpuTimes() ? s.beginTimed(timedName) : -1;
     if (s.tracing) {
         char line[256];
         std::snprintf(line, sizeof(line), "%s groups %ux%ux%u%s", timedName, work.groups[0], work.groups[1], work.groups[2], work.indirectArguments != 0 ? " indirect" : "");
@@ -1655,11 +1884,57 @@ bool NativeDevice::Dispatch(const ComputeWork& work, std::string& failure) {
     }
     s.graphicsBarrier = true;
     s.endTimed(timed);
+    s.noteRecorded();
+    // Debug aid: APS5_DEBUG_AFTER_DISPATCH=<program>:<image slot> reads that slot's surfaces back
+    // right after the program's first dispatches from APS5_NATIVE_DUMP_TARGETS_AT seconds and prints
+    // how many texels of level 0, layer 0 are nonzero (written by the dispatch, or not).
+    {
+        static const std::array<std::uint64_t, 2> after = [] {
+            std::array<std::uint64_t, 2> values{};
+            if (const char* text = std::getenv("APS5_DEBUG_AFTER_DISPATCH")) {
+                char* end = nullptr;
+                values[0] = std::strtoull(text, &end, 0);
+                if (*end == ':') values[1] = std::strtoull(end + 1, nullptr, 0);
+            }
+            return values;
+        }();
+        static const double dumpAfter = [] { const char* text = std::getenv("APS5_NATIVE_DUMP_TARGETS_AT"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto started = std::chrono::steady_clock::now();
+        static int checks = 0;
+        if (after[0] != 0 && work.programAddress == after[0] && checks < 4 && work.slotWords.size() >= (after[1] + 1) * 8 && std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= dumpAfter) {
+            ++checks;
+            const auto* t = work.slotWords.data() + after[1] * 8;
+            const auto base = (static_cast<std::uint64_t>(t[0]) | (static_cast<std::uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+            for (const auto& target : s.images->SurfacesAt(base)) {
+                const auto texel = TexelBytes(target.format);
+                if (texel == 0) continue;
+                void* mapping = nullptr;
+                const auto bytes = static_cast<VkDeviceSize>(target.width) * target.height * texel;
+                auto buffer = s.hostBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, mapping);
+                VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                VkBufferImageCopy region{};
+                region.imageSubresource = {static_cast<VkImageAspectFlags>(target.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
+                region.imageExtent = {target.width, target.height, 1};
+                s.context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(s.commands, target.image, VK_IMAGE_LAYOUT_GENERAL, buffer.buffer, 1, &region);
+                s.flushLocked();
+                const auto* words = static_cast<const std::uint32_t*>(mapping);
+                std::size_t nonzero = 0;
+                for (VkDeviceSize i = 0; i < bytes / 4; ++i) nonzero += words[i] != 0;
+                std::fprintf(stderr, "[native] after dispatch 0x%llx (groups %ux%ux%u): slot %llu surface 0x%llx %ux%u VkFormat %d: %zu of %llu dwords nonzero, first %08x\n", static_cast<unsigned long long>(work.programAddress), work.groups[0], work.groups[1], work.groups[2], static_cast<unsigned long long>(after[1]), static_cast<unsigned long long>(base), target.width, target.height, static_cast<int>(target.format), nonzero, static_cast<unsigned long long>(bytes / 4), words[0]);
+                s.context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(s.vk, buffer.buffer, nullptr);
+                s.context.Function<PFN_vkFreeMemory>("vkFreeMemory")(s.vk, buffer.memory, nullptr);
+            }
+        }
+    }
     return true;
 }
 
 bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     auto& s = *state;
+    SyncChangedMappings();
     const auto lockStart = std::chrono::steady_clock::now();
     std::unique_lock lock(s.workMutex);
     s.noteLockWait(lockStart);
@@ -1775,7 +2050,14 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
             }
             {
                 const CompileWait waiting;
-                s.pipelineReady.wait(lock, [&] { return !s.buildingGraphics.contains(hash); });
+                const auto built = [&] { return !s.buildingGraphics.contains(hash); };
+                if (CompileWaitLimit().count() == 0) s.pipelineReady.wait(lock, built);
+                else if (s.slowGraphics.contains(hash) ? !built() : !s.pipelineReady.wait_for(lock, CompileWaitNow(), built)) {
+                    s.slowGraphics.insert(hash);
+                    NoteCompileWaitTimedOut();
+                    failure = "graphics pipeline still compiling";
+                    return false;
+                }
             }
             if (const auto failed = s.failedGraphics.find(hash); failed != s.failedGraphics.end()) {
                 failure = failed->second;
@@ -1792,13 +2074,147 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     if (s.recording && ringBytes != 0 && s.ringOffset + ringBytes + 256 > s.ringBytes) s.flushLocked(false);
     s.begin();
     for (const auto& stage : work.stages) s.queueSlots(*stage.shader, stage.slotWords);
+    // Debug aid: APS5_DEBUG_DUMP_TARGET_IMAGES=<color target,...> logs and dumps (once per base) the
+    // images that draws into a listed color target bind, from APS5_NATIVE_DUMP_TARGETS_AT seconds.
+    {
+        static const std::vector<std::uint64_t> dumpTargets = AddressList("APS5_DEBUG_DUMP_TARGET_IMAGES");
+        static const double dumpAfter = [] { const char* text = std::getenv("APS5_NATIVE_DUMP_TARGETS_AT"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto started = std::chrono::steady_clock::now();
+        static std::set<std::uint64_t> dumpedBases;
+        if (!dumpTargets.empty() && !graphics.colors.empty() && std::find(dumpTargets.begin(), dumpTargets.end(), graphics.colors.front().address) != dumpTargets.end() && dumpedBases.size() < 300 && std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= dumpAfter) {
+            for (const auto& stage : work.stages) {
+                for (std::size_t index = 0; index < stage.shader->nativeImageSources.size() && stage.slotWords.size() >= (index + 1) * 8; ++index) {
+                    const auto* t = stage.slotWords.data() + index * 8;
+                    const auto base = (static_cast<std::uint64_t>(t[0]) | (static_cast<std::uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+                    if (base == 0 || !dumpedBases.insert(base).second) continue;
+                    s.requestedDumps.push_back(base);
+                    std::fprintf(stderr, "[native] draw image: target 0x%llx program 0x%llx (stage %d) slot %zu base 0x%llx T# %08x %08x %08x %08x %08x %08x %08x %08x\n", static_cast<unsigned long long>(graphics.colors.front().address), static_cast<unsigned long long>(stage.programAddress), static_cast<int>(stage.stage), index, static_cast<unsigned long long>(base), t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
+                }
+            }
+        }
+    }
+    // Debug aid: APS5_DEBUG_LOG_DST_ALPHA=<color target> prints the textures bound by each draw into
+    // that target that multiplies the destination by the source alpha, so the texture whose alpha
+    // erases the target can be named.
+    {
+        static const std::uint64_t wanted = [] { const char* text = std::getenv("APS5_DEBUG_LOG_DST_ALPHA"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+        if (wanted != 0 && !graphics.colors.empty() && graphics.colors.front().address == wanted && !graphics.blends.empty() &&
+            graphics.blends.front().blendEnable && graphics.blends.front().srcColorBlendFactor == VK_BLEND_FACTOR_ZERO && graphics.blends.front().dstColorBlendFactor == VK_BLEND_FACTOR_SRC_ALPHA) {
+            static std::mutex alphaMutex;
+            static std::set<std::uint64_t> alphaSeen;
+            std::lock_guard alphaLock(alphaMutex);
+            if (!work.stages.empty() && alphaSeen.insert(work.stages.back().programAddress).second) {
+                for (const auto& stage : work.stages) {
+                    for (std::size_t index = 0; index < stage.shader->nativeImageSources.size() && stage.slotWords.size() >= (index + 1) * 8; ++index) {
+                        const auto* t = stage.slotWords.data() + index * 8;
+                        const auto base = (static_cast<std::uint64_t>(t[0]) | (static_cast<std::uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+                        std::uint32_t sampled = 0, storage = 0;
+                        const bool resolved = s.images->ImageIndices(std::span<const std::uint32_t, 8>(t, 8), sampled, storage);
+                        std::fprintf(stderr, "[native] dst-alpha draw ps 0x%llx stage %d image slot %zu base 0x%llx T# %08x %08x %08x %08x -> sampled %u storage %u resolved %d\n",
+                            static_cast<unsigned long long>(work.stages.back().programAddress), static_cast<int>(stage.stage), index, static_cast<unsigned long long>(base), t[0], t[1], t[2], t[3], sampled, storage, resolved ? 1 : 0);
+                    }
+                }
+            }
+        }
+    }
+    // Debug aid: APS5_DEBUG_DUMP_AT_COUNT=<n,...> writes the APS5_NATIVE_DUMP_ADDRESSES surfaces
+    // before the n-th draw of the frame into one of them, so one frame can be read as a sequence.
+    {
+        static const std::vector<std::uint64_t> atCounts = AddressList("APS5_DEBUG_DUMP_AT_COUNT");
+        static const std::vector<std::uint64_t> named = AddressList("APS5_NATIVE_DUMP_ADDRESSES");
+        static const double countAfter = [] { const char* text = std::getenv("APS5_NATIVE_DUMP_TARGETS_AT"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto countStarted = std::chrono::steady_clock::now();
+        static int countEvents = 0;
+        if (!atCounts.empty() && !named.empty() && !graphics.colors.empty() &&
+            std::find(named.begin(), named.end(), graphics.colors.front().address) != named.end()) {
+            const auto number = FrameTargetDraws().fetch_add(1) + 1;
+            if (countEvents < 6 && std::find(atCounts.begin(), atCounts.end(), number) != atCounts.end() && FrameCountGate().load()) {
+                std::vector<NativeImages::DrawnTarget> surfaces;
+                for (const auto address : named) {
+                    const auto found = s.images->SurfacesAt(address);
+                    surfaces.insert(surfaces.end(), found.begin(), found.end());
+                }
+                const char* directory = std::getenv("APS5_NATIVE_DUMP_DIR");
+                char prefix[32];
+                std::snprintf(prefix, sizeof(prefix), "count%llu_", static_cast<unsigned long long>(number));
+                ++countEvents;
+                std::fprintf(stderr, "[native] frame draw %llu into 0x%llx (ps 0x%llx): dumping\n", static_cast<unsigned long long>(number),
+                    static_cast<unsigned long long>(graphics.colors.front().address), static_cast<unsigned long long>(work.stages.empty() ? 0ull : work.stages.back().programAddress));
+                DumpTargetSurfaces(s, std::filesystem::path(directory != nullptr ? directory : "native-targets"), surfaces, prefix);
+            }
+        }
+    }
+    // Debug aid: APS5_DEBUG_DUMP_AT_PS=<pixel program,...> writes the APS5_NATIVE_DUMP_ADDRESSES
+    // surfaces just before that program's draw, so a target can be read mid-frame instead of at the
+    // flip, where the next frame has already cleared it.
+    {
+        static const std::vector<std::uint64_t> atPs = AddressList("APS5_DEBUG_DUMP_AT_PS");
+        static const std::vector<std::uint64_t> named = AddressList("APS5_NATIVE_DUMP_ADDRESSES");
+        static const double atAfter = [] { const char* text = std::getenv("APS5_NATIVE_DUMP_TARGETS_AT"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto atStarted = std::chrono::steady_clock::now();
+        static int atEvents = 0;
+        if (!atPs.empty() && !named.empty() && atEvents < 3 && !work.stages.empty() && std::find(atPs.begin(), atPs.end(), work.stages.back().programAddress) != atPs.end() &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - atStarted).count() >= atAfter) {
+            std::vector<NativeImages::DrawnTarget> surfaces;
+            for (const auto address : named) {
+                const auto found = s.images->SurfacesAt(address);
+                surfaces.insert(surfaces.end(), found.begin(), found.end());
+            }
+            const char* directory = std::getenv("APS5_NATIVE_DUMP_DIR");
+            char prefix[32];
+            std::snprintf(prefix, sizeof(prefix), "atps%d_", atEvents++);
+            DumpTargetSurfaces(s, std::filesystem::path(directory != nullptr ? directory : "native-targets"), surfaces, prefix);
+        }
+    }
+    // Debug aid: APS5_DEBUG_TARGET_STATE=<address,...> prints, once per pixel program, the whole
+    // color-target and blend state of a draw into one of those targets, so a draw that lands can be
+    // compared with one that does not.
+    {
+        static const std::vector<std::uint64_t> wanted = AddressList("APS5_DEBUG_TARGET_STATE");
+        if (!wanted.empty() && !graphics.colors.empty() && !work.stages.empty()) {
+            const bool hit = std::any_of(graphics.colors.begin(), graphics.colors.end(), [&](const auto& color) { return std::find(wanted.begin(), wanted.end(), color.address) != wanted.end(); });
+            static std::mutex stateMutex;
+            static std::set<std::uint64_t> stateSeen;
+            std::unique_lock stateLock(stateMutex, std::defer_lock);
+            if (hit) stateLock.lock();
+            if (hit && stateSeen.size() < 24 && stateSeen.insert(work.stages.back().programAddress).second) {
+                std::fprintf(stderr, "[native] target state ps 0x%llx: %zu colors, extent %ux%u, scissor %dx%d+%d+%d, samples %u, depth test %d write %d, a2c %d\n",
+                    static_cast<unsigned long long>(work.stages.back().programAddress), graphics.colors.size(), graphics.renderExtent.width, graphics.renderExtent.height,
+                    graphics.scissor.extent.width, graphics.scissor.extent.height, graphics.scissor.offset.x, graphics.scissor.offset.y, graphics.samples,
+                    graphics.depthTest ? 1 : 0, graphics.depthWrite ? 1 : 0, graphics.alphaToCoverage ? 1 : 0);
+                for (std::size_t index = 0; index < graphics.colors.size(); ++index) {
+                    const auto& color = graphics.colors[index];
+                    const auto& blend = index < graphics.blends.size() ? graphics.blends[index] : VkPipelineColorBlendAttachmentState{};
+                    std::fprintf(stderr, "[native]   color %zu: 0x%llx slot %u export %u VkFormat %d guest %u map 0x%x packing %d uint %d extent %ux%u surface 0x%llx %ux%u mip %u/%u slice %u layers %u tile %u dcc 0x%llx cmask 0x%llx fast %d clear %08x %08x | blend %d mask %x src %d dst %d op %d\n",
+                        index, static_cast<unsigned long long>(color.address), color.slot, color.exportIndex, static_cast<int>(color.format), color.guestFormat, color.componentMapping,
+                        static_cast<int>(color.packing), color.uintExport ? 1 : 0, color.extent.width, color.extent.height, static_cast<unsigned long long>(color.surfaceAddress),
+                        color.surfaceExtent.width, color.surfaceExtent.height, color.mip, color.mipCount, color.arraySlice, color.layers, static_cast<unsigned>(color.tileMode),
+                        static_cast<unsigned long long>(color.dccAddress), static_cast<unsigned long long>(color.cmaskAddress), color.cmaskFastClear ? 1 : 0, color.clearWords[0], color.clearWords[1],
+                        blend.blendEnable ? 1 : 0, blend.colorWriteMask, static_cast<int>(blend.srcColorBlendFactor), static_cast<int>(blend.dstColorBlendFactor), static_cast<int>(blend.colorBlendOp));
+                }
+            }
+        }
+    }
     s.images->Prepare(s.commands);
     phases.Mark(2);
     std::vector<VkImageView> views;
+    VkImage firstColorImage = VK_NULL_HANDLE;
     try {
         for (const auto& color : graphics.colors) {
             VkImage image = VK_NULL_HANDLE;
             views.push_back(s.images->TargetView(s.commands, color, image));
+            if (&color == &graphics.colors.front()) firstColorImage = image;
+            // Debug aid: APS5_DEBUG_TARGET_CENSUS=<address,...> counts the draws into each distinct
+            // VkImage at a listed target address, so an aliased target shows up as several images.
+            {
+                static const std::vector<std::uint64_t> census = AddressList("APS5_DEBUG_TARGET_CENSUS");
+                if (!census.empty() && std::find(census.begin(), census.end(), color.address) != census.end() && image != VK_NULL_HANDLE) {
+                    std::lock_guard censusLock(TargetCensusMutex());
+                    auto& entry = TargetCensus()[std::make_pair(color.address, reinterpret_cast<std::uintptr_t>(image))];
+                    ++entry.first;
+                    if (entry.second == 0 && !work.stages.empty()) entry.second = work.stages.back().programAddress;
+                }
+            }
         }
         if (graphics.depth) views.push_back(s.images->DepthView(s.commands, *graphics.depth));
     } catch (const std::exception& error) {
@@ -1809,7 +2225,12 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
         static std::set<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, int, bool, std::size_t>> seen;
         Graphics::ColorTarget none{};
         const auto& color = graphics.colors.empty() ? none : graphics.colors.front();
-        if (seen.size() < 48 && seen.insert({color.address, graphics.renderExtent.width, graphics.renderExtent.height, static_cast<int>(color.format), heap, work.stages.size()}).second) {
+        // APS5_DEBUG_LOG_AFTER=<s> holds this log back until then, so its slots are spent on the frame
+        // of interest instead of the first draws of the run.
+        static const double logAfter = [] { const char* text = std::getenv("APS5_DEBUG_LOG_AFTER"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto logStarted = std::chrono::steady_clock::now();
+        const bool logDue = std::chrono::duration<double>(std::chrono::steady_clock::now() - logStarted).count() >= logAfter;
+        if (logDue && seen.size() < 200 && seen.insert({color.address, graphics.renderExtent.width, graphics.renderExtent.height, static_cast<int>(color.format), heap, work.stages.size()}).second) {
             std::string stages;
             for (const auto& stage : work.stages) {
                 stages += " stage" + std::to_string(static_cast<int>(stage.stage)) + "(push@" + std::to_string(stage.pushOffset) + " data@" + std::to_string(static_cast<int>(stage.shader->pushDataStartDword)) + " roles";
@@ -1823,7 +2244,8 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
                 stages += ")";
             }
             stages += " topology " + std::to_string(static_cast<int>(graphics.topology)) + " rect " + std::to_string(graphics.rectList) + " cull " + std::to_string(static_cast<int>(graphics.cullMode)) + " front " + std::to_string(static_cast<int>(graphics.frontFace)) + " mesh " + std::to_string(graphics.stages.mesh.has_value());
-            if (Native::Logs()) std::fprintf(stderr, "[native] draw into 0x%llx (%zu targets) %ux%u VkFormat %d blend %u mask 0x%x heap %d count %u:%s\n", static_cast<unsigned long long>(color.address), graphics.colors.size(), graphics.renderExtent.width, graphics.renderExtent.height, static_cast<int>(color.format), graphics.blends.empty() ? 0u : graphics.blends.front().blendEnable, graphics.blends.empty() ? 0u : graphics.blends.front().colorWriteMask, heap, work.count, stages.c_str());
+            if (Native::Logs()) std::fprintf(stderr, "[native] draw into 0x%llx image %p ps 0x%llx (%zu targets) %ux%u VkFormat %d blend %u mask 0x%x heap %d count %u:%s\n", static_cast<unsigned long long>(color.address),
+                static_cast<const void*>(firstColorImage), static_cast<unsigned long long>(work.programAddresses[1]), graphics.colors.size(), graphics.renderExtent.width, graphics.renderExtent.height, static_cast<int>(color.format), graphics.blends.empty() ? 0u : graphics.blends.front().blendEnable, graphics.blends.empty() ? 0u : graphics.blends.front().colorWriteMask, heap, work.count, stages.c_str());
         }
     }
     const std::vector<std::shared_ptr<Graphics::StorageTexture>> owners(graphics.colors.size());
@@ -1902,6 +2324,37 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
         indexBuffer = it->second.buffer;
         indexOffset = work.indexAddress - it->second.begin;
     }
+    // Indirect draws: the records (and their count) in the game's imported memory.
+    VkBuffer recordBuffer = VK_NULL_HANDLE, countBuffer = VK_NULL_HANDLE;
+    VkDeviceSize recordOffset = 0, countOffset = 0;
+    if (work.indirectArguments != 0) {
+        std::shared_lock imports(s.importsMutex);
+        const auto locate = [&](std::uint64_t address, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+            auto it = s.imports.upper_bound(address);
+            if (it == s.imports.begin() || address + bytes > std::prev(it)->second.end) return false;
+            --it;
+            buffer = it->second.buffer;
+            offset = address - it->second.begin;
+            return true;
+        };
+        const auto recordBytes = work.indirectCount == 0 ? 0 : static_cast<std::uint64_t>(work.indirectCount - 1) * work.indirectStride + 20u;
+        if (work.indirectCount == 0) return true;
+        if (!locate(work.indirectArguments, recordBytes, recordBuffer, recordOffset) || (work.indirectCountAddress != 0 && !locate(work.indirectCountAddress, 4, countBuffer, countOffset))) {
+            failure = "indirect draw records outside imported memory";
+            return false;
+        }
+        static int traced = 0;
+        if (Native::Logs() && (traced < 24 || (work.programAddresses[0] == 0x128822fe00ull && traced < 200))) {
+            ++traced;
+            std::array<std::uint32_t, 5> record{};
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(work.indirectArguments), 20)) std::memcpy(record.data(), reinterpret_cast<const void*>(work.indirectArguments), 20);
+            std::fprintf(stderr, "[native] indirect draw vs 0x%llx: records 0x%llx x%u stride %u count at 0x%llx; index 0x%llx size %u x%u B; record now {%u %u %u %d %u}\n", static_cast<unsigned long long>(work.programAddresses[0]), static_cast<unsigned long long>(work.indirectArguments), work.indirectCount, work.indirectStride, static_cast<unsigned long long>(work.indirectCountAddress), static_cast<unsigned long long>(work.indexAddress), work.count, work.indexSize, record[0], record[1], record[2], static_cast<std::int32_t>(record[3]), record[4]);
+        }
+        if ((work.indirectCount > 1 && !s.context.multiDrawIndirect) || (countBuffer != VK_NULL_HANDLE && !s.context.drawIndirectCount)) {
+            failure = "indirect draw needs multiDrawIndirect / drawIndirectCount";
+            return false;
+        }
+    }
     std::uint32_t meshGroups = 0;
     if (graphics.stages.mesh) {
         const auto& mesh = *graphics.stages.mesh;
@@ -1930,7 +2383,7 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barrier.srcAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     if (barrierNeeded) {
         vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
         s.graphicsBarrier = false;
@@ -1946,7 +2399,12 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     std::int32_t query = -1;
     {
         static const std::uint32_t wanted = [] { const char* text = std::getenv("APS5_NATIVE_DRAW_STATS"); return text != nullptr ? static_cast<std::uint32_t>(std::atoi(text)) : 0u; }();
-        if (s.statistics == VK_NULL_HANDLE && wanted != 0) {
+        // APS5_NATIVE_DRAW_STATS_AT=<s>: start measuring then, so the queries land on the frame of
+        // interest instead of the first draws of the run.
+        static const double statsAt = [] { const char* text = std::getenv("APS5_NATIVE_DRAW_STATS_AT"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto statsStarted = std::chrono::steady_clock::now();
+        const bool statsDue = std::chrono::duration<double>(std::chrono::steady_clock::now() - statsStarted).count() >= statsAt;
+        if (s.statistics == VK_NULL_HANDLE && wanted != 0 && statsDue) {
             VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
             info.queryCount = 64;
@@ -1954,33 +2412,69 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
             if (s.context.Function<PFN_vkCreateQueryPool>("vkCreateQueryPool")(s.vk, &info, nullptr, &s.statistics) == VK_SUCCESS) s.statisticsLeft = wanted;
         }
         static const std::uint64_t statisticsProgram = [] { const char* text = std::getenv("APS5_NATIVE_DRAW_STATS_PS"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
-        if (s.statisticsLeft != 0 && s.statisticsUsed < 64 && (statisticsProgram == 0 || work.programAddresses[1] == statisticsProgram)) {
+        if (statsDue && s.statisticsLeft != 0 && s.statisticsUsed < 64 && (statisticsProgram == 0 || work.programAddresses[1] == statisticsProgram)) {
             s.endPass();
             --s.statisticsLeft;
             query = static_cast<std::int32_t>(s.statisticsUsed++);
-            char name[96];
-            std::snprintf(name, sizeof(name), "0x%llx count %u heap %d depth %d", static_cast<unsigned long long>(graphics.colors.empty() ? 0ull : graphics.colors.front().address), work.count, heap, graphics.depth.has_value());
+            char name[256];
+            std::snprintf(name, sizeof(name), "ps 0x%llx target 0x%llx count %u heap %d depth 0x%llx test %d write %d op %d clear %g bounds %d [%g %g] stencil %d (front op %d ref %u mask %x) cull %d front %d", static_cast<unsigned long long>(work.programAddresses[1]), static_cast<unsigned long long>(graphics.colors.empty() ? 0ull : graphics.colors.front().address), work.count, heap,
+                static_cast<unsigned long long>(graphics.depth ? graphics.depth->address : 0ull), graphics.depthTest, graphics.depthWrite, static_cast<int>(graphics.depthCompare), graphics.depth ? graphics.depth->clearDepth : -1.0f, graphics.depthBoundsTest, graphics.minDepthBounds, graphics.maxDepthBounds,
+                graphics.stencilTest, static_cast<int>(graphics.stencilFront.compareOp), graphics.stencilFront.reference, graphics.stencilFront.compareMask, static_cast<int>(graphics.cullMode), static_cast<int>(graphics.frontFace));
             s.statisticsNames.push_back(name);
             s.context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(s.commands, s.statistics, static_cast<std::uint32_t>(query), 1);
         }
     }
-    char timedName[96];
-    std::snprintf(timedName, sizeof(timedName), "draw vs 0x%llx ps 0x%llx %ux%u", static_cast<unsigned long long>(work.programAddresses[0]), static_cast<unsigned long long>(work.programAddresses[1]), graphics.renderExtent.width, graphics.renderExtent.height);
+    char timedName[96] = "";
+    if (State::GpuTimes() || s.tracing) std::snprintf(timedName, sizeof(timedName), "draw vs 0x%llx ps 0x%llx %ux%u", static_cast<unsigned long long>(work.programAddresses[0]), static_cast<unsigned long long>(work.programAddresses[1]), graphics.renderExtent.width, graphics.renderExtent.height);
     if (s.tracing) {
         char line[256];
         std::snprintf(line, sizeof(line), "%s target 0x%llx VkFormat %d count %u x%u heap %d depth %d", timedName, static_cast<unsigned long long>(graphics.colors.empty() ? 0ull : graphics.colors.front().address), static_cast<int>(graphics.colors.empty() ? VK_FORMAT_UNDEFINED : graphics.colors.front().format), work.count, work.instances, static_cast<int>(heap), static_cast<int>(graphics.depth.has_value()));
         s.frameTrace.emplace_back(line);
+    }
+    if (s.context.pipelineExecutableInfo) {
+        static std::set<VkPipeline> reported;
+        if (const auto handle = pipeline->BoundHandle(); reported.insert(handle).second) {
+            std::fprintf(stderr, "[pipeline-stats] native graphics pipeline vs 0x%llx ps 0x%llx %ux%u%s\n", static_cast<unsigned long long>(work.programAddresses[0]), static_cast<unsigned long long>(work.programAddresses[1]), graphics.renderExtent.width, graphics.renderExtent.height, handle == pipeline->BoundHandle() ? "" : "");
+            Graphics::LogPipelineStatistics_nid_no_patch(s.context, handle);
+        }
     }
     auto passKey = pipeline->PassKey(*framebuffer, graphics.renderExtent, graphics);
     if (s.passOpen && !passKey.empty() && passKey == s.passKey) {
         pipeline->Continue(s.commands, graphics);
     } else {
         s.endPass();
-        s.passTimed = s.beginTimed(std::string("pass from ") + timedName);
+        s.passTimed = State::GpuTimes() ? s.beginTimed(std::string("pass from ") + timedName) : -1;
         pipeline->Begin(s.commands, *framebuffer, graphics.renderExtent, graphics);
         ++s.barrierCounts[5];
         s.passOpen = true;
         s.passKey = std::move(passKey);
+    }
+    // Debug experiment: APS5_DEBUG_CLEAR_TARGET=<address> clears attachment 0 to a bright red inside
+    // the pass of every draw whose first color target is that address and that writes at least
+    // APS5_DEBUG_CLEAR_TARGETS colors, to show whether attachment 0 reaches the image the dump
+    // reads. Not a fix.
+    {
+        static const std::vector<std::uint64_t> clearTargets = AddressList("APS5_DEBUG_CLEAR_TARGET");
+        static const std::size_t clearColors = [] { const char* text = std::getenv("APS5_DEBUG_CLEAR_TARGETS"); return text != nullptr ? static_cast<std::size_t>(std::strtoul(text, nullptr, 0)) : 4u; }();
+        static const double clearAfter = [] { const char* text = std::getenv("APS5_NATIVE_DUMP_TARGETS_AT"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto clearStarted = std::chrono::steady_clock::now();
+        if (!clearTargets.empty() && !graphics.colors.empty() && graphics.colors.size() >= clearColors &&
+            std::find(clearTargets.begin(), clearTargets.end(), graphics.colors.front().address) != clearTargets.end() &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - clearStarted).count() >= clearAfter) {
+            VkClearAttachment attachment{};
+            attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            attachment.colorAttachment = 0;
+            attachment.clearValue.color.float32[0] = 0.5f;
+            attachment.clearValue.color.float32[3] = 1.0f;
+            VkClearRect rect{};
+            rect.rect.extent = graphics.renderExtent;
+            rect.layerCount = 1;
+            s.context.Function<PFN_vkCmdClearAttachments>("vkCmdClearAttachments")(s.commands, 1, &attachment, 1, &rect);
+            static int cleared = 0;
+            if (cleared++ < 8)
+                std::fprintf(stderr, "[native] debug clear of attachment 0 (0x%llx, %zu colors, %ux%u) in the pass of ps 0x%llx\n", static_cast<unsigned long long>(graphics.colors.front().address),
+                    graphics.colors.size(), graphics.renderExtent.width, graphics.renderExtent.height, static_cast<unsigned long long>(work.programAddresses[1]));
+        }
     }
     if (query >= 0) s.context.Function<PFN_vkCmdBeginQuery>("vkCmdBeginQuery")(s.commands, s.statistics, static_cast<std::uint32_t>(query), 0);
     if (!writes.empty()) vkCmdPushDescriptorSetKHR(s.commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), 0, static_cast<std::uint32_t>(writes.size()), writes.data());
@@ -1991,7 +2485,7 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     VkShaderStageFlags pushStages = 0;
     for (const auto& stage : work.stages) pushStages |= Graphics::VulkanStage(stage.stage);
     pipeline->PushConstants(s.commands, pushStages, block);
-    {
+    if (Native::Logs()) {
         char entry[128];
         std::snprintf(entry, sizeof(entry), "draw vs 0x%llx ps 0x%llx count %u x%u%s", static_cast<unsigned long long>(work.programAddresses[0]), static_cast<unsigned long long>(work.programAddresses[1]), work.count, work.instances, graphics.stages.mesh ? " mesh" : "");
         s.note(entry);
@@ -2001,13 +2495,16 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
     } else if (work.indexed) {
         if (!vertexBuffers.empty()) s.context.Function<PFN_vkCmdBindVertexBuffers>("vkCmdBindVertexBuffers")(s.commands, 0, static_cast<std::uint32_t>(vertexBuffers.size()), vertexBuffers.data(), vertexOffsets.data());
         s.context.Function<PFN_vkCmdBindIndexBuffer>("vkCmdBindIndexBuffer")(s.commands, indexBuffer, indexOffset, work.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-        s.context.Function<PFN_vkCmdDrawIndexed>("vkCmdDrawIndexed")(s.commands, work.count, work.instances, 0, static_cast<std::int32_t>(work.firstVertex), work.firstInstance);
+        if (countBuffer != VK_NULL_HANDLE) s.context.Function<PFN_vkCmdDrawIndexedIndirectCount>("vkCmdDrawIndexedIndirectCount")(s.commands, recordBuffer, recordOffset, countBuffer, countOffset, work.indirectCount, work.indirectStride);
+        else if (recordBuffer != VK_NULL_HANDLE) s.context.Function<PFN_vkCmdDrawIndexedIndirect>("vkCmdDrawIndexedIndirect")(s.commands, recordBuffer, recordOffset, work.indirectCount, work.indirectStride);
+        else s.context.Function<PFN_vkCmdDrawIndexed>("vkCmdDrawIndexed")(s.commands, work.count, work.instances, 0, static_cast<std::int32_t>(work.firstVertex), work.firstInstance);
     } else {
         if (!vertexBuffers.empty()) s.context.Function<PFN_vkCmdBindVertexBuffers>("vkCmdBindVertexBuffers")(s.commands, 0, static_cast<std::uint32_t>(vertexBuffers.size()), vertexBuffers.data(), vertexOffsets.data());
         s.context.Function<PFN_vkCmdDraw>("vkCmdDraw")(s.commands, work.count, work.instances, work.firstVertex, work.firstInstance);
     }
     if (query >= 0) s.context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(s.commands, s.statistics, static_cast<std::uint32_t>(query));
     if (query >= 0 || s.passKey.empty()) s.endPass();
+    s.noteRecorded();
     phases.Mark(3);
     return true;
 }
@@ -2016,7 +2513,9 @@ namespace {
 
 std::uint32_t TexelBytes(VkFormat format) {
     switch (format) {
-        case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_UINT: return 1;
+        case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_S8_UINT: return 1;
+        case VK_FORMAT_D16_UNORM: case VK_FORMAT_D16_UNORM_S8_UINT: return 2;
+        case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_D32_SFLOAT_S8_UINT: case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_D24_UNORM_S8_UINT: return 4;
         case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_UINT: return 2;
         case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
         case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
@@ -2035,32 +2534,10 @@ std::uint32_t TexelBytes(VkFormat format) {
 
 }
 
-void NativeDevice::NoteFlip() {
-    static const double dumpAt = [] { const char* text = std::getenv("APS5_NATIVE_DUMP_TARGETS_AT"); return text != nullptr ? std::atof(text) : -1.0; }();
-    static const std::vector<std::uint64_t> named = [] {
-        std::vector<std::uint64_t> addresses;
-        if (const char* text = std::getenv("APS5_NATIVE_DUMP_ADDRESSES")) {
-            while (*text) {
-                char* end = nullptr;
-                const auto address = std::strtoull(text, &end, 0);
-                if (end == text) break;
-                addresses.push_back(address);
-                text = *end == ',' ? end + 1 : end;
-            }
-        }
-        return addresses;
-    }();
-    static const auto started = std::chrono::steady_clock::now();
-    static std::uint64_t frameStart = 0;
-    static bool dumped = false;
-    static int namedEvents = 0;
-    auto& s = *state;
-    std::lock_guard lock(s.workMutex);
-    const auto previous = frameStart;
-    frameStart = s.images->DrawSerial();
-    const char* directory = std::getenv("APS5_NATIVE_DUMP_DIR");
-    const std::filesystem::path root = directory != nullptr ? directory : "native-targets";
-    const auto dumpSurfaces = [&](const std::vector<NativeImages::DrawnTarget>& targets, const std::string& prefix) {
+// Copies the listed targets into host buffers and writes them next to the frame trace. Used both
+// by the flip-time dump and by the mid-frame dump APS5_DEBUG_DUMP_AT_PS asks for.
+template <typename StateType>
+void DumpTargetSurfaces(StateType& s, const std::filesystem::path& root, const std::vector<NativeImages::DrawnTarget>& targets, const std::string& prefix) {
         std::filesystem::create_directories(root);
         struct Pending {
             NativeImages::DrawnTarget target;
@@ -2085,31 +2562,85 @@ void NativeDevice::NoteFlip() {
             entry.target = target;
             const bool blocks = target.format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && target.format <= VK_FORMAT_BC7_SRGB_BLOCK;
             entry.bytes = blocks ? static_cast<std::size_t>((target.width + 3u) / 4u) * ((target.height + 3u) / 4u) * texel : static_cast<std::size_t>(target.width) * target.height * texel;
-            entry.buffer = s.hostBuffer(entry.bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, entry.mapping);
+            try {
+                entry.buffer = s.hostBuffer(entry.bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, entry.mapping);
+            } catch (const std::exception& error) {
+                // A diagnostic: a target that cannot be staged is left out, the game keeps running.
+                std::fprintf(stderr, "[native] target dump: 0x%llx (%zu bytes) not dumped: %s\n", static_cast<unsigned long long>(target.address), entry.bytes, error.what());
+                continue;
+            }
             VkBufferImageCopy region{};
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageSubresource = {static_cast<VkImageAspectFlags>(target.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
             region.imageExtent = {target.width, target.height, 1};
-            s.context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(s.commands, target.image, VK_IMAGE_LAYOUT_GENERAL, entry.buffer.buffer, 1, &region);
+            s.context.template Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(s.commands, target.image, VK_IMAGE_LAYOUT_GENERAL, entry.buffer.buffer, 1, &region);
             pending.push_back(std::move(entry));
         }
         s.flushLocked();
         for (const auto& entry : pending) {
             char name[192];
-            std::snprintf(name, sizeof(name), "%starget_%012llx_%ux%u_f%d_d%llu.bin", prefix.c_str(), static_cast<unsigned long long>(entry.target.address), entry.target.width, entry.target.height, static_cast<int>(entry.target.format), static_cast<unsigned long long>(entry.target.drawn));
+            {
+                std::lock_guard censusLock(TargetCensusMutex());
+                for (const auto& [key, value] : TargetCensus())
+                    std::fprintf(stderr, "[native] target census 0x%llx image %p: %llu draws, first ps 0x%llx\n", static_cast<unsigned long long>(key.first), reinterpret_cast<const void*>(key.second),
+                        static_cast<unsigned long long>(value.first), static_cast<unsigned long long>(value.second));
+            }
+            std::fprintf(stderr, "[native] dump surface 0x%llx image %p %ux%u VkFormat %d drawn %llu\n", static_cast<unsigned long long>(entry.target.address), static_cast<const void*>(entry.target.image),
+                entry.target.width, entry.target.height, static_cast<int>(entry.target.format), static_cast<unsigned long long>(entry.target.drawn));
+            std::snprintf(name, sizeof(name), "%s%s_%012llx_%ux%u_f%d_d%llu.bin", prefix.c_str(), entry.target.depth ? "depth" : "target", static_cast<unsigned long long>(entry.target.address), entry.target.width, entry.target.height, static_cast<int>(entry.target.format), static_cast<unsigned long long>(entry.target.drawn));
             std::ofstream file(root / name, std::ios::binary);
             file.write(static_cast<const char*>(entry.mapping), static_cast<std::streamsize>(entry.bytes));
             if (entry.target.guestBytes != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(entry.target.address), entry.target.guestBytes)) {
                 std::snprintf(name, sizeof(name), "%sguest_%012llx_%ux%u_fmt%u_tile%u.bin", prefix.c_str(), static_cast<unsigned long long>(entry.target.address), entry.target.width, entry.target.height, entry.target.guestFormat, entry.target.tileMode);
                 std::ofstream(root / name, std::ios::binary).write(reinterpret_cast<const char*>(entry.target.address), static_cast<std::streamsize>(entry.target.guestBytes));
             }
-            s.context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(s.vk, entry.buffer.buffer, nullptr);
-            s.context.Function<PFN_vkFreeMemory>("vkFreeMemory")(s.vk, entry.buffer.memory, nullptr);
+            s.context.template Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(s.vk, entry.buffer.buffer, nullptr);
+            s.context.template Function<PFN_vkFreeMemory>("vkFreeMemory")(s.vk, entry.buffer.memory, nullptr);
         }
         std::fprintf(stderr, "[native] target dump: %zu surfaces written to %s (%s)\n", pending.size(), root.string().c_str(), prefix.c_str());
-    };
+    }
+
+void NativeDevice::NoteFlip() {
+    FrameTargetDraws().store(0);
+    {
+        static const double countAfter = [] { const char* text = std::getenv("APS5_NATIVE_DUMP_TARGETS_AT"); return text != nullptr ? std::atof(text) : 0.0; }();
+        static const auto countStarted = std::chrono::steady_clock::now();
+        FrameCountGate().store(std::chrono::duration<double>(std::chrono::steady_clock::now() - countStarted).count() >= countAfter);
+    }
+    {
+        std::lock_guard lock(state->workMutex);
+        state->frameScanPending = true;
+    }
+    static const double dumpAt = [] { const char* text = std::getenv("APS5_NATIVE_DUMP_TARGETS_AT"); return text != nullptr ? std::atof(text) : -1.0; }();
+    static const std::vector<std::uint64_t> named = [] {
+        std::vector<std::uint64_t> addresses;
+        if (const char* text = std::getenv("APS5_NATIVE_DUMP_ADDRESSES")) {
+            while (*text) {
+                char* end = nullptr;
+                const auto address = std::strtoull(text, &end, 0);
+                if (end == text) break;
+                addresses.push_back(address);
+                text = *end == ',' ? end + 1 : end;
+            }
+        }
+        return addresses;
+    }();
+    static const auto started = std::chrono::steady_clock::now();
+    static std::uint64_t frameStart = 0;
+    static bool dumped = false;
+    static int namedEvents = 0;
+    auto& s = *state;
+    std::lock_guard lock(s.workMutex);
+    const auto previous = frameStart;
+    frameStart = s.images->DrawSerial();
+    const char* directory = std::getenv("APS5_NATIVE_DUMP_DIR");
+    const std::filesystem::path root = directory != nullptr ? directory : "native-targets";
+    const auto dumpSurfaces = [&](const std::vector<NativeImages::DrawnTarget>& targets, const std::string& prefix) { DumpTargetSurfaces(s, root, targets, prefix); };
     if (!named.empty() && namedEvents < 4) {
         bool hit = dumpAt >= 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= dumpAt + 10.0 * namedEvents;
-        for (const auto& target : s.images->DrawnTargets(previous)) hit = hit || std::find(named.begin(), named.end(), target.address) != named.end();
+        // With a dump time the named surfaces are dumped by time alone (every 10 s from it).
+        if (dumpAt < 0) {
+            for (const auto& target : s.images->DrawnTargets(previous)) hit = hit || std::find(named.begin(), named.end(), target.address) != named.end();
+        }
         if (hit) {
             std::vector<NativeImages::DrawnTarget> surfaces;
             for (const auto address : named) {
@@ -2119,6 +2650,51 @@ void NativeDevice::NoteFlip() {
             char prefix[32];
             std::snprintf(prefix, sizeof(prefix), "named%d_", namedEvents++);
             dumpSurfaces(surfaces, prefix);
+        }
+    }
+    // Debug aid: APS5_DEBUG_ZERO_SURFACES=<seconds> reads every storage surface back once at that
+    // time and lists the ones whose level 0, layer 0 is entirely zero (compute output that never
+    // landed, or inputs nothing produced).
+    {
+        static const double surveyAt = [] { const char* text = std::getenv("APS5_DEBUG_ZERO_SURFACES"); return text != nullptr ? std::atof(text) : -1.0; }();
+        static bool surveyed = false;
+        if (surveyAt >= 0 && !surveyed && std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= surveyAt) {
+            surveyed = true;
+            std::size_t zero = 0, total = 0;
+            for (const auto& target : s.images->StorageSurfaces()) {
+                const auto texel = TexelBytes(target.format);
+                const auto bytes = static_cast<VkDeviceSize>(target.width) * target.height * texel;
+                if (texel == 0 || bytes > (64u << 20)) continue;
+                void* mapping = nullptr;
+                Import buffer;
+                try {
+                    buffer = s.hostBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, mapping);
+                } catch (const std::exception&) {
+                    continue;
+                }
+                s.begin();
+                s.endPass();
+                VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                vkCmdPipelineBarrier(s.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                VkBufferImageCopy region{};
+                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                region.imageExtent = {target.width, target.height, 1};
+                s.context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(s.commands, target.image, VK_IMAGE_LAYOUT_GENERAL, buffer.buffer, 1, &region);
+                s.flushLocked();
+                const auto* words = static_cast<const std::uint8_t*>(mapping);
+                bool any = false;
+                for (VkDeviceSize i = 0; i < bytes && !any; ++i) any = words[i] != 0;
+                ++total;
+                if (!any) {
+                    ++zero;
+                    std::fprintf(stderr, "[native] zero surface: 0x%llx %ux%u guest format %u VkFormat %d tile %u drawn %llu\n", static_cast<unsigned long long>(target.address), target.width, target.height, target.guestFormat, static_cast<int>(target.format), target.tileMode, static_cast<unsigned long long>(target.drawn));
+                }
+                s.context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(s.vk, buffer.buffer, nullptr);
+                s.context.Function<PFN_vkFreeMemory>("vkFreeMemory")(s.vk, buffer.memory, nullptr);
+            }
+            std::fprintf(stderr, "[native] zero surface survey: %zu of %zu storage surfaces are zero\n", zero, total);
         }
     }
     if (!s.requestedDumps.empty()) {
@@ -2172,7 +2748,10 @@ bool NativeDevice::TextureRegistered(std::span<const std::uint32_t, 8> words) {
 }
 
 void NativeDevice::NoteSubmission() {
+    // GT7 writes a frame's CPU data before submitting the frame, which follows the previous flip:
+    // texture memory is checked for CPU writes once per frame, at its first submission.
     std::lock_guard lock(state->workMutex);
+    if (!std::exchange(state->frameScanPending, false)) return;
     state->images->NewBatch();
 }
 
@@ -2320,13 +2899,9 @@ ShaderRecompiler::SpirvTarget NativeDevice::ComputeTarget(std::uint32_t waveSize
 }
 
 void NoteGpuMappingsChanged() {
-    if (auto* current = NativeDevice::Get()) {
-        try {
-            current->SyncGpuMemory();
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "[native] GPU memory import failed: %s\n", error.what());
-        }
-    }
+    // The game maps memory in bursts while it loads: each change is noted, and the imports and page
+    // table are brought up to date once, before the next GPU work that can see them.
+    MappingGeneration().fetch_add(1, std::memory_order_acq_rel);
 }
 
 }

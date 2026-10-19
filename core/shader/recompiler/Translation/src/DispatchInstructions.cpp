@@ -64,6 +64,7 @@ void TranslationContext::TranslateInstruction(const RdnaInstruction& decoded) {
         throw std::runtime_error("opcode has no IR translation at pc " + std::to_string(instruction.programCounter));
     }
     if (const DebugProbe probe = DebugProbeConfig(); probe.enabled && instruction.programCounter == probe.programCounter) {
+        program.Metadata().probeRegister = 255u;
         RdnaOperand source{};
         source.kind = RdnaOperandKind::VectorRegister;
         source.reg = probe.vgpr;
@@ -84,6 +85,34 @@ void SetDebugProbeActive(bool active) {
 
 bool DebugProbeActive() {
     return g_debugProbeActive.load();
+}
+
+namespace {
+thread_local std::uint64_t g_probeProgramHash = 0;
+}
+
+std::uint64_t DebugProbeCodeHash() {
+    static const std::uint64_t wanted = [] {
+        const char* text = std::getenv("APS5_PROBE_CODE");
+        return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+    }();
+    return wanted;
+}
+
+void SetDebugProbeProgramHash(std::uint64_t hash) {
+    g_probeProgramHash = hash;
+}
+
+std::uint64_t DebugProbeProgramHash() {
+    return g_probeProgramHash;
+}
+
+std::uint32_t DebugProbeMarkAllTarget() {
+    static const std::uint32_t target = [] {
+        const char* text = std::getenv("APS5_PROBE_MARK_ALL");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 0x100u;
+    }();
+    return target;
 }
 
 bool RayTracingStrict() {
@@ -112,11 +141,19 @@ DebugProbe DebugProbeConfig() {
         if (end == nullptr || *end != ':') return result;
         result.vgpr = static_cast<std::uint32_t>(std::strtoul(end + 1, &end, 10));
         if (end != nullptr && *end == ':') result.shift = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
+        if (const char* mrt = std::getenv("APS5_PROBE_MRT")) result.mrt = static_cast<std::uint32_t>(std::strtoul(mrt, nullptr, 10));
+        // APS5_PROBE_MARK=<mrt>: that color target gets a sentinel wherever the probed program drew,
+        // so the probed pixels can be told from the pixels the other programs wrote.
+        if (const char* mark = std::getenv("APS5_PROBE_MARK")) result.mark = static_cast<std::uint32_t>(std::strtoul(mark, nullptr, 10));
         result.enabled = result.vgpr < 255u;
         return result;
     }();
     DebugProbe probe = parsed;
-    probe.enabled = parsed.enabled && DebugProbeActive();
+    // A probe limited to one program (APS5_PROBE_CODE) needs no driver to mark the draw that uses it,
+    // and leaves every other program translated as it is: the disk cache stays on, and only the probed
+    // program's cache key carries the probe (ShaderDiskCache appendProbeKey).
+    const auto wanted = DebugProbeCodeHash();
+    probe.enabled = parsed.enabled && (wanted != 0 ? wanted == g_probeProgramHash : DebugProbeActive());
     return probe;
 }
 

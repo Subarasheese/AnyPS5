@@ -1203,6 +1203,11 @@ int DoMprotect(const void* addr, size_t len, int prot) {
             if (mprotect(const_cast<void*>(span), spanBytes, nativeProtection) != 0) throw std::system_error(errno, std::generic_category(), "mprotect failed");
         });
         RecordProtection(span, spanBytes, prot);
+        // Memory that becomes GPU-visible here is new to the GPU, exactly as a fresh mapping is: a
+        // memory pool commits its pages this way (sceKernelMemoryPoolCommit, GT7's texture streaming),
+        // and without this the driver never learns to make them readable, so everything stored in them
+        // reads as zero (black textures).
+        if ((prot & GuestProtGpuReadWrite) != 0) mutation.NoteGpuMapping(span, spanBytes);
     }
     return 0;
 }

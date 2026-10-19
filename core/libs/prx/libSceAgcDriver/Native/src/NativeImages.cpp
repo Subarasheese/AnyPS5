@@ -115,6 +115,9 @@ struct Surface {
     std::uint64_t fingerprint = 0;   // of the game's bytes at the last upload
     std::uint64_t generation = 0;
     std::uint64_t contents = 0;
+    // A render target the game filled through memory (a memset clear) is seeded from it once; after
+    // that the image is the content and memory writes under it are the game's own staging.
+    bool memorySeeded = false;
     std::uint32_t storage = 0;       // first storage heap index (one per level), 0: none
 };
 
@@ -528,6 +531,13 @@ struct NativeImages::State {
         surface.format = Graphics::SampledTextureFormat(context, resource.format);
         const bool compressed = Graphics::IsBlockCompressed(resource.format);
         if (!compressed && Graphics::StorageFormatAvailable(context, resource.format)) surface.storageFormat = Graphics::StorageFormatForGuest(context, resource.format);
+        // Packed 10_11_11 float (guest format 43) is stored natively as B10G11R11 in logical channel
+        // order (its sampled views are identity, as are its render targets). Float image stores (GPU-
+        // resolved shaders bind the float storage slots) need B10G11R11 storage views: the R32_UINT
+        // storage form the guest format resolves to leaves those slots empty and drops every write
+        // (GT7's ComputeSky sky cube). The R32_UINT views stay for packed uint access.
+        const bool packedFloatStorage = resource.format == 43 && Graphics::HostStorageFormat(context, VK_FORMAT_B10G11R11_UFLOAT_PACK32) != VK_FORMAT_UNDEFINED;
+        if (packedFloatStorage) surface.storageFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         // Views of other formats of the same element size (a render target sampled as sRGB, a texture
         // written as uint) share the surface: mutable format, usages any compatible format supports.
@@ -557,6 +567,10 @@ struct NativeImages::State {
                     const auto made = view(surface.image, type, surface.storageFormat, {}, {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_3D ? 1u : geometry.imageLayers});
                     if (numeric == Numeric::Float) write(StorageFloatBase + slot, surface.storage + level, made, true);
                     if (numeric == Numeric::Uint) write(StorageUintBase + slot, surface.storage + level, made, true), write(AtomicUintBase + slot, surface.storage + level, made, true);
+                    if (packedFloatStorage) {
+                        const auto packed = view(surface.image, type, VK_FORMAT_R32_UINT, {}, {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_3D ? 1u : geometry.imageLayers});
+                        write(StorageUintBase + slot, surface.storage + level, packed, true), write(AtomicUintBase + slot, surface.storage + level, packed, true);
+                    }
                 }
             }
         }
@@ -606,6 +620,25 @@ struct NativeImages::State {
 
     // Detiles the surface from the game's memory: tiled bytes -> linear staging -> image.
     void upload(VkCommandBuffer commands, Surface& surface, bool gpuWritten = false) {
+        if (Native::Logs()) {
+            static std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, bool>, std::uint64_t> counts;
+            static auto reported = std::chrono::steady_clock::now();
+            ++counts[{surface.resource.baseAddress, surface.resource.width, surface.resource.height, surface.resource.format, gpuWritten}];
+            if (std::chrono::steady_clock::now() - reported > std::chrono::seconds(5)) {
+                reported = std::chrono::steady_clock::now();
+                std::vector<std::pair<std::uint64_t, std::string>> top;
+                for (const auto& [key, count] : counts) {
+                    char entry[128];
+                    std::snprintf(entry, sizeof(entry), "0x%llx %ux%u fmt %u%s", static_cast<unsigned long long>(std::get<0>(key)), std::get<1>(key), std::get<2>(key), std::get<3>(key), std::get<4>(key) ? " gpu-written" : "");
+                    top.push_back({count, entry});
+                }
+                std::sort(top.rbegin(), top.rend());
+                std::string line;
+                for (std::size_t i = 0; i < std::min<std::size_t>(top.size(), 10); ++i) line += " " + top[i].second + " x" + std::to_string(top[i].first) + ";";
+                std::fprintf(stderr, "[native] texture uploads in 5 s:%s\n", line.c_str());
+                counts.clear();
+            }
+        }
         surface.uploaded = true;
         NotePoolUse("texture", surface.resource.baseAddress);
         const auto& resource = surface.resource;
@@ -644,6 +677,17 @@ struct NativeImages::State {
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), surface.image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        // Debug aid: APS5_DEBUG_LOG_UPLOADS=1 names every surface uploaded from guest memory, which
+        // tells an upload over a rendered target from an ordinary texture upload.
+        {
+            static const bool logUploads = std::getenv("APS5_DEBUG_LOG_UPLOADS") != nullptr;
+            static int logged = 0;
+            if (logUploads && logged < 400) {
+                ++logged;
+                std::fprintf(stderr, "[native] upload 0x%llx %ux%u guest format %u tile %u bytes %llu target %d\n", static_cast<unsigned long long>(resource.baseAddress),
+                    resource.width, resource.height, resource.format, static_cast<unsigned>(resource.tileMode), static_cast<unsigned long long>(geometry.guestBytes), surface.target ? 1 : 0);
+            }
+        }
         ++uploads;
     }
 
@@ -723,21 +767,46 @@ struct NativeImages::State {
         resource.pipeBankXor = color.pipeBankXor;
         if (targets.insert(resource.baseAddress).second && targets.size() <= 64 && Native::Logs()) std::fprintf(stderr, "[native] render target 0x%llx %ux%u VkFormat %d tile %u mips %u\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<int>(color.format), static_cast<unsigned>(color.tileMode), resource.mipCount);
         auto& surface = surfaceFor(resource, commands, true);
-        if (!surface.uploaded && !surface.target) {
-            // A target over memory no texture filled starts cleared, as GT7's fresh render targets do.
+        // The first time a surface is used as a target nothing has been drawn into its image yet, so
+        // its content is still whatever the game left in memory (a texture upload of that memory may
+        // predate the game's own fill).
+        if (surface.drawn == 0) {
+            // On the console a color target's content is its memory, and GT7 fills some targets that
+            // way and never draws into them first: the full-screen attenuation buffer the fog multiply
+            // samples is memset to 1.0 with no draw and no DMA packet, and an image started empty
+            // multiplies the whole frame by zero. A fresh target image therefore starts as a copy of
+            // its memory, and only memory nothing can read starts cleared.
             // Debug aid: APS5_NATIVE_TARGET_CLEAR=1 starts targets magenta (shows what draws cover).
             static const bool debugClear = std::getenv("APS5_NATIVE_TARGET_CLEAR") != nullptr;
-            VkClearColorValue zero{};
-            if (debugClear) zero.float32[0] = zero.float32[2] = zero.float32[3] = 1.0f;
-            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-            ++recordings;
-            recording();
-            fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, surface.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
-            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+            static const bool noSeed = std::getenv("APS5_NO_TARGET_FROM_MEMORY") != nullptr;
+            bool seeded = false;
+            if (!debugClear && !noSeed && surface.geometry.guestBytes != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(resource.baseAddress), surface.geometry.guestBytes)) {
+                ++recordings;
+                context.detiler->BeginBatch();
+                upload(commands, surface);
+                seeded = !surface.stale;
+                if (seeded && Native::Logs()) std::fprintf(stderr, "[native] target 0x%llx started from its memory (%ux%u, %llu bytes)\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(surface.geometry.guestBytes));
+            }
+            if (!seeded) {
+                VkClearColorValue zero{};
+                if (debugClear) zero.float32[0] = zero.float32[2] = zero.float32[3] = 1.0f;
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+                ++recordings;
+                recording();
+                fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, surface.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+                Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+            }
         }
         surface.target = true;
         surface.uploaded = true;
         surface.drawn = ++drawSerial;
+        // GT7 clears some targets by filling their memory (the full-screen attenuation buffer the fog
+        // multiply samples is memset to 1.0 that way, with no draw and no DMA packet). Remember the
+        // write generation of a fresh target so Prepare sees that fill and seeds the image from it.
+        if (surface.generation == 0 && !surface.memorySeeded && GuestMemory::WriteWatched() && surface.geometry.guestBytes != 0 &&
+            GuestMemory::Accessible(reinterpret_cast<const void*>(resource.baseAddress), surface.geometry.guestBytes)) {
+            surface.generation = GuestMemory::CollectWrites(resource.baseAddress, surface.geometry.guestBytes);
+        }
         imageOut = surface.image;
         const std::array<std::uint32_t, 6> key{static_cast<std::uint32_t>(color.format), color.mip, color.arraySlice, std::max(color.layers, 1u), color.depthSlice, 0};
         if (const auto found = surface.attachments.find(key); found != surface.attachments.end()) return found->second;
@@ -927,6 +996,20 @@ std::vector<NativeImages::DrawnTarget> NativeImages::SurfacesAt(std::uint64_t ad
     for (auto it = state->surfaces.lower_bound(SurfaceKey{address, 0, 0, 0, 0, 0, 0, 0}); it != state->surfaces.end() && it->first.address == address; ++it) {
         if (it->second.image != VK_NULL_HANDLE) found.push_back({address, it->second.image, it->second.format, it->second.resource.width, it->second.resource.height, it->second.drawn, it->second.geometry.guestBytes, it->second.resource.format, static_cast<std::uint32_t>(it->second.resource.tileMode)});
     }
+    if (const auto depth = state->depths.find(address); depth != state->depths.end() && depth->second.image != VK_NULL_HANDLE) {
+        DrawnTarget target{address, depth->second.image, depth->second.format, depth->second.extent.width, depth->second.extent.height, 0};
+        target.depth = true;
+        found.push_back(target);
+    }
+    return found;
+}
+
+std::vector<NativeImages::DrawnTarget> NativeImages::StorageSurfaces() const {
+    std::vector<DrawnTarget> found;
+    for (const auto& [key, surface] : state->surfaces) {
+        if (surface.image == VK_NULL_HANDLE || surface.storage == 0) continue;
+        found.push_back({surface.resource.baseAddress, surface.image, surface.format, surface.resource.width, surface.resource.height, surface.drawn, surface.geometry.guestBytes, surface.resource.format, static_cast<std::uint32_t>(surface.resource.tileMode)});
+    }
     return found;
 }
 
@@ -1035,7 +1118,8 @@ void NativeImages::Prepare(VkCommandBuffer commands) {
         {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
             for (const auto& [key, surface] : s.surfaces) {
-                if (!surface.uploaded || surface.target || surface.generation == 0) continue;
+                const bool seedable = surface.target && !surface.memorySeeded && surface.generation != 0 && surface.geometry.guestBytes != 0;
+                if (!seedable && (!surface.uploaded || surface.target || surface.generation == 0)) continue;
                 spans.emplace_back(surface.resource.baseAddress, surface.resource.baseAddress + surface.geometry.guestBytes);
             }
             std::sort(spans.begin(), spans.end());
@@ -1045,6 +1129,20 @@ void NativeImages::Prepare(VkCommandBuffer commands) {
                 else merged.push_back(span);
             }
             for (const auto& [begin, end] : merged) static_cast<void>(GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)));
+            // A target the game filled through memory after we made its image: seed the image from
+            // that memory once, so a buffer the game clears with a memset is not read back as zero.
+            for (auto& [key, surface] : s.surfaces) {
+                if (!surface.target || surface.memorySeeded || surface.generation == 0 || surface.geometry.guestBytes == 0) continue;
+                const auto address = surface.resource.baseAddress;
+                const auto bytes = surface.geometry.guestBytes;
+                if (GuestMemory::UnchangedSince(address, bytes, surface.generation)) continue;
+                surface.memorySeeded = true;
+                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) continue;
+                ++s.recordings;
+                s.context.detiler->BeginBatch();
+                s.upload(commands, surface, true);
+                if (Native::Logs()) std::fprintf(stderr, "[native] target 0x%llx seeded from the memory the game filled (%ux%u, %llu bytes)\n", static_cast<unsigned long long>(address), surface.resource.width, surface.resource.height, static_cast<unsigned long long>(bytes));
+            }
             for (auto& [key, surface] : s.surfaces) {
                 if (!surface.uploaded || surface.target || surface.generation == 0 || s.targets.count(surface.resource.baseAddress) != 0) continue;
                 const auto address = surface.resource.baseAddress;

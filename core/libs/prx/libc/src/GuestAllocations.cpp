@@ -134,7 +134,8 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
             if (it != ranges.begin()) --it;
             for (; it != ranges.end() && it->first < address + bytes; ++it) {
                 const auto& range = it->second;
-                if (range->gpu && range->readable && range->bytes != 0 && range->address + range->bytes > address) mapped.push_back(range);
+                // GPU-only mappings (no CPU access) are GPU memory too.
+                if (range->gpu && range->bytes != 0 && range->address + range->bytes > address) mapped.push_back(range);
             }
         }
         std::sort(mapped.begin(), mapped.end(), [](const auto& left, const auto& right) { return left->address < right->address; });

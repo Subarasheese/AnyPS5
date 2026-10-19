@@ -27,10 +27,15 @@ bool SkipsDraws();
 // half the CPU threads), so a burst of new shaders does not starve the game's own threads.
 class BackgroundSlot {
 public:
-    BackgroundSlot();
+    // Urgent work (compute the game waits on unconditionally) runs at once; other work waits for
+    // one of the hardware_concurrency/2 slots, so a burst of graphics builds cannot starve it.
+    explicit BackgroundSlot(bool urgent = false);
     ~BackgroundSlot();
     BackgroundSlot(const BackgroundSlot&) = delete;
     BackgroundSlot& operator=(const BackgroundSlot&) = delete;
+
+private:
+    bool counted;
 };
 bool Logs();
 void ReportGraphicsIssue(const std::string& category, const std::string& detail);

@@ -2227,6 +2227,15 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
     if (source.empty()) return;
+    // Debug aid: APS5_DEBUG_WATCH_WRITE=<address> names every driver-side store that covers that
+    // address, with the caller, to find what fills a render target's memory behind the image.
+    {
+        static const std::uint64_t watched = [] { const char* text = std::getenv("APS5_DEBUG_WATCH_WRITE"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+        static std::atomic<int> noted{0};
+        if (watched != 0 && address <= watched && watched < address + source.size() && noted.fetch_add(1) < 8)
+            std::fprintf(stderr, "[native] guest store over 0x%llx: at 0x%llx, %zu bytes, first word %08x, caller %p\n", static_cast<unsigned long long>(watched),
+                static_cast<unsigned long long>(address), source.size(), source.size() >= 4 ? *reinterpret_cast<const std::uint32_t*>(source.data()) : 0u, __builtin_return_address(0));
+    }
     // A store, as in WriteChanged.
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, source.size());

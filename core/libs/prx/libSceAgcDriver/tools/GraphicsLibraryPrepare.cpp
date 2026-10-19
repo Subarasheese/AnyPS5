@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "ShaderDiskCache.hpp"
 #include "prx/libSceAgcDriver/Native/include/NativeDevice.hpp"
+#include <chrono>
 #include <memory>
 #include <cstdlib>
 #include <algorithm>
@@ -65,7 +66,26 @@ int main(int argc, char** argv) {
             const auto prepareFile = [&](const std::filesystem::path& path) {
                 std::vector<std::byte> requestBytes;
                 if (!ShaderRecompiler::ReadWholeFile(path, requestBytes)) throw std::runtime_error("cannot read request: " + path.string());
-                auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(std::string_view(reinterpret_cast<const char*>(requestBytes.data()), requestBytes.size()));
+                decltype(ShaderRecompiler::RequestSerializer{}.Deserialize(std::string_view{})) request;
+                try {
+                    request = ShaderRecompiler::RequestSerializer{}.Deserialize(std::string_view(reinterpret_cast<const char*>(requestBytes.data()), requestBytes.size()));
+                } catch (const std::exception& error) {
+                    // A capture cut short when the game was stopped.
+                    std::lock_guard lock(mutex);
+                    std::fprintf(stderr, "Skipped unreadable request %s: %s\n", path.filename().string().c_str(), error.what());
+                    return;
+                }
+                // APS5_PREPARE_CODE_HASH=1: print each request's program hash (the identity APS5_PROBE_CODE
+                // selects, which survives the address changes between runs) and translate nothing.
+                static const bool hashOnly = std::getenv("APS5_PREPARE_CODE_HASH") != nullptr;
+                if (hashOnly) {
+                    const auto& code = request.request.shader.code;
+                    const auto head = code.subspan(0, std::min<std::size_t>(std::size_t{16}, code.size()));
+                    std::lock_guard lock(mutex);
+                    std::printf("%s stage %d hash %016llx\n", path.filename().string().c_str(), static_cast<int>(request.request.shader.stage),
+                        static_cast<unsigned long long>(ShaderRecompiler::HashBytes(std::as_bytes(head))));
+                    return;
+                }
                 const auto stage = request.request.shader.stage;
                 if (nativeCompute) {
                     if (stage != ShaderRecompiler::ShaderStage::Compute) return;
@@ -75,6 +95,12 @@ int main(int argc, char** argv) {
                     {
                         std::lock_guard lock(mutex);
                         if (!liveModules.insert(result.PipelineVariantId()).second) return;
+                    }
+                    if (const char* directory = std::getenv("APS5_PREPARE_SPV_DIR")) {
+                        if (std::FILE* file = std::fopen((std::filesystem::path(directory) / path.filename().replace_extension(".spv")).c_str(), "wb")) {
+                            std::fwrite(result.spirv.data(), 4, result.spirv.size(), file);
+                            std::fclose(file);
+                        }
                     }
                     std::string reason;
                     if (!native->PrebuildCompute(result, reason)) throw std::runtime_error("native compute preparation: " + reason);
@@ -86,14 +112,33 @@ int main(int argc, char** argv) {
                 if (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment && stage != ShaderRecompiler::ShaderStage::Mesh) return;
                 request.request.target = native->GraphicsTarget();
                 if (request.request.context.floatMode && std::getenv("APS5_NATIVE_EXACT_DENORMALS") == nullptr) request.request.context.floatMode->floatMode |= 0x30u;
+                const auto began = std::chrono::steady_clock::now();
                 const auto result = ShaderRecompiler::Recompile(request.request);
+                const auto translated = std::chrono::steady_clock::now();
                 {
                     std::lock_guard lock(mutex);
                     if (!liveModules.insert(result.PipelineVariantId()).second) return;
                 }
+                // APS5_PREPARE_CODE_DIR=<dir> saves each stage's guest program code, for disassembly.
+                if (const char* directory = std::getenv("APS5_PREPARE_CODE_DIR")) {
+                    if (std::FILE* file = std::fopen((std::filesystem::path(directory) / path.filename().replace_extension(".code")).c_str(), "wb")) {
+                        std::fwrite(request.request.shader.code.data(), 4, request.request.shader.code.size(), file);
+                        std::fclose(file);
+                    }
+                }
+                // APS5_PREPARE_SPV_DIR=<dir> saves each translated stage's SPIR-V.
+                if (const char* directory = std::getenv("APS5_PREPARE_SPV_DIR")) {
+                    if (std::FILE* file = std::fopen((std::filesystem::path(directory) / path.filename().replace_extension(".spv")).c_str(), "wb")) {
+                        std::fwrite(result.spirv.data(), 4, result.spirv.size(), file);
+                        std::fclose(file);
+                    }
+                }
                 const auto mesh = stage == ShaderRecompiler::ShaderStage::Mesh && request.request.graphics ? request.request.graphics->mesh : std::nullopt;
                 const bool built = native->PrebuildGraphicsLibrary(result, stage, request.request.context.waveSize, request.request.layout.pushConstantOffsetBytes, mesh);
+                const auto finished = std::chrono::steady_clock::now();
+                const auto ms = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
                 std::lock_guard lock(mutex);
+                std::printf("Stage %s: %zu SPIR-V words, translate %.0f ms, library %.0f ms\n", path.filename().string().c_str(), result.spirv.size(), ms(began, translated), ms(translated, finished));
                 if (!built) {
                     ++liveOnly;
                     std::fprintf(stderr, "Translated native graphics request requires live pipeline state: %s\n", path.filename().string().c_str());

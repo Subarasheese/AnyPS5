@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_NATIVE_INCLUDE_COMPILESTATUS_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_NATIVE_INCLUDE_COMPILESTATUS_HPP
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -18,6 +19,15 @@ public:
 private:
     bool compiling = false;
 };
+
+// How long work waits for a translation or pipeline still compiling before it is skipped for this
+// frame (APS5_COMPILE_WAIT_MS, default 2000; 0 waits until it completes): a shader the driver takes
+// minutes to compile then costs missing work for those frames, not a frozen game.
+std::chrono::milliseconds CompileWaitLimit();
+// The wait to use now: CompileWaitLimit, or 1 ms for a few seconds after a wait timed out. A burst
+// of new shaders (a race loading its materials) then costs skipped draws, not one limit per shader.
+std::chrono::milliseconds CompileWaitNow();
+void NoteCompileWaitTimedOut();
 
 class CompileWait {
 public:

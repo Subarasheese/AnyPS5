@@ -62,9 +62,12 @@ public:
         std::uint64_t guestBytes = 0;
         std::uint32_t guestFormat = 0;
         std::uint32_t tileMode = 0;
+        bool depth = false;
     };
     std::vector<DrawnTarget> DrawnTargets(std::uint64_t since) const;
     std::vector<DrawnTarget> SurfacesAt(std::uint64_t address) const;
+    // Every surface with storage views (written by compute), for the zero-surface survey.
+    std::vector<DrawnTarget> StorageSurfaces() const;
     std::string DescribeUploadedOverlap(std::uint64_t begin, std::uint64_t end) const;
     void MarkGpuWritten(std::uint64_t begin, std::uint64_t end);
     void BeforeRecording(std::function<void()> close);

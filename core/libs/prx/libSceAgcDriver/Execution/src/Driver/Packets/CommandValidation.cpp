@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
+#include "prx/libSceAgcDriver/Native/include/FrontEnd.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -47,8 +49,8 @@ void Driver::dumpPackets(std::span<const std::uint32_t> commands, const std::uin
     }
 }
 
-void Driver::validate(const Submission& submission, const std::uint32_t* guest) {
-    const std::span<const std::uint32_t> commands = submission.commands;
+void Driver::validate(Submission& submission, const std::uint32_t* guest) {
+    std::span<const std::uint32_t> commands = submission.commands;
     const auto queue = submission.queue;
     std::vector<std::size_t> guarded;
     for (std::size_t cursor = 0; cursor < commands.size();) {
@@ -56,17 +58,28 @@ void Driver::validate(const Submission& submission, const std::uint32_t* guest) 
         const auto header = commands[cursor];
         if (Pm4::FillerPacket(header)) { ++cursor; continue; }
         if ((header & 0xc0000000u) != 0xc0000000u) {
-            char what[96];
-            std::snprintf(what, sizeof(what), "unsupported PM4 packet type: header 0x%08x at DWORD %zu of %zu", header, cursor, commands.size());
-
-            dumpPackets(commands, guest);
-            std::fprintf(stderr, "[gpu] dwords %zu..%zu:", cursor >= 8 ? cursor - 8 : 0, std::min(commands.size(), cursor + 8));
-            for (std::size_t i = cursor >= 8 ? cursor - 8 : 0; i < std::min(commands.size(), cursor + 8); ++i) std::fprintf(stderr, " %08x", commands[i]);
-            std::fprintf(stderr, "\n");
-            throw std::runtime_error(std::string("AGC driver: ") + what);
+            // Not a command: GT7 submits some buffers with data past their last packet (it reads as
+            // floats). The CP stops at the buffer's end; here the buffer ends at its last packet.
+            char what[128];
+            std::snprintf(what, sizeof(what), "header 0x%08x at DWORD %zu of %zu (queue %u)", header, cursor, commands.size(), static_cast<unsigned>(queue));
+            Native::ReportGraphicsIssue("submission ends in non-packet data (trimmed)", std::to_string(commands.size() - cursor) + " dwords after the last packet");
+            static int reported = 0;
+            if (reported++ < 4) {
+                std::fprintf(stderr, "[gpu] submission trimmed at a non-packet %s\n", what);
+                dumpPackets(commands, guest);
+            }
+            submission.commands.resize(cursor);
+            break;
         }
         const auto count = Pm4::PacketWords(header);
         require(count <= commands.size() - cursor, "truncated PM4 packet");
+        // A draw the front-end prepared at GT7's call site (its marker NOP precedes it) runs from
+        // that preparation; its packet is not decoded, so it is not validated here.
+        const bool preparedDraw = cursor >= 3 && commands[cursor - 3] == 0xc0011000u && commands[cursor - 2] == Native::FrontEndDrawMarker;
+        if (preparedDraw) {
+            cursor += count;
+            continue;
+        }
         try {
             Pm4::Validate(commands.subspan(cursor, count), queue);
             if (header == FlipPacketHeader && !guarded.empty()) throw std::runtime_error("a flip inside a conditional execution range (conditional flip reservation) is not implemented");

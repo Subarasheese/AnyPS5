@@ -6,6 +6,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
 #include "prx/libSceAgcDriver/Native/include/CompileStatus.hpp"
@@ -134,6 +137,24 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             const bool nativeFrame = Native::GpuNative() && buffer != nullptr && Native::NativeDevice::Get() != nullptr && Native::NativeDevice::Get()->DisplayImage(buffer->address, nativeImage, nativeExtent, nativeFormat);
             static std::uint64_t nativePresents = 0;
             if (Native::GpuNative() && nativePresents++ % 300 == 0 && Native::Logs()) std::fprintf(stderr, "[native] present %llu: display buffer 0x%llx %ux%u format 0x%llx tiling %u: %s\n", static_cast<unsigned long long>(nativePresents), buffer != nullptr ? static_cast<unsigned long long>(buffer->address) : 0ull, buffer != nullptr ? buffer->width : 0u, buffer != nullptr ? buffer->height : 0u, buffer != nullptr ? static_cast<unsigned long long>(buffer->pixelFormat) : 0ull, buffer != nullptr ? buffer->tilingMode : 0u, nativeFrame ? "native image" : "no native image");
+            // Debug aid: APS5_PRESENT_DUMP_AT=<seconds after the first present> saves the display
+            // buffer's guest memory once (present-dump-<address>.bin in APS5_NATIVE_DUMP_DIR or .).
+            {
+                static const double dumpAt = [] { const char* text = std::getenv("APS5_PRESENT_DUMP_AT"); return text != nullptr ? std::atof(text) : -1.0; }();
+                static const auto firstPresent = std::chrono::steady_clock::now();
+                static bool dumped = false;
+                if (dumpAt >= 0 && !dumped && buffer != nullptr && std::chrono::duration<double>(std::chrono::steady_clock::now() - firstPresent).count() >= dumpAt) {
+                    dumped = true;
+                    const char* directory = std::getenv("APS5_NATIVE_DUMP_DIR");
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "present-dump-%llx.bin", static_cast<unsigned long long>(buffer->address));
+                    const auto path = std::filesystem::path(directory != nullptr ? directory : ".") / name;
+                    std::filesystem::create_directories(path.parent_path());
+                    const auto bytes = static_cast<std::size_t>(buffer->width) * buffer->height * 4u;
+                    if (GuestMemory::Accessible(reinterpret_cast<const void*>(buffer->address), bytes)) std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(buffer->address), static_cast<std::streamsize>(bytes));
+                    std::fprintf(stderr, "[native] present dump: display buffer 0x%llx %ux%u tiling %u, %s, guest bytes %s\n", static_cast<unsigned long long>(buffer->address), buffer->width, buffer->height, buffer->tilingMode, nativeFrame ? "native image" : "no native image", path.string().c_str());
+                }
+            }
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
             std::lock_guard lock(GuestMemory::GpuMutex());
             timing.Mark("gpu_mutex_wait");

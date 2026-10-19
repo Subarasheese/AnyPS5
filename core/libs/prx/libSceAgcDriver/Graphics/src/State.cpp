@@ -1071,6 +1071,21 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, bool layeredDep
                 std::fprintf(stderr, "[gpu] depth/stencil tests are ignored (APS5_IGNORE_DEPTH_TEST; DB_DEPTH_CONTROL=0x%08x)\n", depthControl);
             }
         } else {
+            // Debug aid: APS5_DEBUG_DEPTH_REJECT prints the DB registers of draws rejected here.
+            static const bool debugReject = std::getenv("APS5_DEBUG_DEPTH_REJECT") != nullptr;
+            static int rejectLogs = 0;
+            if (debugReject && rejectLogs < 40 && (effectiveDepthControl(depthControl) & DepthControlMask) != 0) {
+                ++rejectLogs;
+                std::string line = "[gpu] depth reject DB_DEPTH_CONTROL=" + std::to_string(depthControl);
+                for (const std::uint32_t offset : {0x000u, 0x002u, 0x005u, 0x007u, 0x010u, 0x011u, 0x012u, 0x013u, 0x014u, 0x015u, 0x01au, 0x01bu, 0x01cu, 0x01du}) {
+                    const auto entry = find(cx, offset);
+                    char text[40];
+                    if (entry == cx.end()) std::snprintf(text, sizeof(text), " %03x=absent", offset);
+                    else std::snprintf(text, sizeof(text), " %03x=%08x", offset, entry->second);
+                    line += text;
+                }
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
             if ((effectiveDepthControl(depthControl) & DepthControlMask) != 0) zero(cx, 0x200, DepthControlMask, "depth, stencil or conditional color writes");
         }
         Require((depthControl & 8u) == 0 || result.depth.has_value() || depthPlanesAbsent(cx), "depth bounds without a depth surface");
@@ -1332,6 +1347,17 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup, bool layeredDep
     }
     for (std::uint32_t i = 0; i < 3; ++i) {
         if ((requiredBlendMask & (1u << i)) != 0) result.blendConstants[i] = requiredBlendConstants[i];
+    }
+    // Debug experiment: APS5_DEBUG_FORCE_WRITE_MASK=1 writes every component of every color target
+    // with blending off, to tell a lost shader write from a write-mask or blend mistake. Not a fix.
+    {
+        static const bool forceWriteMask = std::getenv("APS5_DEBUG_FORCE_WRITE_MASK") != nullptr;
+        if (forceWriteMask) {
+            for (auto& forced : result.blends) {
+                forced.colorWriteMask = 0xfu;
+                forced.blendEnable = VK_FALSE;
+            }
+        }
     }
     if (!result.colors.empty()) result.blend = result.blends[result.colors.front().exportIndex];
     Require(result.reversedBlend == 0 || (exportSlots.size() == 1 && exportCount == 1), "blending into a color target with a reversed component order through a second source color needs that target to be the shader's only color export");

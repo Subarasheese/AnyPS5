@@ -110,6 +110,7 @@ void IrBuilder::SetScalarMaskTag(ScalarReg reg, IrValue& value) {
 IrValue* IrBuilder::vectorWindowIndex(VectorReg reg) {
     const auto& metadata = program.Metadata();
     const auto index = static_cast<std::uint32_t>(RegIndex(reg));
+    if (index == metadata.probeRegister) return nullptr;
     if (metadata.vectorWindowSize == 0u || index < metadata.vectorWindowBase) return nullptr;
     if (index - metadata.vectorWindowBase >= metadata.vectorWindowSize) throw std::runtime_error("vector register " + std::to_string(index) + " lies past the relative-addressing window");
     return &Constant(index - metadata.vectorWindowBase);

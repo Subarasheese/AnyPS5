@@ -46,6 +46,7 @@ struct DeviceLibraries {
     PFN_vkDestroyShaderModule destroyModule = nullptr;
     std::vector<VkShaderModule> modules;
     std::map<std::uint64_t, VkShaderModule> shaderModules;
+    std::map<VkShaderModule, std::size_t> moduleBytes;
     std::map<Key, VkPipelineLayout> layouts;
     std::array<std::map<Key, VkPipeline>, 4> parts;
     PipelineLibraryCounters counters;
@@ -132,6 +133,7 @@ VkShaderModule CachedGraphicsShaderModule(const Context& context, std::uint64_t 
     try {
         const auto [entry, inserted] = device.shaderModules.emplace(variant, module);
         if (!inserted) destroy(context.device, module, nullptr);
+        else device.moduleBytes[module] = spirv.size_bytes();
         return entry->second;
     } catch (...) {
         destroy(context.device, module, nullptr);
@@ -228,7 +230,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         VkGraphicsPipelineLibraryCreateInfoEXT library{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, flags[part] == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT ? &rendering : &shaderRendering};
         library.flags = flags[part];
         VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &library};
-        create.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+        create.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT | (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0u);
         create.pDynamicState = info.pDynamicState;
         create.layout = partLayouts[part];
         switch (flags[part]) {
@@ -255,6 +257,14 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.pColorBlendState = info.pColorBlendState;
             create.layout = VK_NULL_HANDLE;
             break;
+        }
+        // A very large shader is first built unoptimized: the driver can take minutes to optimize one,
+        // and its draws wait meanwhile; the link-time optimized pipeline replaces it once built.
+        // APS5_FAST_LIBRARY_BYTES sets the size (default 512 KiB of SPIR-V; 0 always optimizes).
+        static const std::size_t fastBytes = [] { const char* text = std::getenv("APS5_FAST_LIBRARY_BYTES"); return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 0)) : std::size_t{512} << 10u; }();
+        for (std::uint32_t stage = 0; fastBytes != 0 && stage < create.stageCount; ++stage) {
+            const auto bytes = device.moduleBytes.find(create.pStages[stage].module);
+            if (bytes != device.moduleBytes.end() && bytes->second >= fastBytes) create.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         }
         VkPipeline handle = VK_NULL_HANDLE;
         // Built without the store's mutex: a draw whose parts are resident is not held behind
@@ -296,6 +306,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     linked.libraryCount = static_cast<std::uint32_t>(libraries.size());
     linked.pLibraries = libraries.data();
     VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &linked};
+    create.flags = context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0u;
     create.layout = info.layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
     lock.unlock();
@@ -320,7 +331,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             linked.libraryCount = static_cast<std::uint32_t>(libraries.size());
             linked.pLibraries = libraries.data();
             VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &linked};
-            create.flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
+            create.flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT | (entryContext.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0u);
             create.layout = libraryLayout;
             VkPipeline result = VK_NULL_HANDLE;
             const auto pipelineCreationResult = CreateWithEntryCache(entryContext, linkKey, [&](VkPipelineCache entry) {

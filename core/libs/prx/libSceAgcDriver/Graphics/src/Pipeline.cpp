@@ -578,6 +578,20 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         }
         blend.attachmentCount = static_cast<std::uint32_t>(firstChannels.size());
         blend.pAttachments = firstChannels.empty() ? nullptr : firstChannels.data();
+        // Debug aid: APS5_DEBUG_PIPELINE_STATE=<color target address> prints the attachment formats
+        // and blend states a pipeline drawing into that target is built with.
+        {
+            static const std::uint64_t wanted = [] { const char* text = std::getenv("APS5_DEBUG_PIPELINE_STATE"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+            static int printed = 0;
+            if (wanted != 0 && printed < 6 && std::any_of(state.colors.begin(), state.colors.end(), [&](const auto& color) { return color.address == wanted; })) {
+                ++printed;
+                std::string formats;
+                for (std::size_t index = 0; index < renderingColors.size(); ++index) formats += " [" + std::to_string(index) + "] fmt " + std::to_string(static_cast<int>(renderingColors[index]));
+                for (std::size_t index = 0; index < firstChannels.size(); ++index) formats += " | blend" + std::to_string(index) + " mask " + std::to_string(firstChannels[index].colorWriteMask) + " enable " + std::to_string(firstChannels[index].blendEnable);
+                std::fprintf(stderr, "[native] pipeline for 0x%llx: %zu colors, %zu blends, dynamicRendering %d, libraries %d, attachments%s\n",
+                    static_cast<unsigned long long>(wanted), state.colors.size(), firstChannels.size(), dynamicRendering ? 1 : 0, libraries ? 1 : 0, formats.c_str());
+            }
+        }
         std::copy(state.blendConstants.begin(), state.blendConstants.end(), blend.blendConstants);
         VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         pipelineInfo.flags = context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
@@ -799,6 +813,11 @@ std::vector<std::uint64_t> Pipeline::PassKey(const Framebuffer& framebuffer, VkE
     for (const auto view : framebuffer.Views()) key.push_back(reinterpret_cast<std::uint64_t>(view));
     for (const auto slot : colorSlots) key.push_back(slot);
     return key;
+}
+
+VkPipeline Pipeline::BoundHandle() const {
+    const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
+    return best != VK_NULL_HANDLE ? best : pipeline;
 }
 
 void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {

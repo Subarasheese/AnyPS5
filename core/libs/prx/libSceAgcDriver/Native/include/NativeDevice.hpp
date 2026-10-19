@@ -52,6 +52,8 @@ public:
 
     // Brings the imports in line with the GPU mappings of the allocation registry.
     void SyncGpuMemory();
+    // Brings imports up to date when GPU mappings changed since the last sync.
+    void SyncChangedMappings() const;
     // The device address of guest address `address`, 0 when no import covers [address, +bytes).
     std::uint64_t DeviceAddress(std::uint64_t address, std::uint64_t bytes = 1) const;
     // The device address of readable guest memory at `address` and the bytes mapped contiguously from it.
@@ -107,6 +109,13 @@ public:
         std::uint32_t instances = 1;
         std::uint32_t firstVertex = 0;
         std::uint32_t firstInstance = 0;
+        // Indirect draws: `indirectCount` records of `indirectStride` bytes at `indirectArguments`
+        // (GT7's memory, written by the GPU), or as many as the dword at `indirectCountAddress`
+        // says, at most indirectCount.
+        std::uint64_t indirectArguments = 0;
+        std::uint32_t indirectCount = 0;
+        std::uint32_t indirectStride = 0;
+        std::uint64_t indirectCountAddress = 0;
         std::array<std::uint64_t, 2> programAddresses{};   // vertex and pixel programs (diagnostics)
         std::vector<std::uint64_t> sampled;
     };

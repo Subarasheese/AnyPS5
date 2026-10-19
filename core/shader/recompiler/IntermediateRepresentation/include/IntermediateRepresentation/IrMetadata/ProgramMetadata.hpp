@@ -36,6 +36,9 @@ struct IrProgramMetadata {
     std::uint32_t tessellationLocalStride = 0;
     std::uint32_t vectorWindowBase = 0;
     std::uint32_t vectorWindowSize = 0;
+    // The scratch vector register a debug probe carries its traced value in (DebugProbe): it is never
+    // addressed relatively, so it stays a plain register even in a program with a window.
+    std::uint32_t probeRegister = 0x100;
     bool vectorWindowIndexedWrites = false;
     std::uint32_t tessellationControlStride = 0;
     std::uint32_t tessellationPatchStride = 0;

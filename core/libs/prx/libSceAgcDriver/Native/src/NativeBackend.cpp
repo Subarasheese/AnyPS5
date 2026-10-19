@@ -225,7 +225,8 @@ Slots& BackgroundSlots() {
 }
 }
 
-BackgroundSlot::BackgroundSlot() {
+BackgroundSlot::BackgroundSlot(bool urgent) : counted(!urgent) {
+    if (urgent) return;
     auto& slots = BackgroundSlots();
     std::unique_lock lock(slots.mutex);
     slots.freed.wait(lock, [&] { return slots.available != 0; });
@@ -233,6 +234,7 @@ BackgroundSlot::BackgroundSlot() {
 }
 
 BackgroundSlot::~BackgroundSlot() {
+    if (!counted) return;
     auto& slots = BackgroundSlots();
     {
         std::lock_guard lock(slots.mutex);

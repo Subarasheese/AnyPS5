@@ -1,5 +1,6 @@
 #include "Translation/AttributeInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include <cstdio>
 #include "Recompiler.hpp"
 #include <algorithm>
 #include <array>
@@ -144,6 +145,42 @@ void TranslationContext::eXP(const RdnaInstruction& inst) {
     const std::uint32_t sourceCount = std::min(inst.sourceCount, 4u);
     for (std::uint32_t source = 0u; source < sourceCount; ++source) {
         components[source] = &readRawU32(plainOperand(sourceAt(inst, source))).Value();
+    }
+    // Debug aid (DebugProbe): the probed program exports (v255 >> shift) to the raw 32-bit color
+    // target instead of its own value, so that target reads back as the register the probe traced.
+    // Every pixel program writes its identity to the target APS5_PROBE_MARK_ALL names.
+    if (const auto markAll = DebugProbeMarkAllTarget(); markAll != 0x100u
+        && exportTargetKindFromTarget(inst.exportTarget, index) == ExportTargetKind::Mrt && index == markAll) {
+        const auto identity = static_cast<float>(DebugProbeProgramHash() & 0x7ffull);
+        const auto half = [](float value) {
+            const auto bits = std::bit_cast<std::uint32_t>(value);
+            const auto exponent = static_cast<std::int32_t>((bits >> 23u) & 0xffu) - 127 + 15;
+            if (exponent <= 0) return std::uint32_t{0};
+            return ((bits >> 16u) & 0x8000u) | (static_cast<std::uint32_t>(exponent) << 10u) | ((bits >> 13u) & 0x3ffu);
+        };
+        const auto packed = half(identity) | (half(identity) << 16u);
+        components[0] = &ir.Constant(inst.exportIsCompressed ? packed : std::bit_cast<std::uint32_t>(identity));
+        components[1] = &ir.Constant(inst.exportIsCompressed ? packed : std::bit_cast<std::uint32_t>(identity));
+        components[2] = components[3] = components[1];
+    }
+    if (const DebugProbe probe = DebugProbeConfig(); probe.enabled && exportTargetKindFromTarget(inst.exportTarget, index) == ExportTargetKind::Mrt) {
+        if (!inst.exportIsCompressed && index == probe.mrt) {
+            program.Metadata().probeRegister = 255u;
+            std::fprintf(stderr, "[probe] pixel program exports v%u (pc 0x%x, shift %u) to MRT%u\n", probe.vgpr, probe.programCounter, probe.shift, probe.mrt);
+            RdnaOperand probeReg{};
+            probeReg.kind = RdnaOperandKind::VectorRegister;
+            probeReg.reg = 255u;
+            components[0] = &ir.ShiftRightLogical(readRawU32(probeReg).Value(), ir.Constant(probe.shift));
+            components[1] = components[2] = components[3] = &ir.Constant(0u);
+        } else if (index == probe.mark) {
+            // The sentinel: -1024 in both halves of a packed pair, and as plain floats otherwise. The
+            // targets that carry normals or velocities never hold it.
+            constexpr std::uint32_t sentinel = 0xc4800000u;      // -1024.0f
+            constexpr std::uint32_t packedPair = 0xe400e400u;    // (-1024h, -1024h)
+            components[0] = &ir.Constant(inst.exportIsCompressed ? packedPair : sentinel);
+            components[1] = &ir.Constant(inst.exportIsCompressed ? packedPair : sentinel);
+            components[2] = components[3] = &ir.Constant(inst.exportIsCompressed ? packedPair : sentinel);
+        }
     }
     IrValue& data = ir.Emit(IrOpcode::CompositeConstructU32x4, IrType::U32x4, {components[0], components[1], components[2], components[3]});
     IrValue& exec = ir.GetExec();

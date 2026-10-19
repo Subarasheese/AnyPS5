@@ -22,6 +22,7 @@
 #include <unistd.h>
 #endif
 #include "ShaderCacheSourceVersion.hpp"
+#include "Translation/TranslationContext.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1272,6 +1273,14 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
 }
 
 constexpr std::string_view NeutralSwitches[] = {
+    // The probe switches change one program's translation (the one APS5_PROBE_CODE names), whose key
+    // carries them through appendProbeKey; every other program translates the same with or without
+    // them and keeps the key, and the cache, it already has.
+    "APS5_PROBE",
+    "APS5_PROBE_CODE",
+    "APS5_PROBE_MRT",
+    "APS5_PROBE_MARK",
+    "APS5_PROBE_MARK_ALL",
     "APS5_TRACE_PIPELINE_CREATE",
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
@@ -1673,6 +1682,24 @@ std::uint64_t SourceVersion() {
     return Generated::SourceVersion;
 }
 
+namespace {
+
+// The probed program's key: its translation differs from the same program's without the probe.
+void appendProbeKey(const RecompileRequest& request, Writer& writer) {
+    // Marking every program changes every program: the whole cache is keyed on it.
+    if (const auto markAll = DebugProbeMarkAllTarget(); markAll != 0x100u) writer.Text("markAll " + std::to_string(markAll));
+    const auto wanted = DebugProbeCodeHash();
+    if (wanted == 0) return;
+    const auto head = request.shader.code.subspan(0, std::min<std::size_t>(std::size_t{16}, request.shader.code.size()));
+    if (HashBytes(std::as_bytes(head)) != wanted) return;
+    const char* probe = std::getenv("APS5_PROBE");
+    const char* mrt = std::getenv("APS5_PROBE_MRT");
+    const char* mark = std::getenv("APS5_PROBE_MARK");
+    writer.Text(std::string("probe ") + (probe != nullptr ? probe : "") + " mrt " + (mrt != nullptr ? mrt : "") + " mark " + (mark != nullptr ? mark : ""));
+}
+
+}
+
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {
     key.clear();
     Writer writer(key);
@@ -1689,6 +1716,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, s
     writer.Value(request.layout.firstBinding);
     writer.Value(request.layout.pushConstantOffsetBytes);
     writer.Value(request.layout.pushConstantSizeBytes);
+    appendProbeKey(request, writer);
     const auto& switches = switchKey();
     key.insert(key.end(), switches.begin(), switches.end());
 }
