@@ -137,7 +137,12 @@ std::uint32_t DefineNativeLookup(SpirvEmitterState& state, const char* name, boo
     // A miss appends the words to the table's miss region (header words 1-3: count, capacity, byte
     // offset from the table), from which the native renderer registers the resource for later work.
     const auto result = load(resultVar);
-    const auto missed = binary(spv::OpIEqual, boolean, result, constant(0u));
+    auto missed = binary(spv::OpIEqual, boolean, result, constant(0u));
+    // A T# with a null base address (word 0, word 1 bits 7:0) cannot be registered: recording it only
+    // fills the region and crowds out the misses that can.
+    if (count == 8u)
+        missed = binary(spv::OpLogicalAnd, boolean, missed,
+            binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseOr, u32, words[0], binary(spv::OpBitwiseAnd, u32, words[1], constant(0xffu))), constant(0u)));
     const auto record = state.module.AllocateId();
     const auto recorded = state.module.AllocateId();
     state.module.AddFunction(spv::OpSelectionMerge, recorded, spv::SelectionControlMaskNone);
