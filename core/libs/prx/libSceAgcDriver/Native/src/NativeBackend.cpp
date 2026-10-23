@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
 #include "prx/libSceAgcDriver/Native/include/GameHooks.hpp"
+#include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 
 #include <array>
 #include <atomic>
@@ -130,10 +131,13 @@ void InstallPglHooks() {
     void* library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!library) { std::fprintf(stderr, "[native] GT7_NATIVE: %s\n", dlerror()); std::abort(); }
     auto start = reinterpret_cast<int (*)()>(dlsym(library, "gt7native_start"));
+    // GT7's end-of-pipe events live in this driver's event queues: the library raises them through it.
+    auto setEndOfPipe = reinterpret_cast<void (*)(void (*)(std::uint32_t))>(dlsym(library, "gt7native_set_end_of_pipe"));
+    if (setEndOfPipe) setEndOfPipe(AgcDriverDeliverEopInterrupt);
     auto& l = Library();
     l.attachWindow = reinterpret_cast<int (*)(const Gt7NativeWindow*)>(dlsym(library, "gt7native_attach_window"));
     l.present = reinterpret_cast<int (*)(const Gt7NativeDisplayBuffer*)>(dlsym(library, "gt7native_present"));
-    if (!start || !l.attachWindow || !l.present || !start()) { std::fprintf(stderr, "[native] GT7_NATIVE: libgt7native did not start\n"); std::abort(); }
+    if (!start || !setEndOfPipe || !l.attachWindow || !l.present || !start()) { std::fprintf(stderr, "[native] GT7_NATIVE: libgt7native did not start\n"); std::abort(); }
     l.active = true;
 }
 }
