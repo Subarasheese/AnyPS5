@@ -462,8 +462,39 @@ extern "C" void BlockPathAlias_nid_no_patch(const char* guestPrefix) {
     aliases.blocked.push_back(prefix);
 }
 
+// ANYPS5_FILE_OVERLAY=<guest path>=<host file>[;...]: serves those guest files from host files
+// instead, so a launcher can substitute a patched game file without modifying the installed one.
+static const std::vector<std::pair<std::string, std::filesystem::path>>& FileOverlays() {
+    static const auto overlays = [] {
+        std::vector<std::pair<std::string, std::filesystem::path>> entries;
+        const char* text = std::getenv("ANYPS5_FILE_OVERLAY");
+        if (text == nullptr) return entries;
+        std::string_view rest(text);
+        while (!rest.empty()) {
+            const auto end = rest.find(';');
+            const auto item = rest.substr(0, end);
+            rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end + 1);
+            const auto equals = item.find('=');
+            if (equals == std::string_view::npos || equals == 0 || equals + 1 == item.size()) continue;
+            const std::string guest(item.substr(0, equals));
+            entries.emplace_back(TrimSlashes(guest.c_str()), std::filesystem::u8path(std::string(item.substr(equals + 1))));
+        }
+        return entries;
+    }();
+    return overlays;
+}
+
 static std::filesystem::path ResolveLocked(const char* path, bool module, bool archived) {
     if (!path) { APS5_INVALID_ARG_EX; }
+    if (const auto& overlays = FileOverlays(); !overlays.empty()) {
+        const auto guest = TrimSlashes(path);
+        for (const auto& [name, host] : overlays) {
+            if (guest != name) continue;
+            static std::once_flag noted;
+            std::call_once(noted, [&] { std::fprintf(stderr, "[file-overlay] /%s served from %s\n", name.c_str(), host.string().c_str()); });
+            return host;
+        }
+    }
     if (archived) AppArchiveReady_nid_no_patch();
     auto& state = Directories();
     std::lock_guard lock(state.mutex);
