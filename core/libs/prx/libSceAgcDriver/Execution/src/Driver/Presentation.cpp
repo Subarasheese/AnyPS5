@@ -49,6 +49,7 @@ void Driver::UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<I
 }
 
 void Driver::AttachWindow(const PresentationWindow& window) {
+    if (Native::Gt7NativeActive()) return Native::Gt7NativeAttachWindow(window);   // libgt7native owns the GPU
     CheckFailure();
     std::unique_lock replacing(deviceReplacement);
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
@@ -64,6 +65,11 @@ void Driver::AttachWindow(const PresentationWindow& window) {
 }
 
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool opaque, void (*gpuReady)(void*), void* context) {
+    if (Native::Gt7NativeActive()) {   // libgt7native presents GT7's frame; the flip is done when it returns
+        Native::Gt7NativePresent(window, buffer);
+        gpuReady(context);
+        return;
+    }
     if (Native::GpuNative()) Native::NotePresent();
     if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
     PerformanceContext timingContext(window.timing.get());

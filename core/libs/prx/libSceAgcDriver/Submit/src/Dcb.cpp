@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
+#include <string>
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -41,20 +43,24 @@ std::uint32_t APS5_VABI sceAgcDriverWaitUntilSafeForRendering(std::uint32_t** co
 }
 
 int APS5_VABI sceAgcDriverSubmitDcb(const Packet* packet) {
+    if (AgcDriver::Native::Gt7NativeActive()) AgcDriver::Native::Gt7NativeForbidden(__func__);   // no PS5 command buffer runs with libgt7native
     AgcDriver::Submit(packet, 0);
     return 0;
 }
 
 int APS5_VABI sceAgcDriverSubmitMultiDcbs(std::uint32_t* const* dcbGpuAddrs, const std::uint32_t* dcbSizesInDwords, std::uint32_t count) {
+    if (AgcDriver::Native::Gt7NativeActive()) AgcDriver::Native::Gt7NativeForbidden(__func__);   // no PS5 command buffer runs with libgt7native
     return AgcDriver::SubmitMany(dcbGpuAddrs, dcbSizesInDwords, count, 0);
 }
 
 int APS5_VABI sceAgcDriverAgrSubmitDcb(const Packet* packet) {
+    if (AgcDriver::Native::Gt7NativeActive()) AgcDriver::Native::Gt7NativeForbidden(__func__);   // no PS5 command buffer runs with libgt7native
     AgcDriver::Submit(packet, 0);
     return 0;
 }
 
 int APS5_VABI sceAgcDriverAgrSubmitMultiDcbs(std::uint32_t* const* dcbGpuAddrs, const std::uint32_t* dcbSizesInDwords, std::uint32_t count) {
+    if (AgcDriver::Native::Gt7NativeActive()) AgcDriver::Native::Gt7NativeForbidden(__func__);   // no PS5 command buffer runs with libgt7native
     return AgcDriver::SubmitMany(dcbGpuAddrs, dcbSizesInDwords, count, 0);
 }
 

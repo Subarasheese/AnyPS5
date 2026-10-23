@@ -18,6 +18,13 @@
 namespace AgcDriver::Native {
 
 bool Enabled();
+// GT7's native PC graphics layer (gt7_render_test's libgt7native, GT7_NATIVE=<path>). When it is loaded it owns the
+// GPU: AnyPS5 creates no Vulkan device and runs no PS5 command buffer. VideoOut's window and presentations go to it,
+// and any PS5 command-buffer submission is a fatal error.
+bool Gt7NativeActive();
+void Gt7NativeAttachWindow(const PresentationWindow& window);
+void Gt7NativePresent(const PresentationWindow& window, const DisplayBuffer* buffer);
+[[noreturn]] void Gt7NativeForbidden(const char* what);
 // The default native renderer: GT7's command buffers run on the native
 // executor (native compute and draws on the driver's Vulkan device, no PM4 emulation).
 bool GpuNative();

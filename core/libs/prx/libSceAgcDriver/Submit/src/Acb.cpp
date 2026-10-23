@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
+#include <string>
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -10,6 +12,7 @@
 extern "C" {
 
 int APS5_VABI sceAgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
+    if (AgcDriver::Native::Gt7NativeActive()) AgcDriver::Native::Gt7NativeForbidden(__func__);   // no PS5 command buffer runs with libgt7native
     if (queue < 0x20 || queue >= 0x58) {
         throw std::runtime_error(std::string(__func__) + ": unsupported compute queue");
     }

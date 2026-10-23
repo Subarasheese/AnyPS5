@@ -99,17 +99,65 @@ void ReportStats(Stats& stats) {
 }
 
 namespace {
-// GT7's native PC graphics layer (gt7_render_test's libgt7native, GT7_NATIVE=<path to libgt7native.so>): loaded
-// into the game process before its threads run; it patches GT7's graphics call sites and renders with its own
-// Vulkan renderer.
+// The C interface of libgt7native (engine/native/include/gt7native.h in gt7_render_test).
+struct Gt7NativeWindow {
+    void* context;
+    const char* const* extensions;
+    std::uint32_t extensionCount;
+    VkSurfaceKHR (*createSurface)(void* context, VkInstance instance);
+    void (*getDrawableSize)(void* context, std::uint32_t* width, std::uint32_t* height);
+    std::uint32_t width, height;
+};
+struct Gt7NativeDisplayBuffer {
+    std::uint64_t address, pixelFormat;
+    std::uint32_t width, height, tilingMode, pitchInPixel;
+    std::uint32_t drawableWidth, drawableHeight;
+};
+struct Gt7Native {
+    bool active = false;
+    int (*attachWindow)(const Gt7NativeWindow*) = nullptr;
+    int (*present)(const Gt7NativeDisplayBuffer*) = nullptr;
+};
+Gt7Native& Library() {
+    static Gt7Native library;
+    return library;
+}
+// Loaded into the game process before its threads run; it patches GT7's graphics call sites and renders with its
+// own Vulkan renderer.
 void InstallPglHooks() {
     const char* path = std::getenv("GT7_NATIVE");
     if (!path || !*path || !std::strstr(program_invocation_short_name, "gt7ps5")) return;
     void* library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!library) { std::fprintf(stderr, "[native] GT7_NATIVE: %s\n", dlerror()); std::abort(); }
     auto start = reinterpret_cast<int (*)()>(dlsym(library, "gt7native_start"));
-    if (!start || !start()) { std::fprintf(stderr, "[native] GT7_NATIVE: gt7native_start failed\n"); std::abort(); }
+    auto& l = Library();
+    l.attachWindow = reinterpret_cast<int (*)(const Gt7NativeWindow*)>(dlsym(library, "gt7native_attach_window"));
+    l.present = reinterpret_cast<int (*)(const Gt7NativeDisplayBuffer*)>(dlsym(library, "gt7native_present"));
+    if (!start || !l.attachWindow || !l.present || !start()) { std::fprintf(stderr, "[native] GT7_NATIVE: libgt7native did not start\n"); std::abort(); }
+    l.active = true;
 }
+}
+
+bool Gt7NativeActive() { return Library().active; }
+
+void Gt7NativeAttachWindow(const PresentationWindow& window) {
+    const Gt7NativeWindow w{window.context, window.extensions.data(), static_cast<std::uint32_t>(window.extensions.size()), window.createSurface,
+                            window.getDrawableSize, window.width, window.height};
+    if (!Library().attachWindow(&w)) Gt7NativeForbidden("libgt7native could not take the window");
+}
+
+void Gt7NativePresent(const PresentationWindow& window, const DisplayBuffer* buffer) {
+    Gt7NativeDisplayBuffer b{};
+    if (buffer) b = {buffer->address, buffer->pixelFormat, buffer->width, buffer->height, buffer->tilingMode, buffer->pitchInPixel, 0, 0};
+    std::uint32_t w = window.drawableWidth, h = window.drawableHeight;
+    if (!window.drawableSizeKnown && window.getDrawableSize) window.getDrawableSize(window.context, &w, &h);
+    b.drawableWidth = w, b.drawableHeight = h;
+    if (!Library().present(&b)) Gt7NativeForbidden("libgt7native presentation failed");
+}
+
+void Gt7NativeForbidden(const char* what) {
+    std::fprintf(stderr, "[native] GT7_NATIVE: %s\n", what);
+    std::abort();
 }
 
 bool Enabled() {
