@@ -440,6 +440,26 @@ int VideoOutDriver::SubmitFlip(int handle, int index, int flipMode, int64_t flip
     // A title that does not pace on flipPendingNum can run ahead of the presenter now that the queue
     // worker no longer waits per flip; a full queue is the documented error, not a failure.
     if (flipQueue->reservations.load() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+    if (AgcDriverGt7NativeActive_nid_postfix()) {
+        // libgt7native ran the frame at its submission, so the flip is GPU-ready now: it goes straight to the
+        // presenter (Driver::Present hands it to libgt7native), with no PS5 flip packet.
+        std::shared_ptr<AgcDriver::IVideoOutput> output;
+        {
+            std::lock_guard lock(mutex);
+            if (handle <= 0 || handle >= VIDEO_OUT_NUM_MAX || !outputs[handle]) return VIDEO_OUT_ERROR_INVALID_HANDLE;
+            output = outputs[handle];
+        }
+        const AgcDriver::FlipInfo info{static_cast<std::uint32_t>(handle), index, static_cast<std::uint32_t>(flipMode), flipArg};
+        auto request = output->Reserve(info);
+        static std::atomic<std::uint64_t> frames{0};
+        const std::uint64_t serial = ++frames;   // the frame's one submission is its flip's
+        auto frame = std::make_shared<AgcDriver::FrameTiming>(serial);
+        const auto now = AgcDriver::FrameTiming::Clock::now();
+        frame->IncludeSubmission(serial, now, now, now, true);
+        frame->SetFlip(serial, 0, now, now);
+        request->GpuReady(frame);
+        return 0;
+    }
     std::array<uint32_t, AgcDriver::FlipPacketWords> words{AgcDriver::FlipPacketHeader, static_cast<uint32_t>(handle), static_cast<uint32_t>(index), static_cast<uint32_t>(flipMode), static_cast<uint32_t>(static_cast<uint64_t>(flipArg)), static_cast<uint32_t>(static_cast<uint64_t>(flipArg) >> 32u)};
     Packet packet{words.data(), static_cast<uint32_t>(words.size()), 0, {}};
     const auto result = sceAgcDriverSubmitDcb(&packet);

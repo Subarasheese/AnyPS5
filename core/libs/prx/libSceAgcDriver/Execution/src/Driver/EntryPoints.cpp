@@ -98,6 +98,11 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
     LibcAwaitExit_nid_postfix();
 }
 
+// Whether libgt7native owns the GPU (GT7_NATIVE): no PS5 command buffer runs, so VideoOut flips without one.
+extern "C" bool AgcDriverGt7NativeActive_nid_postfix() {
+    return AgcDriver::Native::Gt7NativeActive();
+}
+
 extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::FlipInfo& info) {
     return AgcDriver::DriverDetail::Driver::Get().ReserveEopFlip(info);
 }
