@@ -161,7 +161,9 @@ void Gt7NativeForbidden(const char* what) {
 }
 
 bool Enabled() {
-    static const bool enabled = !EnvSet("APS5_EMULATED_GPU");
+    // With libgt7native (GT7_NATIVE) AnyPS5's own GPU backends (native and emulated) are off entirely: no hooks of
+    // its own, no device, no executor.
+    static const bool enabled = !EnvSet("APS5_EMULATED_GPU") && !EnvSet("GT7_NATIVE");
     return enabled;
 }
 
