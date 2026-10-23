@@ -627,14 +627,15 @@ int APS5_VABI getdtablesize_nid_postfix(void) {
     return -1;
 }
 
+// AnyPS5 presents itself as a PS5 Pro (Trinity): GT7 then takes its PS5 Pro graphics path.
 int APS5_VABI sceKernelIsTrinityMode(void) {
-    return 0;
+    return 1;
 }
 
 void APS5_VABI sceKernelGetOperationMode(int* mode, int* submode) {
     if (!mode || !submode)
         throw std::invalid_argument("sceKernelGetOperationMode: null output");
-    *mode = 2;
+    *mode = 3;   // PS5 Pro (GT7: 0xc7de30 picks its Pro presets when the mode is 3 and the submode 0)
     *submode = 0;
 }
 

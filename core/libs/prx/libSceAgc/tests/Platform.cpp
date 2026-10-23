@@ -27,7 +27,7 @@ void expectFailure(TAction action) {
 void testTrinityMode() {
     std::array<bool, 3> flags{true, true, true};
     check(sceAgcGetIsTrinityMode(&flags[1]) == 0, "Trinity mode query did not return 0");
-    check(!flags[1], "base PS5 GPU reported as Trinity");
+    check(flags[1], "PS5 Pro GPU not reported as Trinity");
     check(flags[0] && flags[2], "Trinity mode query wrote past its one-byte flag");
 }
 

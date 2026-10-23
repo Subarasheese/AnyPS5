@@ -10,7 +10,7 @@ extern "C" {
 
 int APS5_VABI sceAgcGetIsTrinityMode(bool* isTrinityMode) {
     Agc::Command::CheckAddress(reinterpret_cast<std::uintptr_t>(isTrinityMode), alignof(bool), __func__);
-    *isTrinityMode = false;
+    *isTrinityMode = true;   // a PS5 Pro (Trinity) GPU
     return 0;
 }
 
