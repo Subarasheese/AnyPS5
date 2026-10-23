@@ -280,23 +280,8 @@ set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Native/src/CompileStatus
         INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/3rdparty/stb
 )
 
-# GT7's PGL layer, ported natively in gt7_render_test (engine/pgl), on the Port shim of Native/pgl: the ports replace
-# GT7's graphics-context methods at their call sites (APS5_PGL=1).
-set(GT7_RENDER_TEST_DIR "${CMAKE_SOURCE_DIR}/../../gt7_render_test" CACHE PATH "gt7_render_test checkout (engine/pgl sources)")
-set(gt7PglNames Context Matrix Resources Sync Immediate Commit Clear Registers Compute Bind RegisterState Stage Recording FrameBuffer State)
-set(gt7PglSources ${CMAKE_CURRENT_SOURCE_DIR}/Native/pgl/PortShim.cpp ${CMAKE_CURRENT_SOURCE_DIR}/Native/pgl/PglInstall.cpp)
-foreach(name ${gt7PglNames})
-    list(APPEND gt7PglSources ${GT7_RENDER_TEST_DIR}/engine/pgl/${name}.cpp)
-endforeach()
-add_library(gt7pgl OBJECT ${gt7PglSources})
-set_target_properties(gt7pgl PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(gt7pgl BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Native/pgl/include)
-target_include_directories(gt7pgl PRIVATE ${GT7_RENDER_TEST_DIR}/engine ${LIBS_INCLUDE_DIR})
-target_compile_options(gt7pgl PRIVATE -mavx2 -mfma -mf16c -ffp-contract=off -w)
-
 add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${agcDriverSources}
-        $<TARGET_OBJECTS:gt7pgl>
 )
 add_dependencies(libSceAgcDriver agc_trace_revision)
 

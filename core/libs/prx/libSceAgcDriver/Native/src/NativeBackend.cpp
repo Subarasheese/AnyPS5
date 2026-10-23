@@ -1,6 +1,8 @@
 #include <thread>
 #include <condition_variable>
 #include "prx/libSceAgcDriver/Native/include/NativeBackend.hpp"
+#include <errno.h>
+#include <dlfcn.h>
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
 #include "prx/libSceAgcDriver/Native/include/GameHooks.hpp"
@@ -96,9 +98,18 @@ void ReportStats(Stats& stats) {
 
 }
 
-void InstallPgl();   // Native/pgl/PglInstall.cpp
 namespace {
-void InstallPglHooks() { InstallPgl(); }
+// GT7's native PC graphics layer (gt7_render_test's libgt7native, GT7_NATIVE=<path to libgt7native.so>): loaded
+// into the game process before its threads run; it patches GT7's graphics call sites and renders with its own
+// Vulkan renderer.
+void InstallPglHooks() {
+    const char* path = std::getenv("GT7_NATIVE");
+    if (!path || !*path || !std::strstr(program_invocation_short_name, "gt7ps5")) return;
+    void* library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!library) { std::fprintf(stderr, "[native] GT7_NATIVE: %s\n", dlerror()); std::abort(); }
+    auto start = reinterpret_cast<int (*)()>(dlsym(library, "gt7native_start"));
+    if (!start || !start()) { std::fprintf(stderr, "[native] GT7_NATIVE: gt7native_start failed\n"); std::abort(); }
+}
 }
 
 bool Enabled() {
