@@ -174,6 +174,21 @@ void* InstallGameHook(const char* name, std::uintptr_t ebootAddress, void* handl
     return trampoline;
 }
 
+void* InstallNativeHook(const char* name, std::uintptr_t ebootAddress, void* entry, void* context) {
+    if (!GameCodeMapped(ebootAddress, 16u)) throw std::runtime_error(std::string("native hooks: target is outside the main executable code: ") + name);
+    auto* target = reinterpret_cast<std::uint8_t*>(GameImageBase() + ebootAddress);
+    const std::size_t stolen = StolenLength(target);
+    auto* slot = AllocateSlot(reinterpret_cast<std::uintptr_t>(target));
+    slot[0] = 0x49;   // mov r11, imm64
+    slot[1] = 0xbb;
+    const auto value = reinterpret_cast<std::uintptr_t>(context);
+    std::memcpy(slot + 2, &value, sizeof(value));
+    WriteAbsoluteJump(slot + 10, reinterpret_cast<std::uintptr_t>(entry));
+    void* trampoline = stolen ? BuildTrampoline(slot, target, stolen) : nullptr;
+    PatchEntry(name, target, stolen ? stolen : 5u, slot);
+    return trampoline;
+}
+
 void InstallCountingHook(const char* name, std::uintptr_t ebootAddress, std::uint64_t** counter) {
     std::size_t stolen = 0;
     auto* target = CheckedTarget(name, ebootAddress, stolen);

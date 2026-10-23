@@ -96,6 +96,11 @@ void ReportStats(Stats& stats) {
 
 }
 
+void InstallPgl();   // Native/pgl/PglInstall.cpp
+namespace {
+void InstallPglHooks() { InstallPgl(); }
+}
+
 bool Enabled() {
     static const bool enabled = !EnvSet("APS5_EMULATED_GPU");
     return enabled;
@@ -104,8 +109,10 @@ bool Enabled() {
 namespace {
 // GT7's code is mapped before this library initializes, so the context hooks go in at load time,
 // before any game thread runs.
+void InstallPglHooks();
 const bool hooksInstalled = [] {
     if (Enabled()) InstallGraphicsContextHooks();
+    InstallPglHooks();
     return true;
 }();
 }

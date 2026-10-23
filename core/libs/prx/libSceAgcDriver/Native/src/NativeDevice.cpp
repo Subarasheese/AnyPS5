@@ -2093,6 +2093,37 @@ bool NativeDevice::Draw(const DrawWork& work, std::string& failure) {
             }
         }
     }
+    // Debug aid: APS5_DEBUG_LOG_PS_IMAGES=<pixel program,...> prints, once per program, the image
+    // slots (base, T# words, heap indices) and the attachment-0 blend of that program's draws.
+    {
+        // APS5_DEBUG_LOG_PS_IMAGES_TARGET=<color target>: the same for every program drawing into it.
+        static const std::vector<std::uint64_t> wantedPs = AddressList("APS5_DEBUG_LOG_PS_IMAGES");
+        static const std::vector<std::uint64_t> wantedTargets = AddressList("APS5_DEBUG_LOG_PS_IMAGES_TARGET");
+        const bool byTarget = !wantedTargets.empty() && !graphics.colors.empty() && std::find(wantedTargets.begin(), wantedTargets.end(), graphics.colors.front().address) != wantedTargets.end();
+        if ((!wantedPs.empty() || byTarget) && !work.stages.empty() && (byTarget || std::find(wantedPs.begin(), wantedPs.end(), work.stages.back().programAddress) != wantedPs.end())) {
+            static std::mutex psMutex;
+            static std::set<std::uint64_t> psSeen;
+            std::lock_guard psLock(psMutex);
+            if (psSeen.size() < 400 && psSeen.insert(work.stages.back().programAddress).second) {
+                const auto& blend = graphics.blends.empty() ? VkPipelineColorBlendAttachmentState{} : graphics.blends.front();
+                std::fprintf(stderr, "[native] ps 0x%llx: target 0x%llx %ux%u, blend %d src %d dst %d op %d / alpha src %d dst %d op %d, mask %x, depth test %d\n",
+                    static_cast<unsigned long long>(work.stages.back().programAddress), static_cast<unsigned long long>(graphics.colors.empty() ? 0ull : graphics.colors.front().address),
+                    graphics.renderExtent.width, graphics.renderExtent.height, blend.blendEnable ? 1 : 0, static_cast<int>(blend.srcColorBlendFactor), static_cast<int>(blend.dstColorBlendFactor),
+                    static_cast<int>(blend.colorBlendOp), static_cast<int>(blend.srcAlphaBlendFactor), static_cast<int>(blend.dstAlphaBlendFactor), static_cast<int>(blend.alphaBlendOp), blend.colorWriteMask,
+                    graphics.depthTest ? 1 : 0);
+                for (const auto& stage : work.stages) {
+                    for (std::size_t index = 0; index < stage.shader->nativeImageSources.size() && stage.slotWords.size() >= (index + 1) * 8; ++index) {
+                        const auto* t = stage.slotWords.data() + index * 8;
+                        const auto base = (static_cast<std::uint64_t>(t[0]) | (static_cast<std::uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+                        std::uint32_t sampled = 0, storage = 0;
+                        const bool resolved = s.images->ImageIndices(std::span<const std::uint32_t, 8>(t, 8), sampled, storage);
+                        std::fprintf(stderr, "[native]   stage %d image slot %zu base 0x%llx T# %08x %08x %08x %08x %08x %08x %08x %08x -> sampled %u storage %u resolved %d\n",
+                            static_cast<int>(stage.stage), index, static_cast<unsigned long long>(base), t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], sampled, storage, resolved ? 1 : 0);
+                    }
+                }
+            }
+        }
+    }
     // Debug aid: APS5_DEBUG_LOG_DST_ALPHA=<color target> prints the textures bound by each draw into
     // that target that multiplies the destination by the source alpha, so the texture whose alpha
     // erases the target can be named.

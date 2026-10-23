@@ -17,6 +17,10 @@ namespace AgcDriver::Native {
 // Installs one hook; returns the trampoline that runs the original method. Throws on mismatch.
 void* InstallGameHook(const char* name, std::uintptr_t ebootAddress, void* handler);
 
+// A port hook: the slot loads `context` into r11 and jumps to `entry` (r10 / r11 are free at a call). Returns the
+// trampoline into the original method, or null when its prologue is not a relocatable one (the first 5 bytes are
+// then replaced without a way back).
+void* InstallNativeHook(const char* name, std::uintptr_t ebootAddress, void* entry, void* context);
 // Observation hook: counts calls in `counter` (atomic increment in the thunk) and runs the original.
 void InstallCountingHook(const char* name, std::uintptr_t ebootAddress, std::uint64_t** counter);
 
