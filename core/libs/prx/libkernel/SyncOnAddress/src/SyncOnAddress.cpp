@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -265,9 +267,25 @@ int APS5_VABI sceKernelSyncOnAddressWait32(std::uint32_t* address, std::uint32_t
 }
 
 int APS5_VABI sceKernelSyncOnAddressWait64(std::uint64_t* address, std::uint64_t expected, const KernelUseconds* timeout, const char* name) {
-    (void)name;
     if (!IsAlignedAddress<std::uint64_t>(reinterpret_cast<std::uintptr_t>(address))) {
         APS5_INVALID_ARG_EX;
+    }
+    // Debug (APS5_WAIT_REPORT=1): an untimed wait still blocked after 10 s is reported once (name, address, values,
+    // caller), then keeps waiting as before.
+    static const bool report = std::getenv("APS5_WAIT_REPORT") != nullptr;
+    if (report && timeout == nullptr) {
+        bool reported = false;
+        for (;;) {
+            const KernelUseconds step = 10'000'000;
+            if (WaitOnAddress(address, expected, &step, __builtin_return_address(0)) == SYNC_ON_ADDRESS_OK) return SYNC_ON_ADDRESS_OK;
+            const std::uint64_t now = __atomic_load_n(address, __ATOMIC_ACQUIRE);
+            if (now != expected) return SYNC_ON_ADDRESS_OK;
+            if (!reported) {
+                reported = true;
+                std::fprintf(stderr, "[wait-report] SyncOnAddressWait64 '%s' at %p blocked > 10 s: waits while == %#llx (now %#llx), caller %p\n", name ? name : "",
+                             static_cast<void*>(address), static_cast<unsigned long long>(expected), static_cast<unsigned long long>(now), __builtin_return_address(0));
+            }
+        }
     }
     return WaitOnAddress(address, expected, timeout, __builtin_return_address(0));
 }

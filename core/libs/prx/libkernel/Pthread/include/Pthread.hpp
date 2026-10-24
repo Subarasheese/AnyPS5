@@ -64,6 +64,7 @@ struct PthreadCondattrPrivate {
 struct PthreadCondPrivate {
     TimedWait::Condition _cv;
     int _clockid = 0;
+    std::string name;   // the title's name for it (scePthreadCondInit), for wait reports
 };
 
 struct PthreadSemPrivate {
